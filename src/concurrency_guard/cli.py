@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import importlib.util
 import sys
 from pathlib import Path
@@ -11,8 +12,10 @@ from typing import Any
 import typer
 from rich.console import Console
 from rich.panel import Panel
+from rich.syntax import Syntax
 from rich.table import Table
 
+from concurrency_guard.patcher.cst_fixer import apply_with_for_update_fix
 from concurrency_guard.runner.barrier_engine import run_barrier_test
 from concurrency_guard.scanner.ast_rules import ASTFinding, scan_file
 
@@ -176,6 +179,67 @@ def verify(
         )
     )
     raise typer.Exit(code=0)
+
+
+@app.command()
+def fix(
+    file_path: Path = typer.Argument(
+        ...,
+        exists=True,
+        help="Target Python file to auto-patch with concurrency fixes",
+    ),
+    write: bool = typer.Option(
+        False,
+        "--write",
+        help="Write the patched code back to disk",
+    ),
+) -> None:
+    """Auto-patch concurrency race conditions by appending .with_for_update() using LibCST."""
+    source_code = file_path.read_text(encoding="utf-8")
+    patched_code = apply_with_for_update_fix(source_code)
+
+    if source_code == patched_code:
+        console.print(
+            Panel(
+                f"[bold green]No concurrency fixes needed for {file_path}.[/bold green]",
+                border_style="green",
+            )
+        )
+        raise typer.Exit(code=0)
+
+    diff = "".join(
+        difflib.unified_diff(
+            source_code.splitlines(keepends=True),
+            patched_code.splitlines(keepends=True),
+            fromfile=str(file_path),
+            tofile=f"{file_path} (patched)",
+        )
+    )
+
+    diff_syntax = Syntax(diff, "diff", theme="monokai", line_numbers=True)
+    console.print(
+        Panel(
+            diff_syntax,
+            title=f"[bold cyan]LibCST Auto-Patch Preview: {file_path}[/bold cyan]",
+            border_style="cyan",
+        )
+    )
+
+    if write:
+        file_path.write_text(patched_code, encoding="utf-8")
+        console.print(
+            Panel(
+                f"[bold green]✔ Successfully wrote patched code to {file_path}[/bold green]",
+                border_style="green",
+            )
+        )
+    else:
+        console.print(
+            Panel(
+                "[dim]Dry-run mode: Pass [bold]--write[/bold] to apply the patch directly to disk.[/dim]",
+                border_style="yellow",
+            )
+        )
 
 
 if __name__ == "__main__":
