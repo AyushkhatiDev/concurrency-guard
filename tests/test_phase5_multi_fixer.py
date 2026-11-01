@@ -149,3 +149,4 @@ async def withdraw(user_id: int, amount: float, db: AsyncSession = Depends(get_d
     remaining_rules = {f.rule_id for f in remaining}
     assert "CG-001" not in remaining_rules
     assert "CG-002" in remaining_rules
+

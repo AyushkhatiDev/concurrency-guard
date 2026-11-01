@@ -1,0 +1,44 @@
+name: "ConcurrencyGuard Action"
+description: "Deterministic AST scanner and runtime race condition verifier for Python FastAPI & SQLAlchemy"
+author: "AyushkhatiDev"
+branding:
+  icon: "shield"
+  color: "blue"
+
+inputs:
+  path:
+    description: "Path to file or directory to scan"
+    required: false
+    default: "."
+  report-file:
+    description: "File to generate GitHub PR Markdown report for"
+    required: false
+    default: ""
+  output:
+    description: "Output path for the Markdown report"
+    required: false
+    default: "concurrency-guard-report.md"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.12"
+
+    - name: Install ConcurrencyGuard
+      shell: bash
+      run: |
+        pip install .
+
+    - name: Run ConcurrencyGuard Scan
+      shell: bash
+      run: |
+        cguard scan ${{ inputs.path }}
+
+    - name: Run ConcurrencyGuard Report
+      if: ${{ inputs.report-file != '' }}
+      shell: bash
+      run: |
+        cguard report ${{ inputs.report-file }} --output ${{ inputs.output }} || true
