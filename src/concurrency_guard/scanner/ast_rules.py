@@ -164,6 +164,64 @@ def _is_commit_protected(node: ast.AsyncFunctionDef) -> bool:
     return False
 
 
+def _is_celery_task(dec: ast.AST) -> bool:
+    """Check if decorator is a Celery task decorator like @app.task, @celery.task, or @shared_task."""
+    func = dec.func if isinstance(dec, ast.Call) else dec
+    if isinstance(func, ast.Attribute) and func.attr == "task":
+        return True
+    return bool(isinstance(func, ast.Name) and func.id in ("shared_task", "task"))
+
+
+def _has_celery_retry_kwarg(dec: ast.AST) -> bool:
+    """Check if decorator has autoretry_for or max_retries keyword arguments."""
+    if not isinstance(dec, ast.Call):
+        return False
+    for kw in dec.keywords:
+        if kw.arg in ("autoretry_for", "max_retries"):
+            return True
+    return False
+
+
+def _has_acks_late_true(dec: ast.AST) -> bool:
+    """Check if decorator specifies acks_late=True."""
+    if not isinstance(dec, ast.Call):
+        return False
+    for kw in dec.keywords:
+        if kw.arg == "acks_late" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+            return True
+    return False
+
+
+def _has_mutation_or_side_effect(local_nodes: list[ast.AST]) -> bool:
+    """Check if body contains .add(), .commit(), or .post() call."""
+    for n in local_nodes:
+        if (
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr in ("add", "commit", "post")
+        ):
+            return True
+    return False
+
+
+def _has_idempotency_or_lock(local_nodes: list[ast.AST]) -> bool:
+    """Check if body checks an idempotency or deduplication lock."""
+    for n in local_nodes:
+        if isinstance(n, ast.Name):
+            lower = n.id.lower()
+            if any(k in lower for k in ("idempotency", "dedup", "lock")):
+                return True
+        elif isinstance(n, ast.Attribute):
+            lower = n.attr.lower()
+            if any(k in lower for k in ("idempotency", "dedup", "lock")):
+                return True
+        elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+            lower = n.value.lower()
+            if any(k in lower for k in ("idempotency", "dedup")):
+                return True
+    return False
+
+
 class ConcurrencyASTVisitor(ast.NodeVisitor):
     """AST visitor detecting concurrency race conditions and idempotency issues."""
 
@@ -289,13 +347,62 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                     )
                 )
 
+    def _check_cg_005(
+        self,
+        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        local_nodes: list[ast.AST],
+    ) -> None:
+        """Rule CG-005: Non-Idempotent Celery Retry Task."""
+        matching_task_dec: ast.AST | None = None
+        has_retry = False
+        has_acks_late = False
+
+        for dec in node.decorator_list:
+            if _is_celery_task(dec):
+                matching_task_dec = dec
+                if _has_celery_retry_kwarg(dec):
+                    has_retry = True
+                if _has_acks_late_true(dec):
+                    has_acks_late = True
+
+        if not matching_task_dec or not has_retry:
+            return
+
+        if has_acks_late or _has_idempotency_or_lock(local_nodes):
+            return
+
+        if _has_mutation_or_side_effect(local_nodes):
+            self.findings.append(
+                ASTFinding(
+                    rule_id="CG-005",
+                    filename=self.filename,
+                    lineno=node.lineno,
+                    function_name=node.name,
+                    message=(
+                        "Non-Idempotent Celery Retry Task: Celery task configured with retries "
+                        "executes side effects without acks_late=True or idempotency deduplication lock."
+                    ),
+                    suggested_fix_hint=(
+                        "Add 'acks_late=True' to the Celery task decorator and enforce an "
+                        "idempotency lock before executing database commits or external POST calls on retry."
+                    ),
+                )
+            )
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
+        """Inspect sync function definitions for rule CG-005."""
+        local_nodes = list(_walk_local_nodes(node))
+        self._check_cg_005(node, local_nodes)
+        self.generic_visit(node)
+
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        """Inspect async function definitions for rules CG-001, CG-002, CG-003, and CG-004."""
+        """Inspect async function definitions for rules CG-001, CG-002, CG-003, CG-004, and CG-005."""
         local_nodes = list(_walk_local_nodes(node))
         self._check_cg_001(node, local_nodes)
         self._check_cg_002(node, local_nodes)
         self._check_cg_003(node)
         self._check_cg_004(node, local_nodes)
+        self._check_cg_005(node, local_nodes)
         self.generic_visit(node)
 
 

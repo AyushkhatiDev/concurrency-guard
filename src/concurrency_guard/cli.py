@@ -16,7 +16,8 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from concurrency_guard.patcher.cst_fixer import apply_all_fixes
-from concurrency_guard.runner.barrier_engine import run_barrier_test
+from concurrency_guard.reporter.github_pr import generate_github_pr_markdown
+from concurrency_guard.runner.barrier_engine import BarrierResult, run_barrier_test
 from concurrency_guard.scanner.ast_rules import ASTFinding, scan_file, scan_source_code
 
 app = typer.Typer(no_args_is_help=True, help="Deterministic Concurrency & Idempotency Verifier")
@@ -283,6 +284,96 @@ def fix(
                 border_style="yellow",
             )
         )
+
+
+@app.command()
+def report(
+    file_path: Path = typer.Argument(
+        ...,
+        exists=True,
+        dir_okay=False,
+        readable=True,
+        help="Target Python file to generate Markdown report for",
+    ),
+    output: Path | None = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Optional path to write the Markdown report to",
+    ),
+    workers: int = typer.Option(
+        20,
+        "--workers",
+        "-w",
+        help="Number of concurrent workers for barrier runtime verification if applicable",
+    ),
+) -> None:
+    """Generate a GitHub Pull Request Markdown report for AST findings and barrier exploit proofs."""
+    source_code = file_path.read_text(encoding="utf-8")
+    findings = scan_file(file_path)
+
+    barrier_result: BarrierResult | None = None
+    try:
+        module_name = f"cguard_report_target_{file_path.stem}"
+        spec = importlib.util.spec_from_file_location(module_name, file_path)
+        if spec is not None and spec.loader is not None:
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+            target_app: Any = getattr(module, "app", None)
+            if target_app is not None:
+                engine: Any = getattr(module, "engine", None)
+                session_factory: Any = getattr(
+                    module, "async_session", getattr(module, "AsyncSessionLocal", None)
+                )
+                wallet_model: Any = getattr(module, "Wallet", None)
+                base_class: Any = getattr(module, "Base", None)
+                base_metadata: Any = getattr(base_class, "metadata", None) if base_class else None
+
+                has_withdraw_route = any(
+                    getattr(route, "path", None) == "/wallet/withdraw"
+                    for route in getattr(target_app, "routes", [])
+                )
+                if has_withdraw_route:
+                    barrier_result = asyncio.run(
+                        run_barrier_test(
+                            app=target_app,
+                            endpoint="/wallet/withdraw",
+                            workers=workers,
+                            initial_balance=50,
+                            withdraw_amount=50,
+                            engine=engine,
+                            session_factory=session_factory,
+                            wallet_model=wallet_model,
+                            base_metadata=base_metadata,
+                        )
+                    )
+    except Exception:  # noqa: BLE001
+        barrier_result = None
+
+    patched_code = apply_all_fixes(source_code)
+    markdown_report = generate_github_pr_markdown(
+        file_path=file_path,
+        findings=findings,
+        barrier_result=barrier_result,
+        patched_code=patched_code if patched_code != source_code else None,
+        original_code=source_code,
+    )
+
+    if output is not None:
+        output.write_text(markdown_report, encoding="utf-8")
+        console.print(
+            Panel(
+                f"[bold green]✔ Successfully wrote PR report to {output}[/bold green]",
+                border_style="green",
+            )
+        )
+    else:
+        console.print(markdown_report)
+
+    if findings or (barrier_result and barrier_result.get("invariant_violated")):
+        raise typer.Exit(code=1)
+    raise typer.Exit(code=0)
 
 
 if __name__ == "__main__":
