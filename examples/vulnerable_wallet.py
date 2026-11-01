@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 
-from fastapi import Depends, FastAPI, HTTPException, status
+from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
 from sqlalchemy import Float, Integer, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -68,6 +68,7 @@ async def withdraw(
 async def withdraw_safe(
     request: WithdrawRequest,
     db: AsyncSession = Depends(get_db),
+    idempotency_key: str = Header(..., alias="Idempotency-Key"),
 ) -> dict[str, float | str]:
     """Safe endpoint: acquires row-level lock using .with_for_update() to prevent race conditions."""
     stmt = (

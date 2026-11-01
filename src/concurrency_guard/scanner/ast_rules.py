@@ -44,28 +44,137 @@ def _is_matching_binop_mutation(stmt: ast.Assign) -> bool:
     return False
 
 
+def _is_select_call(node: ast.AST) -> bool:
+    """Check if node is a select(...) call."""
+    if isinstance(node, ast.Call):
+        func = node.func
+        if (isinstance(func, ast.Name) and func.id == "select") or (
+            isinstance(func, ast.Attribute) and func.attr == "select"
+        ):
+            return True
+    return False
+
+
+def _is_db_or_session(val: ast.AST) -> bool:
+    """Check if AST value refers to a database or session object."""
+    if isinstance(val, ast.Name):
+        name = val.id.lower()
+        return any(k in name for k in ("db", "session", "conn"))
+    if isinstance(val, ast.Attribute):
+        name = val.attr.lower()
+        return any(k in name for k in ("db", "session", "conn"))
+    return False
+
+
+def _is_add_call(node: ast.AST) -> bool:
+    """Check if node is a db.add(...) or session.add(...) call."""
+    if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "add":
+        return _is_db_or_session(node.func.value)
+    return False
+
+
+def _is_commit_call(node: ast.AST) -> bool:
+    """Check if node is a .commit() call."""
+    return (
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "commit"
+    )
+
+
+def _is_post_route(node: ast.AsyncFunctionDef) -> bool:
+    """Check if function is decorated with @app.post or @router.post."""
+    for dec in node.decorator_list:
+        func = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(func, ast.Attribute) and func.attr == "post":
+            return True
+    return False
+
+
+def _has_idempotency_param(node: ast.AsyncFunctionDef) -> bool:
+    """Check if parameter list includes an idempotency_key parameter or header."""
+    all_args = node.args.posonlyargs + node.args.args + node.args.kwonlyargs
+    for arg in all_args:
+        name = arg.arg.lower()
+        if "idempotency" in name:
+            return True
+        if arg.annotation and "idempotency" in ast.unparse(arg.annotation).lower():
+            return True
+
+    all_defaults = [d for d in node.args.defaults if d is not None] + [
+        d for d in node.args.kw_defaults if d is not None
+    ]
+    for d in all_defaults:
+        if "idempotency" in ast.unparse(d).lower():
+            return True
+
+    return False
+
+
+def _find_loop_execute_calls(node: ast.AST, in_loop: bool = False) -> list[ast.Call]:
+    """Find db.execute / session.execute calls directly within loop bodies."""
+    calls: list[ast.Call] = []
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+
+        if (
+            in_loop
+            and isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr == "execute"
+            and _is_db_or_session(child.func.value)
+        ):
+            calls.append(child)
+
+        if isinstance(child, (ast.For, ast.AsyncFor)):
+            for b in child.body:
+                calls.extend(_find_loop_execute_calls(b, in_loop=True))
+            for o in child.orelse:
+                calls.extend(_find_loop_execute_calls(o, in_loop=True))
+        else:
+            calls.extend(_find_loop_execute_calls(child, in_loop=in_loop))
+    return calls
+
+
+def _catches_integrity_error(try_node: ast.Try) -> bool:
+    """Check if Try block has an except handler catching IntegrityError."""
+    for handler in try_node.handlers:
+        if handler.type is None:
+            continue
+        types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+        for t in types:
+            if isinstance(t, ast.Name) and t.id == "IntegrityError":
+                return True
+            if isinstance(t, ast.Attribute) and t.attr == "IntegrityError":
+                return True
+    return False
+
+
+def _is_commit_protected(node: ast.AsyncFunctionDef) -> bool:
+    """Check if any commit call is wrapped in a try/except catching IntegrityError."""
+    for child in ast.walk(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child is not node:
+            continue
+        if isinstance(child, ast.Try) and _catches_integrity_error(child):
+            for stmt in child.body:
+                for sub in ast.walk(stmt):
+                    if _is_commit_call(sub):
+                        return True
+    return False
+
+
 class ConcurrencyASTVisitor(ast.NodeVisitor):
-    """AST visitor detecting concurrency race conditions in async functions."""
+    """AST visitor detecting concurrency race conditions and idempotency issues."""
 
     def __init__(self, filename: str = "<memory>") -> None:
         self.filename = filename
         self.findings: list[ASTFinding] = []
 
-    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        """Inspect async function definitions for Rule CG-001."""
-        local_nodes = list(_walk_local_nodes(node))
+    def _check_cg_001(self, node: ast.AsyncFunctionDef, local_nodes: list[ast.AST]) -> None:
+        """Rule CG-001: Unlocked Read-Modify-Write Race Condition."""
+        select_calls = [n for n in local_nodes if isinstance(n, ast.Call) and _is_select_call(n)]
 
-        # Check for select(...) call
-        select_calls: list[ast.Call] = []
-        for n in local_nodes:
-            if isinstance(n, ast.Call):
-                func = n.func
-                if (isinstance(func, ast.Name) and func.id == "select") or (
-                    isinstance(func, ast.Attribute) and func.attr == "select"
-                ):
-                    select_calls.append(n)
-
-        # Check for attribute mutation (AugAssign or Assign with BinOp referencing same attr)
         has_mutation = False
         for n in local_nodes:
             if isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Attribute):
@@ -75,17 +184,14 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 has_mutation = True
                 break
 
-        # Check for .commit()
         has_commit = any(
             isinstance(n, ast.Attribute) and n.attr == "commit" for n in local_nodes
         )
 
-        # Check for .with_for_update()
         has_with_for_update = any(
             isinstance(n, ast.Attribute) and n.attr == "with_for_update" for n in local_nodes
         )
 
-        # Rule CG-001: Unlocked Read-Modify-Write Race Condition
         if select_calls and has_mutation and has_commit and not has_with_for_update:
             first_select = select_calls[0]
             self.findings.append(
@@ -105,6 +211,91 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 )
             )
 
+    def _check_cg_002(self, node: ast.AsyncFunctionDef, local_nodes: list[ast.AST]) -> None:
+        """Rule CG-002: Missing Idempotency Guard on POST Routes."""
+        if not _is_post_route(node):
+            return
+
+        has_db_mutation = any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr in ("commit", "add")
+            for n in local_nodes
+        )
+
+        if not has_db_mutation:
+            return
+
+        if not _has_idempotency_param(node):
+            self.findings.append(
+                ASTFinding(
+                    rule_id="CG-002",
+                    filename=self.filename,
+                    lineno=node.lineno,
+                    function_name=node.name,
+                    message=(
+                        "Missing Idempotency Guard: POST route executes database modification "
+                        "without an 'Idempotency-Key' parameter."
+                    ),
+                    suggested_fix_hint=(
+                        "Require an 'Idempotency-Key' header in FastAPI request parameters "
+                        "to prevent duplicate submissions on network retries."
+                    ),
+                )
+            )
+
+    def _check_cg_003(self, node: ast.AsyncFunctionDef) -> None:
+        """Rule CG-003: Async Loop N+1 Query Explode."""
+        loop_execute_calls = _find_loop_execute_calls(node, in_loop=False)
+        for call in loop_execute_calls:
+            self.findings.append(
+                ASTFinding(
+                    rule_id="CG-003",
+                    filename=self.filename,
+                    lineno=call.lineno,
+                    function_name=node.name,
+                    message="Async Loop N+1 Query Explode: database query executed inside loop body.",
+                    suggested_fix_hint=(
+                        "Move the query outside the loop or use joinedload/selectinload "
+                        "to fetch related data in a single batch query."
+                    ),
+                )
+            )
+
+    def _check_cg_004(self, node: ast.AsyncFunctionDef, local_nodes: list[ast.AST]) -> None:
+        """Rule CG-004: Check-Then-Act Uniqueness Race."""
+        select_calls = [n for n in local_nodes if isinstance(n, ast.Call) and _is_select_call(n)]
+        add_calls = [n for n in local_nodes if isinstance(n, ast.Call) and _is_add_call(n)]
+        has_commit = any(_is_commit_call(n) for n in local_nodes)
+
+        if select_calls and add_calls and has_commit:
+            first_select = select_calls[0]
+            first_add = add_calls[0]
+            if first_select.lineno <= first_add.lineno and not _is_commit_protected(node):
+                self.findings.append(
+                    ASTFinding(
+                        rule_id="CG-004",
+                        filename=self.filename,
+                        lineno=first_select.lineno,
+                        function_name=node.name,
+                        message=(
+                            "Check-Then-Act Uniqueness Race: select() existence check followed by "
+                            "add() and commit() without catching IntegrityError."
+                        ),
+                        suggested_fix_hint=(
+                            "Wrap database commit in a try/except block catching "
+                            "sqlalchemy.exc.IntegrityError to handle concurrent unique constraint violations safely."
+                        ),
+                    )
+                )
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
+        """Inspect async function definitions for rules CG-001, CG-002, CG-003, and CG-004."""
+        local_nodes = list(_walk_local_nodes(node))
+        self._check_cg_001(node, local_nodes)
+        self._check_cg_002(node, local_nodes)
+        self._check_cg_003(node)
+        self._check_cg_004(node, local_nodes)
         self.generic_visit(node)
 
 
