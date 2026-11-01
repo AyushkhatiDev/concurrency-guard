@@ -15,9 +15,9 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
-from concurrency_guard.patcher.cst_fixer import apply_with_for_update_fix
+from concurrency_guard.patcher.cst_fixer import apply_all_fixes
 from concurrency_guard.runner.barrier_engine import run_barrier_test
-from concurrency_guard.scanner.ast_rules import ASTFinding, scan_file
+from concurrency_guard.scanner.ast_rules import ASTFinding, scan_file, scan_source_code
 
 app = typer.Typer(no_args_is_help=True, help="Deterministic Concurrency & Idempotency Verifier")
 console = Console()
@@ -188,15 +188,24 @@ def fix(
         exists=True,
         help="Target Python file to auto-patch with concurrency fixes",
     ),
+    rule: str | None = typer.Option(
+        None,
+        "--rule",
+        "-r",
+        help="Specific rule to fix (e.g. CG-001, CG-002, CG-004). Defaults to all supported rules.",
+    ),
     write: bool = typer.Option(
         False,
         "--write",
         help="Write the patched code back to disk",
     ),
 ) -> None:
-    """Auto-patch concurrency race conditions by appending .with_for_update() using LibCST."""
+    """Auto-patch concurrency race conditions and idempotency bugs using LibCST."""
     source_code = file_path.read_text(encoding="utf-8")
-    patched_code = apply_with_for_update_fix(source_code)
+    initial_findings = scan_file(file_path)
+
+    rules_filter = {rule.upper()} if rule else None
+    patched_code = apply_all_fixes(source_code, rules=rules_filter)
 
     if source_code == patched_code:
         console.print(
@@ -206,6 +215,40 @@ def fix(
             )
         )
         raise typer.Exit(code=0)
+
+    # Determine which rules were fixed
+    remaining_findings = scan_source_code(patched_code, filename=str(file_path))
+    remaining_ids = {f.rule_id for f in remaining_findings}
+    fixed_findings = [f for f in initial_findings if f.rule_id not in remaining_ids]
+
+    # Render summary table of patched rules
+    summary_table = Table(
+        title="LibCST Auto-Patch Summary",
+        show_header=True,
+        header_style="bold green",
+    )
+    summary_table.add_column("Rule ID", style="bold yellow")
+    summary_table.add_column("Function", style="magenta")
+    summary_table.add_column("Fix Applied", style="white")
+
+    rule_descriptions = {
+        "CG-001": "Appended .with_for_update() row lock to query",
+        "CG-002": "Injected idempotency_key: str = Header(...) parameter",
+        "CG-004": "Wrapped commit in try/except IntegrityError with rollback",
+    }
+
+    seen_fixes: set[tuple[str, str]] = set()
+    for f in fixed_findings:
+        key = (f.rule_id, f.function_name)
+        if key not in seen_fixes:
+            seen_fixes.add(key)
+            summary_table.add_row(
+                f.rule_id,
+                f.function_name,
+                rule_descriptions.get(f.rule_id, "Applied auto-fix patch"),
+            )
+
+    console.print(summary_table)
 
     diff = "".join(
         difflib.unified_diff(
