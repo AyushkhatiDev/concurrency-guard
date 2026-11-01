@@ -16,6 +16,7 @@ dependencies = [
     "fastapi>=0.111.0",
     "sqlalchemy>=2.0.30",
     "aiosqlite>=0.20.0",
+    "greenlet>=3.0.0",
 ]
 
 [project.optional-dependencies]
@@ -45,6 +46,7 @@ target-version = "py310"
 ignore = ["B008"]
 
 [tool.pytest.ini_options]
+pythonpath = ["."]
 asyncio_default_fixture_loop_scope = "function"
 
 
