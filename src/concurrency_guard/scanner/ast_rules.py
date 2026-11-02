@@ -3,9 +3,21 @@
 from __future__ import annotations
 
 import ast
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+
+EXCLUDED_DIRS: frozenset[str] = frozenset({
+    ".venv",
+    "venv",
+    "__pycache__",
+    "node_modules",
+    "build",
+    "dist",
+    "migrations",
+    "alembic",
+})
 
 
 @dataclass(frozen=True)
@@ -66,6 +78,18 @@ def _is_db_or_session(val: ast.AST) -> bool:
     return False
 
 
+def _is_query_call(node: ast.AST) -> bool:
+    """Check if node is a select(...) call or SQLAlchemy 2.0 scalar/scalars/get query."""
+    if _is_select_call(node):
+        return True
+    return bool(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr in ("scalar", "scalars", "get")
+        and _is_db_or_session(node.func.value)
+    )
+
+
 def _is_add_call(node: ast.AST) -> bool:
     """Check if node is a db.add(...) or session.add(...) call."""
     if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "add":
@@ -112,7 +136,7 @@ def _has_idempotency_param(node: ast.AsyncFunctionDef) -> bool:
 
 
 def _find_loop_execute_calls(node: ast.AST, in_loop: bool = False) -> list[ast.Call]:
-    """Find db.execute / session.execute calls directly within loop bodies."""
+    """Find db/session execute, scalar, scalars, or get calls directly within loop bodies."""
     calls: list[ast.Call] = []
     for child in ast.iter_child_nodes(node):
         if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -122,7 +146,7 @@ def _find_loop_execute_calls(node: ast.AST, in_loop: bool = False) -> list[ast.C
             in_loop
             and isinstance(child, ast.Call)
             and isinstance(child.func, ast.Attribute)
-            and child.func.attr == "execute"
+            and child.func.attr in ("execute", "scalar", "scalars", "get")
             and _is_db_or_session(child.func.value)
         ):
             calls.append(child)
@@ -204,7 +228,7 @@ def _has_mutation_or_side_effect(local_nodes: list[ast.AST]) -> bool:
     return False
 
 
-def _has_idempotency_or_lock(local_nodes: list[ast.AST]) -> bool:
+def _has_idempotency_or_lock(local_nodes: list[ast.AST], docstring: str | None = None) -> bool:
     """Check if body checks an idempotency or deduplication lock."""
     for n in local_nodes:
         if isinstance(n, ast.Name):
@@ -216,6 +240,8 @@ def _has_idempotency_or_lock(local_nodes: list[ast.AST]) -> bool:
             if any(k in lower for k in ("idempotency", "dedup", "lock")):
                 return True
         elif isinstance(n, ast.Constant) and isinstance(n.value, str):
+            if docstring and n.value == docstring:
+                continue
             lower = n.value.lower()
             if any(k in lower for k in ("idempotency", "dedup")):
                 return True
@@ -231,7 +257,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
     def _check_cg_001(self, node: ast.AsyncFunctionDef, local_nodes: list[ast.AST]) -> None:
         """Rule CG-001: Unlocked Read-Modify-Write Race Condition."""
-        select_calls = [n for n in local_nodes if isinstance(n, ast.Call) and _is_select_call(n)]
+        query_calls = [n for n in local_nodes if isinstance(n, ast.Call) and _is_query_call(n)]
 
         has_mutation = False
         for n in local_nodes:
@@ -250,13 +276,13 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             isinstance(n, ast.Attribute) and n.attr == "with_for_update" for n in local_nodes
         )
 
-        if select_calls and has_mutation and has_commit and not has_with_for_update:
-            first_select = select_calls[0]
+        if query_calls and has_mutation and has_commit and not has_with_for_update:
+            first_query = query_calls[0]
             self.findings.append(
                 ASTFinding(
                     rule_id="CG-001",
                     filename=self.filename,
-                    lineno=first_select.lineno,
+                    lineno=first_query.lineno,
                     function_name=node.name,
                     message=(
                         "Unlocked Read-Modify-Write Race Condition: database state is read and "
@@ -322,19 +348,19 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
     def _check_cg_004(self, node: ast.AsyncFunctionDef, local_nodes: list[ast.AST]) -> None:
         """Rule CG-004: Check-Then-Act Uniqueness Race."""
-        select_calls = [n for n in local_nodes if isinstance(n, ast.Call) and _is_select_call(n)]
+        query_calls = [n for n in local_nodes if isinstance(n, ast.Call) and _is_query_call(n)]
         add_calls = [n for n in local_nodes if isinstance(n, ast.Call) and _is_add_call(n)]
         has_commit = any(_is_commit_call(n) for n in local_nodes)
 
-        if select_calls and add_calls and has_commit:
-            first_select = select_calls[0]
+        if query_calls and add_calls and has_commit:
+            first_query = query_calls[0]
             first_add = add_calls[0]
-            if first_select.lineno <= first_add.lineno and not _is_commit_protected(node):
+            if first_query.lineno <= first_add.lineno and not _is_commit_protected(node):
                 self.findings.append(
                     ASTFinding(
                         rule_id="CG-004",
                         filename=self.filename,
-                        lineno=first_select.lineno,
+                        lineno=first_query.lineno,
                         function_name=node.name,
                         message=(
                             "Check-Then-Act Uniqueness Race: select() existence check followed by "
@@ -368,7 +394,8 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         if not matching_task_dec or not has_retry:
             return
 
-        if has_acks_late or _has_idempotency_or_lock(local_nodes):
+        docstring = ast.get_docstring(node)
+        if has_acks_late or _has_idempotency_or_lock(local_nodes, docstring=docstring):
             return
 
         if _has_mutation_or_side_effect(local_nodes):
@@ -414,7 +441,36 @@ def scan_source_code(source_code: str, filename: str = "<memory>") -> list[ASTFi
     return visitor.findings
 
 
+def discover_python_files(path: Path) -> list[Path]:
+    """Discover Python files in a directory or file, skipping hidden and excluded folders."""
+    if not path.is_dir():
+        return [path]
+
+    py_files: list[Path] = []
+    for root, dirs, files in os.walk(path):
+        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in EXCLUDED_DIRS]
+        for f in sorted(files):
+            if f.endswith(".py"):
+                py_files.append(Path(root) / f)
+    return sorted(py_files)
+
+
 def scan_file(file_path: Path) -> list[ASTFinding]:
-    """Scan a Python file for concurrency vulnerabilities."""
-    source_code = file_path.read_text(encoding="utf-8")
-    return scan_source_code(source_code, filename=str(file_path))
+    """Scan a Python file for concurrency vulnerabilities, skipping unparseable files."""
+    try:
+        source_code = file_path.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, OSError):
+        return []
+
+    try:
+        return scan_source_code(source_code, filename=str(file_path))
+    except SyntaxError:
+        return []
+
+
+def scan_directory(dir_path: Path) -> list[ASTFinding]:
+    """Scan a directory recursively for concurrency vulnerabilities, skipping excluded directories."""
+    findings: list[ASTFinding] = []
+    for file_path in discover_python_files(dir_path):
+        findings.extend(scan_file(file_path))
+    return findings

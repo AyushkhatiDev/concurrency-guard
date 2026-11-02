@@ -42,3 +42,4 @@ runs:
       shell: bash
       run: |
         cguard report ${{ inputs.report-file }} --output ${{ inputs.output }} || true
+

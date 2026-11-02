@@ -121,3 +121,4 @@ def test_cli_report_command_writes_markdown(tmp_path: Path) -> None:
     assert "`CG-002`" in content
     assert "💥 Runtime Concurrency Exploit Proof" in content
     assert "🔧 Deterministic LibCST Auto-Patch Diff" in content
+
