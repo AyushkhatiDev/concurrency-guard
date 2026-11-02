@@ -6,7 +6,7 @@
 
 **Deterministic AST static analysis, runtime race verification, and auto-patching engine for Python FastAPI and SQLAlchemy backends.**
 
-![ConcurrencyGuard Demo](demo_2.gif)
+![ConcurrencyGuard Demo](demo.gif)
 
 ---
 
