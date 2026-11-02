@@ -7,7 +7,7 @@ import sys
 from collections.abc import Callable
 from dataclasses import dataclass
 from types import ModuleType
-from typing import Any, get_type_hints
+from typing import Any, Optional, get_type_hints
 
 from pydantic import BaseModel
 
@@ -20,12 +20,12 @@ class DiscoveredTarget:
     method: str
     function_name: str
     endpoint_fn: Callable[..., Any]
-    pydantic_model: type[BaseModel] | None
-    mutated_attribute: str | None
+    pydantic_model: Optional[type[BaseModel]]
+    mutated_attribute: Optional[str]
     uses_for_update: bool
 
 
-def _extract_mutated_attribute(func_ast: ast.AsyncFunctionDef) -> str | None:
+def _extract_mutated_attribute(func_ast: ast.AsyncFunctionDef) -> Optional[str]:
     """Extract the attribute name mutated via AugAssign or BinOp Assign in an async function."""
     for node in ast.walk(func_ast):
         # Nested function definitions should not be inspected
@@ -60,7 +60,7 @@ def _build_function_map(source_code: str) -> dict[str, ast.AsyncFunctionDef]:
     return result
 
 
-def _extract_pydantic_model(endpoint_fn: Callable[..., Any]) -> type[BaseModel] | None:
+def _extract_pydantic_model(endpoint_fn: Callable[..., Any]) -> Optional[type[BaseModel]]:
     """Extract the Pydantic BaseModel type annotation from an endpoint's parameters.
 
     Uses get_type_hints() to resolve forward references that result from
@@ -88,7 +88,7 @@ def _extract_pydantic_model(endpoint_fn: Callable[..., Any]) -> type[BaseModel] 
 def discover_fastapi_targets(
     module: ModuleType,
     source_code: str,
-    target_function: str | None = None,
+    target_function: Optional[str] = None,
 ) -> list[DiscoveredTarget]:
     """Discover POST/PUT/PATCH FastAPI routes and extract mutation metadata via AST."""
     # Locate the FastAPI app in the module
@@ -115,7 +115,7 @@ def discover_fastapi_targets(
         if not mutating_methods:
             continue
 
-        endpoint_fn: Callable[..., Any] | None = getattr(route, "endpoint", None)
+        endpoint_fn: Optional[Callable[..., Any]] = getattr(route, "endpoint", None)
         if endpoint_fn is None:
             continue
 
@@ -124,7 +124,7 @@ def discover_fastapi_targets(
             continue
 
         func_ast = func_map.get(fn_name)
-        mutated_attr: str | None = None
+        mutated_attr: Optional[str] = None
         uses_for_update = False
 
         if func_ast is not None:

@@ -7,7 +7,7 @@ import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional, Union
 
 import yaml  # type: ignore[import-untyped]
 
@@ -54,7 +54,7 @@ class CFGNode:
     successors: tuple[int, ...]
 
 
-def build_cfg(function: ast.FunctionDef | ast.AsyncFunctionDef) -> list[CFGNode]:
+def build_cfg(function: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> list[CFGNode]:
     """Build a lightweight intra-procedural CFG for a function body."""
     statements = [n for n in ast.walk(function) if isinstance(n, ast.stmt)]
     statements = sorted({id(n): n for n in statements}.values(), key=lambda n: (n.lineno, n.col_offset))
@@ -136,7 +136,7 @@ def _is_file_write(call: ast.Call) -> bool:
     return isinstance(mode, ast.Constant) and isinstance(mode.value, str) and any(x in mode.value for x in "wax+")
 
 
-def _literal_path(call: ast.Call) -> str | None:
+def _literal_path(call: ast.Call) -> Optional[str]:
     if call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str):
         return call.args[0].value
     return None
@@ -338,7 +338,7 @@ def _has_mutation_or_side_effect(local_nodes: list[ast.AST]) -> bool:
     return False
 
 
-def _has_idempotency_or_lock(local_nodes: list[ast.AST], docstring: str | None = None) -> bool:
+def _has_idempotency_or_lock(local_nodes: list[ast.AST], docstring: Optional[str] = None) -> bool:
     """Check if body checks an idempotency or deduplication lock."""
     for n in local_nodes:
         if isinstance(n, ast.Name):
@@ -389,7 +389,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         self.findings.append(ASTFinding(rule_id, self.filename, getattr(node, "lineno", 0), function, message, hint))
 
     def _check_standard_library_rules(
-        self, node: ast.FunctionDef | ast.AsyncFunctionDef, local_nodes: list[ast.AST]
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], local_nodes: list[ast.AST]
     ) -> None:
         """Detect shared-memory and file races without framework/ORM assumptions."""
         locked = _has_lock_context(node)
@@ -593,11 +593,11 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
     def _check_cg_005(
         self,
-        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
         local_nodes: list[ast.AST],
     ) -> None:
         """Rule CG-005: Non-Idempotent Celery Retry Task."""
-        matching_task_dec: ast.AST | None = None
+        matching_task_dec: Optional[ast.AST] = None
         has_retry = False
         has_acks_late = False
 
@@ -698,7 +698,7 @@ def load_yaml_rules(rule_file: Path) -> list[dict[str, Any]]:
 
 
 def scan_source_code(
-    source_code: str, filename: str = "<memory>", custom_rules: list[dict[str, Any]] | None = None
+    source_code: str, filename: str = "<memory>", custom_rules: Optional[list[dict[str, Any]]] = None
 ) -> list[ASTFinding]:
     """Scan Python source code string for concurrency vulnerabilities."""
     tree = ast.parse(source_code, filename=filename)
@@ -739,7 +739,7 @@ def discover_python_files(path: Path) -> list[Path]:
     return sorted(py_files)
 
 
-def scan_file(file_path: Path, custom_rules: list[dict[str, Any]] | None = None) -> list[ASTFinding]:
+def scan_file(file_path: Path, custom_rules: Optional[list[dict[str, Any]]] = None) -> list[ASTFinding]:
     """Scan a Python file for concurrency vulnerabilities, skipping unparseable files."""
     try:
         source_code = file_path.read_text(encoding="utf-8")
@@ -752,13 +752,13 @@ def scan_file(file_path: Path, custom_rules: list[dict[str, Any]] | None = None)
         return []
 
 
-def scan_directory(dir_path: Path, custom_rules: list[dict[str, Any]] | None = None) -> list[ASTFinding]:
+def scan_directory(dir_path: Path, custom_rules: Optional[list[dict[str, Any]]] = None) -> list[ASTFinding]:
     """Scan a directory recursively, including cross-file call-chain analysis."""
     return scan_project(discover_python_files(dir_path), roots=[dir_path], custom_rules=custom_rules)
 
 
 def scan_project(
-    file_paths: list[Path], roots: list[Path] | None = None, custom_rules: list[dict[str, Any]] | None = None
+    file_paths: list[Path], roots: Optional[list[Path]] = None, custom_rules: Optional[list[dict[str, Any]]] = None
 ) -> list[ASTFinding]:
     """Scan files and propagate shared-state hazards to transitive callers.
 

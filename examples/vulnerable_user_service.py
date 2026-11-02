@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Union
+
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, EmailStr
 from sqlalchemy import Integer, String, select
@@ -42,9 +44,9 @@ async def batch_fetch_users(
     user_ids: list[int],
     db: AsyncSession = Depends(get_db),
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
-) -> list[dict[str, int | str]]:
+) -> list[dict[str, Union[int, str]]]:
     """Vulnerable to CG-003: executing queries inside a loop."""
-    results: list[dict[str, int | str]] = []
+    results: list[dict[str, Union[int, str]]] = []
     for uid in user_ids:
         stmt = select(User).where(User.id == uid)
         res = await db.execute(stmt)
@@ -59,7 +61,7 @@ async def batch_fetch_users_safe(
     user_ids: list[int],
     db: AsyncSession = Depends(get_db),
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
-) -> list[dict[str, int | str]]:
+) -> list[dict[str, Union[int, str]]]:
     """Safe from CG-003: batch query outside the loop."""
     stmt = select(User).where(User.id.in_(user_ids))
     res = await db.execute(stmt)

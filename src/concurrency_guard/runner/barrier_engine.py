@@ -7,7 +7,7 @@ import importlib.util
 import sys
 from collections.abc import Callable, Coroutine
 from pathlib import Path
-from typing import Any, TypedDict
+from typing import Any, Optional, TypedDict
 
 import httpx
 from sqlalchemy import select
@@ -102,18 +102,18 @@ class BarrierResult(TypedDict):
 
 
 async def run_barrier_test(
-    app: Any | None = None,
+    app: Optional[Any] = None,
     endpoint: str = "/wallet/withdraw",
-    handler: Callable[[], Coroutine[Any, Any, bool]] | None = None,
+    handler: Optional[Callable[[], Coroutine[Any, Any, bool]]] = None,
     workers: int = 20,
     initial_balance: int = 50,
     withdraw_amount: int = 50,
     user_id: int = 1,
-    headers: dict[str, str] | None = None,
-    engine: Any | None = None,
-    session_factory: Any | None = None,
-    wallet_model: Any | None = None,
-    base_metadata: Any | None = None,
+    headers: Optional[dict[str, str]] = None,
+    engine: Optional[Any] = None,
+    session_factory: Optional[Any] = None,
+    wallet_model: Optional[Any] = None,
+    base_metadata: Optional[Any] = None,
 ) -> BarrierResult:
     """Stress test a FastAPI endpoint or async handler using an asyncio.Barrier."""
     enable_for_update_locking()
@@ -304,7 +304,7 @@ async def _run_dynamic_single_target(
 
 def _find_sqlalchemy_model_for_field(
     module: Any, mutated_field: str
-) -> tuple[Any, str, Any, Any, Any] | None:
+) -> Optional[tuple[Any, str, Any, Any, Any]]:
     """Find the SQLAlchemy model that has the mutated field, its ID field, engine, and session."""
     from sqlalchemy.orm import DeclarativeBase
 
@@ -356,7 +356,7 @@ def _find_sqlalchemy_model_for_field(
 
 async def run_dynamic_barrier_verification(
     file_path: Path,
-    function_name: str | None = None,
+    function_name: Optional[str] = None,
     workers: int = 20,
     initial_quota: int = 50,
 ) -> list[DynamicBarrierResult]:

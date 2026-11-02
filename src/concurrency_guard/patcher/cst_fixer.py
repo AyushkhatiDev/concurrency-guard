@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Optional, Union
+
 import libcst as cst
 from libcst.metadata import MetadataWrapper, ParentNodeProvider
 
@@ -22,7 +24,7 @@ def _is_select_chain(node: cst.CSTNode) -> bool:
     return False
 
 
-def _get_module_name(node: cst.CSTNode | None) -> str:
+def _get_module_name(node: Optional[cst.CSTNode]) -> str:
     """Extract dotted module or variable name from CST node."""
     if node is None:
         return ""
@@ -96,7 +98,7 @@ def _ensure_import(tree: cst.Module, module_name: str, import_name: str) -> cst.
         return tree.visit(AddToFrom())
 
     new_stmt = cst.parse_statement(f"from {module_name} import {import_name}\n")
-    body: list[cst.SimpleStatementLine | cst.BaseCompoundStatement] = list(tree.body)
+    body: list[Union[cst.SimpleStatementLine, cst.BaseCompoundStatement]] = list(tree.body)
     insert_idx = 0
     for idx, stmt_node in enumerate(body):
         if isinstance(stmt_node, cst.SimpleStatementLine) and any(
@@ -118,7 +120,7 @@ def _ensure_module_import(tree: cst.Module, module_name: str) -> cst.Module:
                         if _get_module_name(alias.name) == module_name:
                             return tree
     new_stmt = cst.parse_statement(f"import {module_name}\n")
-    body: list[cst.SimpleStatementLine | cst.BaseCompoundStatement] = list(tree.body)
+    body: list[Union[cst.SimpleStatementLine, cst.BaseCompoundStatement]] = list(tree.body)
     insert_idx = 0
     for idx, statement in enumerate(body):
         if isinstance(statement, cst.SimpleStatementLine) and any(
@@ -230,10 +232,10 @@ class WithForUpdateTransformer(cst.CSTTransformer):
 
     METADATA_DEPENDENCIES = (ParentNodeProvider,)
 
-    def __init__(self, target_functions: set[str] | None = None) -> None:
+    def __init__(self, target_functions: Optional[set[str]] = None) -> None:
         super().__init__()
         self.target_functions = target_functions
-        self._current_async_func: cst.FunctionDef | None = None
+        self._current_async_func: Optional[cst.FunctionDef] = None
         self._func_needs_fix: bool = False
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
@@ -289,7 +291,7 @@ class WithForUpdateTransformer(cst.CSTTransformer):
 class IdempotencyHeaderTransformer(cst.CSTTransformer):
     """LibCST transformer that appends idempotency_key parameter to POST route handlers."""
 
-    def __init__(self, target_functions: set[str] | None = None) -> None:
+    def __init__(self, target_functions: Optional[set[str]] = None) -> None:
         super().__init__()
         self.target_functions = target_functions
 
@@ -344,10 +346,10 @@ class IdempotencyHeaderTransformer(cst.CSTTransformer):
 class IntegrityErrorGuardTransformer(cst.CSTTransformer):
     """LibCST transformer wrapping await session.commit() in try/except IntegrityError."""
 
-    def __init__(self, target_functions: set[str] | None = None) -> None:
+    def __init__(self, target_functions: Optional[set[str]] = None) -> None:
         super().__init__()
         self.target_functions = target_functions
-        self._current_func: str | None = None
+        self._current_func: Optional[str] = None
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
         """Inspect function entry."""
@@ -372,7 +374,7 @@ class IntegrityErrorGuardTransformer(cst.CSTTransformer):
         if not self._current_func:
             return updated_node
 
-        session_name: str | None = None
+        session_name: Optional[str] = None
         for expr in original_node.body:
             if isinstance(expr, cst.Expr) and isinstance(expr.value, cst.Await):
                 call = expr.value.expression
@@ -398,7 +400,7 @@ except IntegrityError:
         return updated_node
 
 
-def apply_all_fixes(source_code: str, rules: set[str] | None = None) -> str:
+def apply_all_fixes(source_code: str, rules: Optional[set[str]] = None) -> str:
     """Apply auto-patch fixes for specified concurrency and idempotency rules."""
     selected_rules = rules if rules is not None else {"CG-001", "CG-002", "CG-004", "CG-006", "CG-007", "CG-009"}
     current_code = source_code

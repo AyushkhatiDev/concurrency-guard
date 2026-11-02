@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, Union
 
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from pydantic import BaseModel
@@ -34,7 +34,7 @@ class RedeemCouponRequest(BaseModel):
 async def redeem_coupon(
     request: RedeemCouponRequest,
     db: AsyncSession = Depends(get_db),
-) -> dict[str, str | int]:
+) -> dict[str, Union[str, int]]:
     """Redeem coupon using SQLAlchemy 2.0 await db.scalar without row-locking or idempotency."""
     stmt = select(Coupon).where(Coupon.code == request.code)
     coupon = await db.scalar(stmt)

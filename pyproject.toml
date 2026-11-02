@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "concurrency-guard"
-version = "2.0.0"
+version = "2.0.1"
 description = "Universal static concurrency analysis, semantic taint tracking, and runtime verification for Python"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -40,16 +40,18 @@ cguard = "concurrency_guard.cli:app"
 packages = ["src/concurrency_guard"]
 
 [tool.mypy]
+# Mypy itself no longer supports a Python 3.9 target; runtime support remains >=3.9.
 python_version = "3.10"
 strict = true
 warn_unused_configs = true
 
 [tool.ruff]
 line-length = 100
-target-version = "py310"
+target-version = "py39"
 
 [tool.ruff.lint]
-ignore = ["B008"]
+# Keep typing.Optional/Union so Typer's runtime get_type_hints works on Python 3.9.
+ignore = ["B008", "UP006", "UP007", "UP045"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

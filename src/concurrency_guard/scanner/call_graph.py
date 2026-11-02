@@ -11,6 +11,7 @@ import os
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Optional, Union
 
 
 @dataclass(frozen=True)
@@ -101,7 +102,7 @@ def _shared_names(tree: ast.Module) -> set[str]:
     return names
 
 
-def _mutates_shared(function: ast.FunctionDef | ast.AsyncFunctionDef, shared: set[str]) -> bool:
+def _mutates_shared(function: Union[ast.FunctionDef, ast.AsyncFunctionDef], shared: set[str]) -> bool:
     for node in ast.walk(function):
         if isinstance(node, (ast.Assign, ast.AugAssign)):
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
@@ -120,7 +121,7 @@ def _mutates_shared(function: ast.FunctionDef | ast.AsyncFunctionDef, shared: se
     return False
 
 
-def build_call_graph(files: list[Path], roots: list[Path] | None = None) -> CallGraph:
+def build_call_graph(files: list[Path], roots: Optional[list[Path]] = None) -> CallGraph:
     """Build a graph for local calls and imports among ``files``.
 
     Calls that resolve to third-party packages are intentionally omitted. A

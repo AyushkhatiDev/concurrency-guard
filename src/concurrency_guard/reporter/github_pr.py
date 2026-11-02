@@ -5,7 +5,7 @@ from __future__ import annotations
 import difflib
 from collections.abc import Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 from concurrency_guard.scanner.ast_rules import ASTFinding
 
@@ -13,9 +13,9 @@ from concurrency_guard.scanner.ast_rules import ASTFinding
 def generate_github_pr_markdown(
     file_path: Path,
     findings: list[ASTFinding],
-    barrier_result: Mapping[str, Any] | None = None,
-    patched_code: str | None = None,
-    original_code: str | None = None,
+    barrier_result: Optional[Mapping[str, Any]] = None,
+    patched_code: Optional[str] = None,
+    original_code: Optional[str] = None,
 ) -> str:
     """Generate a clean GitHub PR Markdown comment summarizing scan findings and proofs."""
     lines: list[str] = []

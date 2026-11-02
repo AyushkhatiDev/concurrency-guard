@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
+from typing import Union
 
 from fastapi import Depends, FastAPI, Header, HTTPException, status
 from pydantic import BaseModel, Field
@@ -46,7 +47,7 @@ app = FastAPI(title="Inventory Service")
 async def reserve_stock(
     request: ReserveStockRequest,
     db: AsyncSession = Depends(get_db),
-) -> dict[str, int | str]:
+) -> dict[str, Union[int, str]]:
     """Vulnerable endpoint: reads stock, modifies it, and commits without row locking."""
     stmt = select(InventoryItem).where(InventoryItem.item_id == request.item_id)
     result = await db.execute(stmt)
@@ -72,7 +73,7 @@ async def reserve_stock_safe(
     request: ReserveStockRequest,
     db: AsyncSession = Depends(get_db),
     idempotency_key: str = Header(..., alias="Idempotency-Key"),
-) -> dict[str, int | str]:
+) -> dict[str, Union[int, str]]:
     """Safe endpoint: acquires row-level lock using .with_for_update() to prevent race conditions."""
     stmt = (
         select(InventoryItem)

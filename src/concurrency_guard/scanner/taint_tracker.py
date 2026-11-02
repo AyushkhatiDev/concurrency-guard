@@ -10,6 +10,7 @@ from __future__ import annotations
 import ast
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Union
 
 from concurrency_guard.scanner.call_graph import CallGraph, FunctionNode
 
@@ -62,7 +63,7 @@ def _is_lock_context(node: ast.AST) -> bool:
     return "lock" in ast.unparse(node).lower() or "semaphore" in ast.unparse(node).lower()
 
 
-def _is_concurrent(node: ast.FunctionDef | ast.AsyncFunctionDef) -> bool:
+def _is_concurrent(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> bool:
     if isinstance(node, ast.AsyncFunctionDef):
         return True
     decorators = " ".join(ast.unparse(decorator).lower() for decorator in node.decorator_list)
@@ -105,7 +106,7 @@ class _FunctionFlow:
 
     def __init__(
         self,
-        node: ast.FunctionDef | ast.AsyncFunctionDef,
+        node: Union[ast.FunctionDef, ast.AsyncFunctionDef],
         filename: str,
         initial_taint: set[str],
     ) -> None:
@@ -162,9 +163,9 @@ class _FunctionFlow:
 
 def _function_ast_by_key(
     files: list[Path], graph: CallGraph
-) -> tuple[dict[str, ast.FunctionDef | ast.AsyncFunctionDef], dict[str, set[str]]]:
+) -> tuple[dict[str, Union[ast.FunctionDef, ast.AsyncFunctionDef]], dict[str, set[str]]]:
     """Map call-graph keys to AST definitions and module-level source names."""
-    definitions: dict[str, ast.FunctionDef | ast.AsyncFunctionDef] = {}
+    definitions: dict[str, Union[ast.FunctionDef, ast.AsyncFunctionDef]] = {}
     source_names: dict[str, set[str]] = {}
     by_location = {(node.filename, node.name): key for key, node in graph.functions.items()}
     for path in files:

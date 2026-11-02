@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Optional
 
 from pydantic import BaseModel
 
@@ -26,7 +26,7 @@ _STRING_LABEL_PATTERNS = ("sku", "code", "email", "name")
 
 
 def synthesize_request_payload(
-    pydantic_model: type[BaseModel] | None,
+    pydantic_model: Optional[type[BaseModel]],
     initial_quota: int = 50,
 ) -> dict[str, Any]:
     """Synthesize a deterministic request payload from Pydantic model field introspection.

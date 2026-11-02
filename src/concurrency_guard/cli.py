@@ -9,7 +9,7 @@ import json
 import sys
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import typer
 from rich.console import Console
@@ -55,7 +55,7 @@ def scan(
         "--format",
         help="Output format: 'table' or 'json'",
     ),
-    rules: Path | None = typer.Option(None, "--rules", help="YAML file containing custom concurrency rules"),
+    rules: Optional[Path] = typer.Option(None, "--rules", help="YAML file containing custom concurrency rules"),
 ) -> None:
     """Scan Python files or directories for concurrency vulnerabilities."""
     start_time = time.perf_counter()
@@ -141,7 +141,7 @@ def verify(
         exists=True,
         help="File containing FastAPI application to verify with concurrent barrier workers",
     ),
-    function: str | None = typer.Option(
+    function: Optional[str] = typer.Option(
         None,
         "--function",
         "-f",
@@ -266,7 +266,7 @@ def fix(
         exists=True,
         help="Target Python file to auto-patch with concurrency fixes",
     ),
-    rule: str | None = typer.Option(
+    rule: Optional[str] = typer.Option(
         None,
         "--rule",
         "-r",
@@ -375,7 +375,7 @@ def report(
         readable=True,
         help="Target Python file to generate Markdown report for",
     ),
-    output: Path | None = typer.Option(
+    output: Optional[Path] = typer.Option(
         None,
         "--output",
         "-o",
@@ -392,7 +392,7 @@ def report(
     source_code = file_path.read_text(encoding="utf-8")
     findings = scan_file(file_path)
 
-    barrier_result: BarrierResult | None = None
+    barrier_result: Optional[BarrierResult] = None
     try:
         module_name = f"cguard_report_target_{file_path.stem}"
         spec = importlib.util.spec_from_file_location(module_name, file_path)
