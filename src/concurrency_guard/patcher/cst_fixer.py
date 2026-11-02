@@ -400,9 +400,49 @@ except IntegrityError:
         return updated_node
 
 
+def _is_django_manager_expression(node: cst.BaseExpression) -> bool:
+    """Check whether an expression is a Django ``Model.objects`` manager."""
+    return isinstance(node, cst.Attribute) and node.attr.value == "objects"
+
+
+class DjangoSelectForUpdateTransformer(cst.CSTTransformer):
+    """Insert select_for_update() between Django's objects manager and fetch call."""
+
+    def __init__(self, target_functions: set[str]) -> None:
+        self.target_functions = target_functions
+        self._active = False
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
+        self._active = node.name.value in self.target_functions
+        return True
+
+    def leave_FunctionDef(
+        self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef
+    ) -> cst.FunctionDef:
+        if original_node.name.value in self.target_functions:
+            self._active = False
+        return updated_node
+
+    def leave_Call(self, original_node: cst.Call, updated_node: cst.Call) -> cst.Call:
+        """Rewrite Model.objects.get/filter into a select_for_update manager chain."""
+        if not self._active or not isinstance(original_node.func, cst.Attribute):
+            return updated_node
+        if original_node.func.attr.value not in {"get", "filter"}:
+            return updated_node
+        manager = original_node.func.value
+        if not _is_django_manager_expression(manager):
+            return updated_node
+        locked_manager = cst.Call(
+            func=cst.Attribute(value=manager, attr=cst.Name("select_for_update")),
+            args=(),
+        )
+        assert isinstance(updated_node.func, cst.Attribute)
+        return updated_node.with_changes(func=updated_node.func.with_changes(value=locked_manager))
+
+
 def apply_all_fixes(source_code: str, rules: Optional[set[str]] = None) -> str:
     """Apply auto-patch fixes for specified concurrency and idempotency rules."""
-    selected_rules = rules if rules is not None else {"CG-001", "CG-002", "CG-004", "CG-006", "CG-007", "CG-009"}
+    selected_rules = rules if rules is not None else {"CG-001", "CG-002", "CG-004", "CG-006", "CG-007", "CG-009", "CG-016"}
     current_code = source_code
     findings = scan_source_code(current_code)
 
@@ -465,6 +505,15 @@ def apply_all_fixes(source_code: str, rules: Optional[set[str]] = None) -> str:
         if targets:
             tree = cst.parse_module(current_code).visit(FileLockTransformer(targets))
             current_code = _ensure_import(tree, "filelock", "FileLock").code
+
+    # 7. CG-016: lock a Django ORM fetch before its read-modify-write sequence.
+    if "CG-016" in selected_rules:
+        findings = scan_source_code(current_code)
+        targets = {finding.function_name for finding in findings if finding.rule_id == "CG-016"}
+        if targets:
+            current_code = cst.parse_module(current_code).visit(
+                DjangoSelectForUpdateTransformer(targets)
+            ).code
 
     return current_code
 

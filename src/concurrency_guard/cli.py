@@ -270,7 +270,7 @@ def fix(
         None,
         "--rule",
         "-r",
-        help="Specific rule to fix (e.g. CG-001, CG-006, CG-007, CG-009). Defaults to all supported rules.",
+        help="Specific rule to fix (e.g. CG-001, CG-006, CG-007, CG-009, CG-016). Defaults to all supported rules.",
     ),
     write: bool = typer.Option(
         False,
@@ -316,6 +316,7 @@ def fix(
         "CG-006": "Wrapped async shared-state mutation in asyncio.Lock",
         "CG-007": "Wrapped threaded shared-state mutation in threading.Lock",
         "CG-009": "Wrapped concurrent file write in FileLock",
+        "CG-016": "Added Django select_for_update() to ORM fetch",
     }
 
     seen_fixes: set[tuple[str, str]] = set()

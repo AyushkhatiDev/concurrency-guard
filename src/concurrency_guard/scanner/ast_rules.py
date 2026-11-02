@@ -358,6 +358,41 @@ def _has_idempotency_or_lock(local_nodes: list[ast.AST], docstring: Optional[str
     return False
 
 
+def _django_manager_call(call: ast.Call) -> tuple[bool, bool]:
+    """Return whether a call fetches a Django model and has a row lock.
+
+    The supported forms are ``Model.objects.get(...)`` and
+    ``Model.objects.filter(...).first()``. The second value records a
+    ``select_for_update()`` anywhere in the manager chain.
+    """
+    if not isinstance(call.func, ast.Attribute):
+        return False, False
+    method = call.func.attr
+    manager: Optional[ast.AST] = None
+    if method == "get":
+        manager = call.func.value
+    elif method == "first" and isinstance(call.func.value, ast.Call):
+        filter_call = call.func.value
+        if isinstance(filter_call.func, ast.Attribute) and filter_call.func.attr == "filter":
+            manager = filter_call.func.value
+    if manager is None:
+        return False, False
+    manager_name = _expr_name(manager)
+    is_django_manager = manager_name.endswith(".objects") or ".objects." in manager_name
+    has_row_lock = any(
+        isinstance(child, ast.Attribute) and child.attr == "select_for_update"
+        for child in ast.walk(call)
+    )
+    return is_django_manager, has_row_lock
+
+
+def _target_root_name(node: ast.AST) -> str:
+    """Return the local name at the root of an attribute/subscript target."""
+    while isinstance(node, (ast.Attribute, ast.Subscript)):
+        node = node.value
+    return node.id if isinstance(node, ast.Name) else ""
+
+
 class ConcurrencyASTVisitor(ast.NodeVisitor):
     """AST visitor detecting concurrency race conditions and idempotency issues."""
 
@@ -634,10 +669,56 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 )
             )
 
+    def _check_cg_016(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], local_nodes: list[ast.AST]
+    ) -> None:
+        """Rule CG-016: Django object fetch/mutate/save without select_for_update()."""
+        tracked_models: set[str] = set()
+        unlocked_fetches: dict[str, ast.Call] = {}
+        mutated: set[str] = set()
+
+        statements = sorted((item for item in local_nodes if isinstance(item, ast.stmt)), key=lambda item: item.lineno)
+        for statement in statements:
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
+                target = statement.targets[0]
+                if isinstance(target, ast.Name):
+                    if isinstance(statement.value, ast.Call):
+                        is_fetch, has_lock = _django_manager_call(statement.value)
+                        if is_fetch:
+                            tracked_models.add(target.id)
+                            if not has_lock:
+                                unlocked_fetches[target.id] = statement.value
+                    elif isinstance(statement.value, ast.Name) and statement.value.id in tracked_models:
+                        # Preserve taint through aliases such as ``account = user``.
+                        tracked_models.add(target.id)
+                        if statement.value.id in unlocked_fetches:
+                            unlocked_fetches[target.id] = unlocked_fetches[statement.value.id]
+            elif isinstance(statement, ast.AugAssign) and _target_root_name(statement.target) in tracked_models:
+                mutated.add(_target_root_name(statement.target))
+            elif isinstance(statement, ast.Assign):
+                for target in statement.targets:
+                    if isinstance(target, ast.Attribute) and _target_root_name(target) in tracked_models:
+                        mutated.add(_target_root_name(target))
+
+            for call in (item for item in ast.walk(statement) if isinstance(item, ast.Call)):
+                if isinstance(call.func, ast.Attribute) and call.func.attr == "save":
+                    saved_name = _target_root_name(call.func.value)
+                    fetch = unlocked_fetches.get(saved_name)
+                    if fetch is not None and saved_name in mutated:
+                        self._add(
+                            "CG-016",
+                            fetch,
+                            node.name,
+                            "Django Unlocked Read-Modify-Write: a model fetched through objects is mutated and saved without select_for_update().",
+                            "Fetch the row with '.objects.select_for_update().get(...)' (or before filter().first()) inside transaction.atomic().",
+                        )
+                        return
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """Inspect sync function definitions for rule CG-005."""
         local_nodes = list(_walk_local_nodes(node))
         self._check_cg_005(node, local_nodes)
+        self._check_cg_016(node, local_nodes)
         self._check_standard_library_rules(node, local_nodes)
         self.generic_visit(node)
 
@@ -649,6 +730,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         self._check_cg_003(node)
         self._check_cg_004(node, local_nodes)
         self._check_cg_005(node, local_nodes)
+        self._check_cg_016(node, local_nodes)
         self._check_standard_library_rules(node, local_nodes)
         self.generic_visit(node)
 

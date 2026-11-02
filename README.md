@@ -107,8 +107,9 @@ cguard fix app/routers/wallet.py --write
 | **`CG-013`** | **Lock-order Deadlock** | Two locks are acquired in opposite nesting orders in one module. | Establish and enforce one global lock order. |
 | **`CG-014`** | **Inter-procedural Shared-state Race** | A local or imported function call chain reaches a cross-file function that mutates module shared state. | Propagate a synchronization boundary through the chain or make the leaf operation atomic. |
 | **`CG-015`** | **Tainted Shared-state Mutation** | A reference to global, class-level, singleton, or Redis shared state flows through locals/callees and is mutated without a lock. | Lock the complete operation or use an atomic primitive. |
+| **`CG-016`** | **Django Unlocked RMW** | A Django `objects.get()` or `objects.filter().first()` result is mutated and saved without `select_for_update()`. | Insert `select_for_update()` within `transaction.atomic()`. |
 
-`cguard fix --write` can remediate CG-006, CG-007, and CG-009 in addition to the
+`cguard fix --write` can remediate CG-006, CG-007, CG-009, and CG-016 in addition to the
 database rules: it injects the required standard-library lock import and wraps
 the flagged mutation, or wraps a write-mode file context in `filelock.FileLock`.
 
