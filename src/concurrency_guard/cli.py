@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import difflib
 import importlib.util
+import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +25,12 @@ from concurrency_guard.runner.barrier_engine import (
     run_barrier_test,
     run_dynamic_barrier_verification,
 )
-from concurrency_guard.scanner.ast_rules import ASTFinding, scan_file, scan_source_code
+from concurrency_guard.scanner.ast_rules import (
+    ASTFinding,
+    discover_python_files,
+    scan_file,
+    scan_source_code,
+)
 
 app = typer.Typer(no_args_is_help=True, help="Deterministic Concurrency & Idempotency Verifier")
 console = Console()
@@ -41,16 +48,41 @@ def scan(
         exists=True,
         help="File or directory to scan for concurrency bugs",
     ),
+    format: str = typer.Option(
+        "table",
+        "--format",
+        help="Output format: 'table' or 'json'",
+    ),
 ) -> None:
     """Scan Python files or directories for concurrency vulnerabilities."""
-    if path.is_dir():
-        py_files = sorted(path.rglob("*.py"))
-    else:
-        py_files = [path]
+    start_time = time.perf_counter()
+    py_files = discover_python_files(path)
 
     findings: list[ASTFinding] = []
     for py_file in py_files:
         findings.extend(scan_file(py_file))
+
+    elapsed_ms = (time.perf_counter() - start_time) * 1000
+
+    if format.lower() == "json":
+        payload = {
+            "scanned_files": len(py_files),
+            "elapsed_ms": round(elapsed_ms, 2),
+            "findings_count": len(findings),
+            "findings": [
+                {
+                    "rule_id": f.rule_id,
+                    "filename": f.filename,
+                    "lineno": f.lineno,
+                    "function_name": f.function_name,
+                    "message": f.message,
+                    "suggested_fix_hint": f.suggested_fix_hint,
+                }
+                for f in findings
+            ],
+        }
+        typer.echo(json.dumps(payload, indent=2))
+        raise typer.Exit(code=1 if findings else 0)
 
     if findings:
         table = Table(
@@ -76,7 +108,8 @@ def scan(
         console.print(table)
         console.print(
             Panel(
-                f"[bold red]Found {len(findings)} concurrency vulnerability issue(s).[/bold red]",
+                f"[bold red]Found {len(findings)} concurrency vulnerability issue(s).[/bold red]\n"
+                f"[dim]Scanned {len(py_files)} file(s) in {elapsed_ms:.1f} ms | Found {len(findings)} issue(s)[/dim]",
                 border_style="red",
             )
         )
@@ -84,7 +117,8 @@ def scan(
 
     console.print(
         Panel(
-            "[bold green]All AST concurrency checks passed. No vulnerabilities found.[/bold green]",
+            f"[bold green]All AST concurrency checks passed. No vulnerabilities found.[/bold green]\n"
+            f"[dim]Scanned {len(py_files)} file(s) in {elapsed_ms:.1f} ms | Found 0 issue(s)[/dim]",
             border_style="green",
         )
     )
