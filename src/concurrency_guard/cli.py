@@ -17,7 +17,12 @@ from rich.table import Table
 
 from concurrency_guard.patcher.cst_fixer import apply_all_fixes
 from concurrency_guard.reporter.github_pr import generate_github_pr_markdown
-from concurrency_guard.runner.barrier_engine import BarrierResult, run_barrier_test
+from concurrency_guard.runner.barrier_engine import (
+    BarrierResult,
+    DynamicBarrierResult,
+    run_barrier_test,
+    run_dynamic_barrier_verification,
+)
 from concurrency_guard.scanner.ast_rules import ASTFinding, scan_file, scan_source_code
 
 app = typer.Typer(no_args_is_help=True, help="Deterministic Concurrency & Idempotency Verifier")
@@ -93,6 +98,12 @@ def verify(
         exists=True,
         help="File containing FastAPI application to verify with concurrent barrier workers",
     ),
+    function: str | None = typer.Option(
+        None,
+        "--function",
+        "-f",
+        help="Specific function name to verify (e.g. 'withdraw', 'reserve_stock'). Defaults to all.",
+    ),
     workers: int = typer.Option(
         20,
         "--workers",
@@ -100,86 +111,81 @@ def verify(
         help="Number of concurrent workers synchronized at the barrier",
     ),
 ) -> None:
-    """Verify runtime concurrency and race condition invariants using asyncio.Barrier."""
-    module_name = f"cguard_target_{file_path.stem}"
-    spec = importlib.util.spec_from_file_location(module_name, file_path)
-    if spec is None or spec.loader is None:
-        console.print(f"[bold red]Error: Could not load target module from {file_path}[/bold red]")
-        raise typer.Exit(code=2)
+    """Verify runtime concurrency and race condition invariants using asyncio.Barrier.
 
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[module_name] = module
-    spec.loader.exec_module(module)
-
-    target_app: Any = getattr(module, "app", None)
-    if target_app is None:
-        console.print(f"[bold red]Error: No 'app' found in {file_path}[/bold red]")
-        raise typer.Exit(code=2)
-
-    engine: Any = getattr(module, "engine", None)
-    session_factory: Any = getattr(
-        module, "async_session", getattr(module, "AsyncSessionLocal", None)
-    )
-    wallet_model: Any = getattr(module, "Wallet", None)
-    base_class: Any = getattr(module, "Base", None)
-    base_metadata: Any = getattr(base_class, "metadata", None) if base_class else None
-
-    # Run barrier stress test
-    result = asyncio.run(
-        run_barrier_test(
-            app=target_app,
-            endpoint="/wallet/withdraw",
+    Dynamically discovers FastAPI routes, synthesizes Pydantic payloads,
+    seeds SQLAlchemy models, and fires concurrent barrier-synchronized requests.
+    """
+    results: list[DynamicBarrierResult] = asyncio.run(
+        run_dynamic_barrier_verification(
+            file_path=file_path,
+            function_name=function,
             workers=workers,
-            initial_balance=50,
-            withdraw_amount=50,
-            engine=engine,
-            session_factory=session_factory,
-            wallet_model=wallet_model,
-            base_metadata=base_metadata,
+            initial_quota=50,
         )
     )
 
-    if result["invariant_violated"]:
-        proof_text = (
-            f"[bold]Target File:[/bold] {file_path}\n"
-            f"[bold]Target Endpoint:[/bold] POST /wallet/withdraw\n"
-            f"[bold]Concurrent Barrier Workers:[/bold] {result['workers']}\n"
-            f"[bold]Initial Wallet Balance:[/bold] ${result['initial_balance']}\n"
-            f"[bold]Successful Withdrawals ($50 each):[/bold] "
-            f"[bold red]{result['success_count']}[/bold red]\n"
-            f"[bold]Final Resulting Balance:[/bold] "
-            f"[bold red]${result['final_balance']}[/bold red]\n\n"
-            f"[bold red]INVARIANT VIOLATION PROVEN:[/bold red]\n"
-            f"Multiple concurrent withdrawals succeeded against a $50 balance due to an unlocked "
-            f"Read-Modify-Write race condition (CG-001).\n"
-            f"Expected max 1 successful withdrawal, but {result['success_count']} requests succeeded!"
-        )
+    if not results:
         console.print(
             Panel(
-                proof_text,
-                title="[bold red]❌ CONCURRENCY INVARIANT VIOLATED (RACE PROVEN)[/bold red]",
-                border_style="red",
+                f"[bold yellow]No verifiable POST/PUT/PATCH routes with state mutation found in {file_path}.[/bold yellow]",
+                border_style="yellow",
             )
         )
-        raise typer.Exit(code=1)
+        raise typer.Exit(code=0)
 
-    safe_text = (
-        f"[bold]Target File:[/bold] {file_path}\n"
-        f"[bold]Target Endpoint:[/bold] POST /wallet/withdraw\n"
-        f"[bold]Concurrent Barrier Workers:[/bold] {result['workers']}\n"
-        f"[bold]Initial Wallet Balance:[/bold] ${result['initial_balance']}\n"
-        f"[bold]Successful Withdrawals:[/bold] {result['success_count']}\n"
-        f"[bold]Final Balance:[/bold] ${result['final_balance']}\n\n"
-        f"[bold green]Row-level locking preserved the concurrency invariant under barrier stress.[/bold green]"
-    )
-    console.print(
-        Panel(
-            safe_text,
-            title="[bold green]✔ CONCURRENCY INVARIANT HELD[/bold green]",
-            border_style="green",
-        )
-    )
-    raise typer.Exit(code=0)
+    any_violated = False
+
+    for result in results:
+        if result["invariant_violated"]:
+            any_violated = True
+            proof_text = (
+                f"[bold]Target File:[/bold] {file_path}\n"
+                f"[bold]Target Endpoint:[/bold] {result['endpoint_path']}\n"
+                f"[bold]Function:[/bold] {result['function_name']}\n"
+                f"[bold]Mutated Field:[/bold] {result['mutated_field']}\n"
+                f"[bold]Synthesized Payload:[/bold] {result['synthesized_payload']}\n"
+                f"[bold]Concurrent Barrier Workers:[/bold] {result['workers']}\n"
+                f"[bold]Initial {result['mutated_field']}:[/bold] {result['initial_balance']}\n"
+                f"[bold]Successful Concurrent Requests:[/bold] "
+                f"[bold red]{result['success_count']}[/bold red]\n"
+                f"[bold]Final {result['mutated_field']}:[/bold] "
+                f"[bold red]{result['final_balance']}[/bold red]\n\n"
+                f"[bold red]INVARIANT VIOLATION PROVEN:[/bold red]\n"
+                f"Multiple concurrent requests succeeded against {result['mutated_field']}="
+                f"{result['initial_balance']} due to an unlocked Read-Modify-Write race condition "
+                f"(CG-001).\n"
+                f"Expected max 1 successful request, but {result['success_count']} succeeded!"
+            )
+            console.print(
+                Panel(
+                    proof_text,
+                    title=f"[bold red]❌ RACE PROVEN: {result['endpoint_path']}[/bold red]",
+                    border_style="red",
+                )
+            )
+        else:
+            safe_text = (
+                f"[bold]Target File:[/bold] {file_path}\n"
+                f"[bold]Target Endpoint:[/bold] {result['endpoint_path']}\n"
+                f"[bold]Function:[/bold] {result['function_name']}\n"
+                f"[bold]Mutated Field:[/bold] {result['mutated_field']}\n"
+                f"[bold]Synthesized Payload:[/bold] {result['synthesized_payload']}\n"
+                f"[bold]Concurrent Barrier Workers:[/bold] {result['workers']}\n"
+                f"[bold]Successful Requests:[/bold] {result['success_count']}\n"
+                f"[bold]Final {result['mutated_field']}:[/bold] {result['final_balance']}\n\n"
+                f"[bold green]Row-level locking preserved the concurrency invariant "
+                f"under barrier stress.[/bold green]"
+            )
+            console.print(
+                Panel(
+                    safe_text,
+                    title=f"[bold green]✔ INVARIANT HELD: {result['endpoint_path']}[/bold green]",
+                    border_style="green",
+                )
+            )
+
+    raise typer.Exit(code=1 if any_violated else 0)
 
 
 @app.command()
