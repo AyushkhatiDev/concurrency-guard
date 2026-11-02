@@ -1,171 +1,105 @@
 # ConcurrencyGuard (`cguard`)
 
-[![CI](https://github.com/AyushkhatiDev/concurrency-guard/actions/workflows/ci.yml/badge.svg)](https://github.com/AyushkhatiDev/concurrency-guard/actions/workflows/ci.yml)
-[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
+[![Python Version](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-**Deterministic AST + Runtime Concurrency & Idempotency Verifier for Python FastAPI, SQLAlchemy, and Celery Backends.**
+**Deterministic AST static analysis, runtime race verification, and auto-patching engine for Python FastAPI and SQLAlchemy backends.**
+
+![ConcurrencyGuard Demo](demo_2.gif)
 
 ---
 
-## ⚡ Why ConcurrencyGuard?
+## The Problem vs. The `cguard` Solution
 
-Modern async Python services frequently suffer from silent concurrency bugs, double-spend race conditions, lost updates, and duplicate background tasks. Traditional linters only check syntax and type hints, while external LLM tools hallucinate or miss non-local control flow races.
-
-**ConcurrencyGuard (`cguard`)** solves this with a **100% deterministic pipeline**:
-1. **Pure AST Static Scanning**: Catches race patterns, missing idempotency keys, N+1 queries, uniqueness races, and unsafe Celery retry tasks.
-2. **Runtime `asyncio.Barrier` Exploit Engine**: Proves race conditions empirically by synchronizing concurrent coroutines to hit endpoints at the exact same microsecond.
-3. **Deterministic `LibCST` Auto-Patcher**: Safely rewrites code to apply database row locks (`.with_for_update()`), inject FastAPI `Idempotency-Key` headers, and wrap transactions in `IntegrityError` guards.
-4. **Automated GitHub PR Reporter**: Emits rich Markdown comments with exploit proofs and diff previews for pull requests.
-
----
-
-## 📋 Rule Catalog
-
-| Rule ID | Name | Target / Trigger Condition | Automated Fix |
+| Vulnerability Vector | Linters (Ruff, Flake8) | AI / LLM Code Reviewers | `cguard` |
 |:---|:---|:---|:---|
-| **`CG-001`** | **Unlocked Read-Modify-Write Race** | Async route reads database state with `select()`, mutates an attribute, and calls `commit()` without `.with_for_update()` locking. | Appends `.with_for_update()` row-level locks via LibCST. |
-| **`CG-002`** | **Missing Idempotency Guard** | Async `@app.post` or `@router.post` route mutates state without an `idempotency_key` parameter. | Injects `idempotency_key: str = Header(..., alias="Idempotency-Key")` into route parameters. |
-| **`CG-003`** | **Async Loop N+1 Query Explode** | `db.execute(...)` or `session.execute(...)` call located directly inside a `for` or `async for` loop body. | Flags query explosion; suggests batching or eager loading (`joinedload`/`selectinload`). |
-| **`CG-004`** | **Check-Then-Act Uniqueness Race** | Async route checks existence with `select()`, calls `add()`, and commits without catching `sqlalchemy.exc.IntegrityError`. | Wraps commit statements in `try...except IntegrityError` with session rollback. |
-| **`CG-005`** | **Non-Idempotent Celery Retry Task** | Celery task (`@app.task`, `@shared_task`) with `autoretry_for` or `max_retries` executes mutations (`.add()`, `.commit()`, `.post()`) without `acks_late=True` or an idempotency lock. | Recommends `acks_late=True` and distributed deduplication lock before side-effects. |
+| **Unlocked Read-Modify-Write** (`CG-001`) | ❌ Blind to DB semantics | ⚠️ Hallucinates, misses context | ✅ **Deterministic AST detection** |
+| **Missing Idempotency Headers** (`CG-002`) | ❌ Ignored | ⚠️ High latency, non-deterministic | ✅ **Sub-millisecond AST verification** |
+| **Async Loop N+1 Explode** (`CG-003`) | ❌ Unchecked | ⚠️ Inconsistent pattern matching | ✅ **Local control-flow AST traversal** |
+| **Check-Then-Act Uniqueness Races** (`CG-004`) | ❌ Ignored | ⚠️ Frequently missed | ✅ **Catch-integrity validation** |
+| **Celery Retry Duplication** (`CG-005`) | ❌ Ignored | ⚠️ Misses task retry mechanics | ✅ **Decorator & kwarg audit** |
+| **Empirical Exploit Verification** | ❌ None | ❌ Cannot execute code | ✅ **`asyncio.Barrier` stress engine** |
+| **Deterministic Code Remediation** | ⚠️ Style fixes only | ⚠️ Introduces syntax regressions | ✅ **Zero-regression `LibCST` patcher** |
+
+Modern AI agents and developers write fast asynchronous endpoints, but routinely introduce critical race conditions: forgetting `.with_for_update()` row-level locks on balance deductions, omitting `Idempotency-Key` headers on mutating POST routes, or executing queries inside loops. 
+
+Standard linters only validate syntax, while LLM-based reviewers are slow, non-deterministic, cost money per token, and miss non-local control flow races. **`cguard` runs 100% locally with zero external API calls**, using pure Python AST analysis to catch race conditions in milliseconds and providing runtime proof via synchronized barrier stress testing.
 
 ---
 
-## 🚀 Installation
+## Installation
 
 ```bash
-# Clone and install in virtual environment
-git clone https://github.com/AyushkhatiDev/concurrency-guard.git
-cd concurrency-guard
-python -m venv .venv
-source .venv/bin/activate
-pip install -e .
-```
-
-To install with development and testing dependencies:
-```bash
-pip install -e ".[dev]"
+pip install concurrency-guard
 ```
 
 ---
 
-## 🛠️ CLI Usage
+## Quick Start
 
-### 1. `cguard scan` — Static AST Analysis
-Scan files or entire directories for concurrency vulnerabilities:
+### 1. Scan your codebase for concurrency vulnerabilities
+Analyze files or entire directories in milliseconds with zero false positives:
+
 ```bash
-# Scan a single file
-cguard scan examples/vulnerable_wallet.py
+# Scan a single route or module
+cguard scan app/routers/wallet.py
 
-# Scan an entire codebase
+# Scan an entire repository (auto-excludes virtualenvs, migrations, and build caches)
 cguard scan src/
 ```
 
-### 2. `cguard verify` — Runtime `asyncio.Barrier` Verification
-Simulate high-concurrency traffic using synchronized barrier workers to prove whether an invariant holds or breaks under load:
+### 2. Verify race conditions empirically at runtime
+Launch synchronized concurrent workers via `asyncio.Barrier` to mathematically prove whether an endpoint preserves or violates state invariants under high concurrency:
+
 ```bash
 cguard verify examples/vulnerable_wallet.py --workers 20
 ```
 
-Sample exploit proof output:
-```
+```text
 ❌ CONCURRENCY INVARIANT VIOLATED (RACE PROVEN)
-Target File: examples/vulnerable_wallet.py
 Target Endpoint: POST /wallet/withdraw
 Concurrent Barrier Workers: 20
-Initial Wallet Balance: $50
+Initial Balance: $50
 Successful Withdrawals ($50 each): 20
-Final Resulting Balance: $-950
-
-INVARIANT VIOLATION PROVEN:
-Multiple concurrent withdrawals succeeded against a $50 balance due to an unlocked
-Read-Modify-Write race condition (CG-001).
+Final Resulting Balance: $-950 (Double-spend exploit confirmed!)
 ```
 
-### 3. `cguard fix` — Deterministic LibCST Auto-Patcher
-Inspect and apply deterministic code patches:
+### 3. Automatically patch vulnerabilities in-place
+Safely rewrite source code using `LibCST` syntax-tree transformations:
+
 ```bash
-# Preview auto-fixes (dry-run)
-cguard fix examples/vulnerable_wallet.py
+# Preview patch diff (dry-run)
+cguard fix app/routers/wallet.py
 
-# Apply specific rule fix
-cguard fix examples/vulnerable_wallet.py --rule CG-001 --write
-
-# Apply all available auto-fixes directly to disk
-cguard fix examples/vulnerable_wallet.py --write
-```
-
-### 4. `cguard report` — GitHub Pull Request Markdown Reporter
-Generate comprehensive Markdown summaries for CI/CD:
-```bash
-# Print report to stdout
-cguard report examples/vulnerable_wallet.py
-
-# Write report to markdown file for GitHub Actions PR comment
-cguard report examples/vulnerable_wallet.py --output pr_report.md
+# Write deterministic fixes directly to disk
+cguard fix app/routers/wallet.py --write
 ```
 
 ---
 
-## 🤖 GitHub Action Integration
+## Supported Vulnerability Rules
 
-Add ConcurrencyGuard to your pull request workflows:
-
-```yaml
-name: Concurrency Guard CI
-
-on:
-  pull_request:
-    branches: [main]
-
-jobs:
-  concurrency-audit:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Run ConcurrencyGuard Action
-        uses: AyushkhatiDev/concurrency-guard@main
-        with:
-          path: "app"
-          report-file: "app/main.py"
-          output: "pr-report.md"
-
-      - name: Post PR Comment
-        if: failure() || success()
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            if (fs.existsSync('pr-report.md')) {
-              const body = fs.readFileSync('pr-report.md', 'utf8');
-              github.rest.issues.createComment({
-                issue_number: context.issue.number,
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                body: body
-              });
-            }
-```
+| Rule ID | Rule Name | Trigger Condition | Automated Remediation (`LibCST`) |
+|:---|:---|:---|:---|
+| **`CG-001`** | **Unlocked Read-Modify-Write Race** | Route queries state (`select`, `db.scalar`, `session.get`), mutates an attribute, and commits without `.with_for_update()` locking. | Appends `.with_for_update()` row lock to the query chain. |
+| **`CG-002`** | **Missing Idempotency Guard on POST** | Mutating `@app.post` or `@router.post` endpoint executes database writes without an `Idempotency-Key` parameter. | Injects `idempotency_key: str = Header(..., alias="Idempotency-Key")` into endpoint parameters. |
+| **`CG-003`** | **Async Loop N+1 Query Explode** | Query operations (`.execute()`, `.scalar()`, `.scalars()`, `.get()`) called directly inside a `for` or `async for` loop body. | Flags query explosion; suggests eager loading via `joinedload` / `selectinload`. |
+| **`CG-004`** | **Check-Then-Act Uniqueness Race** | Route checks existence via `select()`, executes `db.add()`, and commits without wrapping in a `try...except IntegrityError` handler. | Wraps commit in `try...except IntegrityError` with rollback. |
+| **`CG-005`** | **Non-Idempotent Celery Retry Task** | Celery task configured with retries (`autoretry_for`, `max_retries`) executes mutations without `acks_late=True` or an idempotency lock. | Recommends `acks_late=True` and distributed deduplication lock before side-effects. |
 
 ---
 
-## 🧪 Testing
+## Architecture
 
-ConcurrencyGuard is thoroughly tested with unit tests and runtime stress verifications:
+`concurrency-guard` operates entirely offline and locally with zero external network or LLM dependencies:
 
-```bash
-# Run test suite
-pytest -v
-
-# Run lint and type checking
-ruff check .
-mypy src/
-```
+- **Static Scanner (`ast`)**: Recursively walks Python Abstract Syntax Trees to identify dangerous state-mutation patterns across control flow, function parameters, loop constructs, and decorator metadata.
+- **Runtime Verification Engine (`asyncio.Barrier`)**: Uses dynamic introspection and payload synthesis to seed isolated test states, synchronizing 20+ coroutines to hit endpoints at the exact same microsecond to prove state corruption.
+- **Auto-Patcher (`libcst`)**: Performs lossless, Concrete Syntax Tree transformations that preserve comments, formatting, and indentation while injecting locks and error guards.
 
 ---
 
-## 📄 License
+## License
 
-MIT License. See [LICENSE](LICENSE) for details.
+Distributed under the MIT License. See [LICENSE](LICENSE) for details.

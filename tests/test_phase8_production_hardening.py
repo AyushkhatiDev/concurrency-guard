@@ -97,3 +97,4 @@ def test_graceful_handling_of_syntax_error_files(tmp_path: Path) -> None:
     result = runner.invoke(app, ["scan", str(tmp_path)])
     assert result.exit_code == 0
     assert "No vulnerabilities found" in result.stdout
+
