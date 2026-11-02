@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "concurrency-guard"
-version = "0.1.0"
-description = "Deterministic AST + Runtime Concurrency & Idempotency Verifier for Python FastAPI/SQLAlchemy backends"
+version = "2.0.0"
+description = "Universal static concurrency analysis, semantic taint tracking, and runtime verification for Python"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
@@ -17,7 +17,13 @@ dependencies = [
     "sqlalchemy>=2.0.30",
     "aiosqlite>=0.20.0",
     "greenlet>=3.0.0",
+    "PyYAML>=6.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/AyushkhatiDev/concurrency-guard"
+Repository = "https://github.com/AyushkhatiDev/concurrency-guard"
+Issues = "https://github.com/AyushkhatiDev/concurrency-guard/issues"
 
 [project.optional-dependencies]
 dev = [

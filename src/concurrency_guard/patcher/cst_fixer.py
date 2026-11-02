@@ -26,6 +26,8 @@ def _get_module_name(node: cst.CSTNode | None) -> str:
     """Extract dotted module or variable name from CST node."""
     if node is None:
         return ""
+    if isinstance(node, cst.Call):
+        return _get_module_name(node.func)
     if isinstance(node, cst.Name):
         return node.value
     if isinstance(node, cst.Attribute):
@@ -104,6 +106,123 @@ def _ensure_import(tree: cst.Module, module_name: str, import_name: str) -> cst.
             insert_idx = idx + 1
     body.insert(insert_idx, new_stmt)
     return tree.with_changes(body=tuple(body))
+
+
+def _ensure_module_import(tree: cst.Module, module_name: str) -> cst.Module:
+    """Ensure ``import module_name`` exists without disturbing existing trivia."""
+    for statement in tree.body:
+        if isinstance(statement, cst.SimpleStatementLine):
+            for child in statement.body:
+                if isinstance(child, cst.Import):
+                    for alias in child.names:
+                        if _get_module_name(alias.name) == module_name:
+                            return tree
+    new_stmt = cst.parse_statement(f"import {module_name}\n")
+    body: list[cst.SimpleStatementLine | cst.BaseCompoundStatement] = list(tree.body)
+    insert_idx = 0
+    for idx, statement in enumerate(body):
+        if isinstance(statement, cst.SimpleStatementLine) and any(
+            isinstance(child, cst.ImportFrom) and _get_module_name(child.module) == "__future__"
+            for child in statement.body
+        ):
+            insert_idx = idx + 1
+    body.insert(insert_idx, new_stmt)
+    return tree.with_changes(body=tuple(body))
+
+
+def _is_shared_mutation(statement: cst.SimpleStatementLine) -> bool:
+    """Recognize assignments and built-in mutator calls suitable for lock wrapping."""
+    for child in statement.body:
+        if isinstance(child, (cst.Assign, cst.AugAssign)):
+            targets = child.targets if isinstance(child, cst.Assign) else (child.target,)
+            for target in targets:
+                expression = target.target if isinstance(target, cst.AssignTarget) else target
+                if isinstance(expression, (cst.Subscript, cst.Attribute)):
+                    return True
+        if isinstance(child, cst.Expr) and isinstance(child.value, cst.Call):
+            function = child.value.func
+            if isinstance(function, cst.Attribute) and function.attr.value in {
+                "append", "extend", "update", "pop", "remove", "clear", "setdefault", "add",
+            }:
+                return True
+    return False
+
+
+class SharedStateLockTransformer(cst.CSTTransformer):
+    """Wrap targeted shared-state mutations in a standard-library lock context."""
+
+    def __init__(self, target_functions: set[str], asynchronous: bool) -> None:
+        self.target_functions = target_functions
+        self.asynchronous = asynchronous
+        self._active = False
+        self._lock_depth = 0
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
+        self._active = node.name.value in self.target_functions and (
+            node.asynchronous is not None if self.asynchronous else node.asynchronous is None
+        )
+        return True
+
+    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.FunctionDef:
+        if original_node.name.value in self.target_functions:
+            self._active = False
+        return updated_node
+
+    def visit_With(self, node: cst.With) -> bool:
+        if any("lock" in _get_module_name(item.item).lower() for item in node.items):
+            self._lock_depth += 1
+        return True
+
+    def leave_With(self, original_node: cst.With, updated_node: cst.With) -> cst.With:
+        if any("lock" in _get_module_name(item.item).lower() for item in original_node.items):
+            self._lock_depth -= 1
+        return updated_node
+
+    def leave_SimpleStatementLine(
+        self, original_node: cst.SimpleStatementLine, updated_node: cst.SimpleStatementLine
+    ) -> cst.BaseStatement:
+        if not self._active or self._lock_depth or not _is_shared_mutation(original_node):
+            return updated_node
+        prefix = "async with asyncio.Lock():" if self.asynchronous else "with threading.Lock():"
+        wrapper = cst.parse_statement(f"{prefix}\n    pass\n")
+        assert isinstance(wrapper, cst.With)
+        return wrapper.with_changes(body=cst.IndentedBlock(body=(updated_node,)))
+
+
+def _is_write_open(item: cst.WithItem) -> bool:
+    """Return whether a with-item opens a file in a destructive/write mode."""
+    if not isinstance(item.item, cst.Call) or _get_module_name(item.item.func) not in {"open", "aiofiles.open"}:
+        return False
+    if len(item.item.args) < 2 or not isinstance(item.item.args[1].value, cst.SimpleString):
+        return False
+    return any(mode in item.item.args[1].value.evaluated_value for mode in "wax+")
+
+
+class FileLockTransformer(cst.CSTTransformer):
+    """Put write-mode ``open`` contexts under a FileLock in targeted functions."""
+
+    def __init__(self, target_functions: set[str]) -> None:
+        self.target_functions = target_functions
+        self._active = False
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
+        self._active = node.name.value in self.target_functions
+        return True
+
+    def leave_FunctionDef(self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef) -> cst.FunctionDef:
+        if original_node.name.value in self.target_functions:
+            self._active = False
+        return updated_node
+
+    def leave_With(self, original_node: cst.With, updated_node: cst.With) -> cst.With:
+        if not self._active or not any(_is_write_open(item) for item in original_node.items):
+            return updated_node
+        open_item = next(item for item in original_node.items if _is_write_open(item))
+        assert isinstance(open_item.item, cst.Call) and open_item.item.args
+        path = cst.Module([]).code_for_node(open_item.item.args[0].value)
+        wrapper = cst.parse_statement(f"with FileLock({path} + '.lock'):\n    pass\n")
+        assert isinstance(wrapper, cst.With)
+        return wrapper.with_changes(body=cst.IndentedBlock(body=(updated_node,)))
 
 
 class WithForUpdateTransformer(cst.CSTTransformer):
@@ -281,7 +400,7 @@ except IntegrityError:
 
 def apply_all_fixes(source_code: str, rules: set[str] | None = None) -> str:
     """Apply auto-patch fixes for specified concurrency and idempotency rules."""
-    selected_rules = rules if rules is not None else {"CG-001", "CG-002", "CG-004"}
+    selected_rules = rules if rules is not None else {"CG-001", "CG-002", "CG-004", "CG-006", "CG-007", "CG-009"}
     current_code = source_code
     findings = scan_source_code(current_code)
 
@@ -315,6 +434,35 @@ def apply_all_fixes(source_code: str, rules: set[str] | None = None) -> str:
             tree = _ensure_import(tree, "sqlalchemy.exc", "IntegrityError")
             tree = _ensure_import(tree, "fastapi", "HTTPException")
             current_code = tree.code
+
+    # 4. CG-006: protect async shared-state mutations.
+    if "CG-006" in selected_rules:
+        findings = scan_source_code(current_code)
+        targets = {finding.function_name for finding in findings if finding.rule_id == "CG-006"}
+        if targets:
+            tree = cst.parse_module(current_code).visit(
+                SharedStateLockTransformer(targets, asynchronous=True)
+            )
+            current_code = _ensure_module_import(tree, "asyncio").code
+
+    # 5. CG-007: protect threaded shared-state mutations.
+    if "CG-007" in selected_rules:
+        findings = scan_source_code(current_code)
+        targets = {finding.function_name for finding in findings if finding.rule_id == "CG-007"}
+        if targets:
+            tree = cst.parse_module(current_code).visit(
+                SharedStateLockTransformer(targets, asynchronous=False)
+            )
+            current_code = _ensure_module_import(tree, "threading").code
+
+    # 6. CG-009 is concurrent file overwrite. CG-008 is accepted for callers
+    # that used the pre-release file-rule identifier.
+    if {"CG-008", "CG-009"}.intersection(selected_rules):
+        findings = scan_source_code(current_code)
+        targets = {finding.function_name for finding in findings if finding.rule_id == "CG-009"}
+        if targets:
+            tree = cst.parse_module(current_code).visit(FileLockTransformer(targets))
+            current_code = _ensure_import(tree, "filelock", "FileLock").code
 
     return current_code
 

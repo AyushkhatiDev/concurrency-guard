@@ -7,6 +7,15 @@ import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
+
+import yaml  # type: ignore[import-untyped]
+
+from concurrency_guard.scanner.call_graph import build_call_graph
+from concurrency_guard.scanner.taint_tracker import (
+    find_tainted_shared_state_mutations,
+    find_tainted_shared_state_mutations_in_source,
+)
 
 EXCLUDED_DIRS: frozenset[str] = frozenset({
     ".venv",
@@ -30,6 +39,107 @@ class ASTFinding:
     function_name: str
     message: str
     suggested_fix_hint: str
+
+
+@dataclass(frozen=True)
+class CFGNode:
+    """A deliberately small, inspectable control-flow graph node.
+
+    The graph is not an executor: it provides the sequencing backbone used by
+    semantic rules, including branches and loop back-edges.
+    """
+
+    lineno: int
+    kind: str
+    successors: tuple[int, ...]
+
+
+def build_cfg(function: ast.FunctionDef | ast.AsyncFunctionDef) -> list[CFGNode]:
+    """Build a lightweight intra-procedural CFG for a function body."""
+    statements = [n for n in ast.walk(function) if isinstance(n, ast.stmt)]
+    statements = sorted({id(n): n for n in statements}.values(), key=lambda n: (n.lineno, n.col_offset))
+    result: list[CFGNode] = []
+    for index, statement in enumerate(statements):
+        next_line = statements[index + 1].lineno if index + 1 < len(statements) else -1
+        successors: tuple[int, ...] = () if next_line == -1 else (next_line,)
+        if isinstance(statement, (ast.For, ast.AsyncFor, ast.While)):
+            successors = tuple(x for x in (next_line, statement.lineno) if x != -1)
+        result.append(CFGNode(statement.lineno, type(statement).__name__, successors))
+    return result
+
+
+def _expr_name(node: ast.AST) -> str:
+    """Return a stable dotted name for names, attributes, and calls."""
+    if isinstance(node, ast.Call):
+        return _expr_name(node.func)
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _expr_name(node.value)
+        return f"{base}.{node.attr}" if base else node.attr
+    return ""
+
+
+def _is_lock_expr(node: ast.AST) -> bool:
+    name = _expr_name(node).lower()
+    return "lock" in name or "semaphore" in name
+
+
+def _lock_names(node: ast.AST) -> list[str]:
+    """Find names held by with/async-with statements, preserving nesting order."""
+    names: list[str] = []
+    for child in ast.walk(node):
+        if isinstance(child, (ast.With, ast.AsyncWith)):
+            for item in child.items:
+                if _is_lock_expr(item.context_expr):
+                    name = _expr_name(item.context_expr)
+                    names.append(name or "<lock>")
+    return names
+
+
+def _has_lock_context(node: ast.AST) -> bool:
+    return bool(_lock_names(node))
+
+
+def _assignment_target_name(node: ast.AST) -> str:
+    if isinstance(node, (ast.Name, ast.Attribute, ast.Subscript)):
+        return ast.unparse(node)
+    return ""
+
+
+def _mutated_targets(node: ast.AST) -> set[str]:
+    targets: set[str] = set()
+    for child in ast.walk(node):
+        if isinstance(child, ast.AugAssign):
+            targets.add(_assignment_target_name(child.target))
+        elif isinstance(child, ast.Assign):
+            for target in child.targets:
+                targets.add(_assignment_target_name(target))
+        elif (
+            isinstance(child, ast.Call)
+            and isinstance(child.func, ast.Attribute)
+            and child.func.attr in {"append", "extend", "update", "pop", "remove", "setdefault", "clear"}
+        ):
+            targets.add(_assignment_target_name(child.func.value))
+    return {target for target in targets if target}
+
+
+def _is_concurrency_api(node: ast.AST) -> bool:
+    return any(token in _expr_name(node).lower() for token in ("thread", "executor", "create_task", "gather", "process"))
+
+
+def _is_file_write(call: ast.Call) -> bool:
+    name = _expr_name(call.func)
+    if name not in {"open", "aiofiles.open"} or len(call.args) < 2:
+        return False
+    mode = call.args[1]
+    return isinstance(mode, ast.Constant) and isinstance(mode.value, str) and any(x in mode.value for x in "wax+")
+
+
+def _literal_path(call: ast.Call) -> str | None:
+    if call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str):
+        return call.args[0].value
+    return None
 
 
 def _walk_local_nodes(node: ast.AST) -> Iterator[ast.AST]:
@@ -254,6 +364,114 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
     def __init__(self, filename: str = "<memory>") -> None:
         self.filename = filename
         self.findings: list[ASTFinding] = []
+        self.shared_names: set[str] = set()
+        self.thread_targets: set[str] = set()
+        self.lock_orders: list[tuple[str, str, int, str]] = []
+
+    def visit_Module(self, node: ast.Module) -> None:
+        """Collect module shared state and thread entry points before functions."""
+        for statement in node.body:
+            if isinstance(statement, (ast.Assign, ast.AnnAssign)):
+                value = statement.value
+                if isinstance(value, (ast.List, ast.Dict, ast.Set)):
+                    targets = statement.targets if isinstance(statement, ast.Assign) else [statement.target]
+                    self.shared_names.update(_assignment_target_name(t) for t in targets)
+        for call in (n for n in ast.walk(node) if isinstance(n, ast.Call) and _is_concurrency_api(n.func)):
+            for keyword in call.keywords:
+                if keyword.arg in {"target", "fn", "func"} and isinstance(keyword.value, ast.Name):
+                    self.thread_targets.add(keyword.value.id)
+            for arg in call.args:
+                if isinstance(arg, ast.Name):
+                    self.thread_targets.add(arg.id)
+        self.generic_visit(node)
+
+    def _add(self, rule_id: str, node: ast.AST, function: str, message: str, hint: str) -> None:
+        self.findings.append(ASTFinding(rule_id, self.filename, getattr(node, "lineno", 0), function, message, hint))
+
+    def _check_standard_library_rules(
+        self, node: ast.FunctionDef | ast.AsyncFunctionDef, local_nodes: list[ast.AST]
+    ) -> None:
+        """Detect shared-memory and file races without framework/ORM assumptions."""
+        locked = _has_lock_context(node)
+        mutations = _mutated_targets(node)
+        shared_mutations = [m for m in mutations if m.split("[")[0].split(".")[0] in self.shared_names]
+        is_thread_target = node.name in self.thread_targets
+
+        if isinstance(node, ast.AsyncFunctionDef) and shared_mutations and not locked:
+            self._add(
+                "CG-006", node, node.name,
+                "Async shared-state mutation without an asyncio.Lock context manager.",
+                "Create a shared asyncio.Lock and wrap the read/write section in 'async with lock:'.",
+            )
+        if (is_thread_target or any(_is_concurrency_api(n) for n in local_nodes)) and shared_mutations and not locked:
+            self._add(
+                "CG-007", node, node.name,
+                "Threaded shared built-in mutation without a threading.Lock or threading.RLock.",
+                "Protect the shared collection with 'with lock:' (or redesign around a Queue).",
+            )
+
+        # Semantic RMW: remember a value read from an attribute/subscript, then
+        # identify its later assignment back. This catches arbitrary classes,
+        # schemas, and in-memory objects rather than only ORM entities.
+        reads: dict[str, str] = {}
+        for statement in sorted((n for n in local_nodes if isinstance(n, ast.stmt)), key=lambda n: n.lineno):
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
+                value = statement.value
+                if isinstance(value, (ast.Attribute, ast.Subscript)):
+                    reads[statement.targets[0].id] = ast.unparse(value)
+            if isinstance(statement, ast.Assign):
+                for target in statement.targets:
+                    target_name = _assignment_target_name(target)
+                    value_names = {n.id for n in ast.walk(statement.value) if isinstance(n, ast.Name)}
+                    if target_name in reads.values() and value_names.intersection(reads) and not locked:
+                        self._add(
+                            "CG-008", statement, node.name,
+                            "Read-Modify-Write race: state is read, transformed, and written back without a lock.",
+                            "Use the appropriate async/thread/process lock or an atomic update primitive around the full RMW sequence.",
+                        )
+                        break
+
+        for call in (n for n in local_nodes if isinstance(n, ast.Call) and _is_file_write(n)):
+            path = _literal_path(call)
+            concurrent = isinstance(node, ast.AsyncFunctionDef) or is_thread_target or any(isinstance(n, (ast.For, ast.AsyncFor)) for n in local_nodes)
+            if concurrent and not locked:
+                self._add(
+                    "CG-009", call, node.name,
+                    "Concurrent file overwrite: write-mode open() may race on a shared path.",
+                    "Use a file lock, unique per-task filenames, or serialize writes through one worker.",
+                )
+            if path and (path.startswith("/tmp/") or "tmp" in path.lower()):
+                self._add(
+                    "CG-010", call, node.name,
+                    "Hard-coded temporary filename can collide between concurrent tasks.",
+                    "Use tempfile.NamedTemporaryFile, TemporaryDirectory, or mkstemp instead.",
+                )
+
+        calls = [n for n in local_nodes if isinstance(n, ast.Call)]
+        redis_gets = [n for n in calls if _expr_name(n.func).lower().endswith((".get", ".mget")) and "redis" in _expr_name(n.func).lower()]
+        redis_sets = [n for n in calls if _expr_name(n.func).lower().endswith((".set", ".setex")) and "redis" in _expr_name(n.func).lower()]
+        memcached_non_atomic = [n for n in calls if "memcache" in _expr_name(n.func).lower() and _expr_name(n.func).lower().endswith(".set")]
+        if redis_gets and redis_sets and not locked and not any("setnx" in _expr_name(c.func).lower() or "lua" in _expr_name(c.func).lower() for c in calls):
+            self._add("CG-011", redis_gets[0], node.name, "Redis check-then-act sequence is non-atomic.", "Use SET NX/EX, a Redis lock, WATCH/MULTI, or a Lua script.")
+        if memcached_non_atomic and any(".get" in _expr_name(c.func).lower() for c in calls):
+            self._add("CG-012", memcached_non_atomic[0], node.name, "Memcached get/set increment is non-atomic.", "Use Memcached incr/decr or a compare-and-swap workflow.")
+
+        for with_node in (n for n in ast.walk(node) if isinstance(n, (ast.With, ast.AsyncWith))):
+            outer = [_expr_name(item.context_expr) for item in with_node.items if _is_lock_expr(item.context_expr)]
+            for nested in (n for n in ast.walk(with_node) if n is not with_node and isinstance(n, (ast.With, ast.AsyncWith))):
+                inner = [_expr_name(item.context_expr) for item in nested.items if _is_lock_expr(item.context_expr)]
+                for first in outer:
+                    for second in inner:
+                        self.lock_orders.append((first, second, with_node.lineno, node.name))
+
+    def _check_deadlocks(self) -> None:
+        reported: set[tuple[str, str]] = set()
+        for first, second, line, function in self.lock_orders:
+            for reverse_first, reverse_second, _, _ in self.lock_orders:
+                pair = (min(first, second), max(first, second))
+                if first == reverse_second and second == reverse_first and first != second and pair not in reported:
+                    reported.add(pair)
+                    self.findings.append(ASTFinding("CG-013", self.filename, line, function, f"Potential deterministic deadlock: locks '{first}' and '{second}' are acquired in reverse order.", "Adopt one global lock ordering, or replace nested locks with a single higher-level lock."))
 
     def _check_cg_001(self, node: ast.AsyncFunctionDef, local_nodes: list[ast.AST]) -> None:
         """Rule CG-001: Unlocked Read-Modify-Write Race Condition."""
@@ -420,6 +638,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         """Inspect sync function definitions for rule CG-005."""
         local_nodes = list(_walk_local_nodes(node))
         self._check_cg_005(node, local_nodes)
+        self._check_standard_library_rules(node, local_nodes)
         self.generic_visit(node)
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
@@ -430,15 +649,80 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         self._check_cg_003(node)
         self._check_cg_004(node, local_nodes)
         self._check_cg_005(node, local_nodes)
+        self._check_standard_library_rules(node, local_nodes)
         self.generic_visit(node)
 
 
-def scan_source_code(source_code: str, filename: str = "<memory>") -> list[ASTFinding]:
+def _custom_rule_findings(tree: ast.AST, filename: str, rules: list[dict[str, Any]]) -> list[ASTFinding]:
+    """Evaluate compact YAML rules against functions without executing YAML content.
+
+    Supported fields are ``id``/``rule_id``, ``function`` (called dotted name),
+    ``modifies`` (target text), and ``without_context`` (required context text).
+    A rule matches when all supplied positive predicates match and its context is
+    absent. This intentionally small DSL is predictable and safe to extend.
+    """
+    findings: list[ASTFinding] = []
+    for function in (n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))):
+        nodes = list(_walk_local_nodes(function))
+        calls = {_expr_name(n.func) for n in nodes if isinstance(n, ast.Call)}
+        modified = _mutated_targets(function)
+        contexts = {_expr_name(item.context_expr) for n in ast.walk(function) if isinstance(n, (ast.With, ast.AsyncWith)) for item in n.items}
+        for rule in rules:
+            rule_id = str(rule.get("id", rule.get("rule_id", "CUSTOM")))
+            wanted_function = rule.get("function") or rule.get("call")
+            wanted_modify = rule.get("modifies") or rule.get("variable")
+            missing_context = rule.get("without_context") or rule.get("without_lock")
+            if wanted_function and not any(str(wanted_function) in call for call in calls):
+                continue
+            if wanted_modify and not any(str(wanted_modify) in target for target in modified):
+                continue
+            if missing_context and any(str(missing_context) in context for context in contexts):
+                continue
+            if not wanted_function and not wanted_modify:
+                continue
+            findings.append(ASTFinding(
+                rule_id, filename, function.lineno, function.name,
+                str(rule.get("message", f"Custom concurrency rule {rule_id} matched.")),
+                str(rule.get("suggested_fix_hint", rule.get("fix", "Add the required synchronization guard."))),
+            ))
+    return list(dict.fromkeys(findings))
+
+
+def load_yaml_rules(rule_file: Path) -> list[dict[str, Any]]:
+    """Load and validate a YAML rule document (a list or ``rules:`` mapping)."""
+    document = yaml.safe_load(rule_file.read_text(encoding="utf-8"))
+    raw_rules = document.get("rules", []) if isinstance(document, dict) else document
+    if not isinstance(raw_rules, list) or not all(isinstance(rule, dict) for rule in raw_rules):
+        raise ValueError("Rule YAML must be a list of mappings or contain a 'rules:' list.")
+    return raw_rules
+
+
+def scan_source_code(
+    source_code: str, filename: str = "<memory>", custom_rules: list[dict[str, Any]] | None = None
+) -> list[ASTFinding]:
     """Scan Python source code string for concurrency vulnerabilities."""
     tree = ast.parse(source_code, filename=filename)
     visitor = ConcurrencyASTVisitor(filename=filename)
     visitor.visit(tree)
-    return visitor.findings
+    visitor._check_deadlocks()
+    taint_findings = [
+        ASTFinding(
+            rule_id="CG-015",
+            filename=finding.filename,
+            lineno=finding.lineno,
+            function_name=finding.function_name,
+            message=(
+                "Tainted Shared State Mutation: a local variable referencing shared state is "
+                "mutated without concurrency controls."
+            ),
+            suggested_fix_hint=(
+                "Protect the complete shared-state access with the appropriate lock or atomic "
+                "operation before mutating the local reference."
+            ),
+        )
+        for finding in find_tainted_shared_state_mutations_in_source(source_code, filename)
+    ]
+    return visitor.findings + taint_findings + (_custom_rule_findings(tree, filename, custom_rules) if custom_rules else [])
 
 
 def discover_python_files(path: Path) -> list[Path]:
@@ -455,7 +739,7 @@ def discover_python_files(path: Path) -> list[Path]:
     return sorted(py_files)
 
 
-def scan_file(file_path: Path) -> list[ASTFinding]:
+def scan_file(file_path: Path, custom_rules: list[dict[str, Any]] | None = None) -> list[ASTFinding]:
     """Scan a Python file for concurrency vulnerabilities, skipping unparseable files."""
     try:
         source_code = file_path.read_text(encoding="utf-8")
@@ -463,14 +747,72 @@ def scan_file(file_path: Path) -> list[ASTFinding]:
         return []
 
     try:
-        return scan_source_code(source_code, filename=str(file_path))
+        return scan_source_code(source_code, filename=str(file_path), custom_rules=custom_rules)
     except SyntaxError:
         return []
 
 
-def scan_directory(dir_path: Path) -> list[ASTFinding]:
-    """Scan a directory recursively for concurrency vulnerabilities, skipping excluded directories."""
+def scan_directory(dir_path: Path, custom_rules: list[dict[str, Any]] | None = None) -> list[ASTFinding]:
+    """Scan a directory recursively, including cross-file call-chain analysis."""
+    return scan_project(discover_python_files(dir_path), roots=[dir_path], custom_rules=custom_rules)
+
+
+def scan_project(
+    file_paths: list[Path], roots: list[Path] | None = None, custom_rules: list[dict[str, Any]] | None = None
+) -> list[ASTFinding]:
+    """Scan files and propagate shared-state hazards to transitive callers.
+
+    CG-014 reports at a public caller when its cross-file call chain reaches a
+    function that mutates module shared state. Graph construction reads source
+    only; no scanned code is imported or executed.
+    """
     findings: list[ASTFinding] = []
-    for file_path in discover_python_files(dir_path):
-        findings.extend(scan_file(file_path))
-    return findings
+    for file_path in file_paths:
+        findings.extend(scan_file(file_path, custom_rules=custom_rules))
+    graph = build_call_graph(file_paths, roots=roots)
+    taint_findings = find_tainted_shared_state_mutations(file_paths, graph)
+    findings.extend(
+        ASTFinding(
+            rule_id="CG-015",
+            filename=finding.filename,
+            lineno=finding.lineno,
+            function_name=finding.function_name,
+            message=(
+                "Tainted Shared State Mutation: a local variable referencing shared state is "
+                "mutated without concurrency controls."
+            ),
+            suggested_fix_hint=(
+                "Protect the complete shared-state access with the appropriate lock or atomic "
+                "operation before mutating the local reference."
+            ),
+        )
+        for finding in taint_findings
+    )
+    reported: set[tuple[str, str]] = set()
+    for mutation in graph.shared_mutations:
+        mutated = graph.functions[mutation]
+        for caller_name in graph.callers_of(mutation):
+            caller = graph.functions[caller_name]
+            if caller.filename == mutated.filename:
+                continue
+            key = (caller_name, mutation)
+            if key in reported:
+                continue
+            reported.add(key)
+            findings.append(
+                ASTFinding(
+                    rule_id="CG-014",
+                    filename=caller.filename,
+                    lineno=caller.lineno,
+                    function_name=caller.name,
+                    message=(
+                        f"Inter-procedural shared-state race: call chain reaches '{mutation}', "
+                        "which mutates module shared state."
+                    ),
+                    suggested_fix_hint=(
+                        "Propagate a lock or synchronization boundary through the call chain, "
+                        "or make the shared-state operation atomic in the callee."
+                    ),
+                )
+            )
+    return list(dict.fromkeys(findings))

@@ -25,10 +25,12 @@ from concurrency_guard.runner.barrier_engine import (
     run_barrier_test,
     run_dynamic_barrier_verification,
 )
+from concurrency_guard.runner.runtime_verifier import verify_function
 from concurrency_guard.scanner.ast_rules import (
-    ASTFinding,
     discover_python_files,
+    load_yaml_rules,
     scan_file,
+    scan_project,
     scan_source_code,
 )
 
@@ -53,14 +55,21 @@ def scan(
         "--format",
         help="Output format: 'table' or 'json'",
     ),
+    rules: Path | None = typer.Option(None, "--rules", help="YAML file containing custom concurrency rules"),
 ) -> None:
     """Scan Python files or directories for concurrency vulnerabilities."""
     start_time = time.perf_counter()
     py_files = discover_python_files(path)
+    try:
+        custom_rules = load_yaml_rules(rules) if rules else None
+    except (OSError, ValueError, RuntimeError) as error:
+        raise typer.BadParameter(str(error), param_hint="--rules") from error
 
-    findings: list[ASTFinding] = []
-    for py_file in py_files:
-        findings.extend(scan_file(py_file))
+    findings = scan_project(
+        py_files,
+        roots=[path] if path.is_dir() else [path.parent],
+        custom_rules=custom_rules,
+    )
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000
 
@@ -144,12 +153,40 @@ def verify(
         "-w",
         help="Number of concurrent workers synchronized at the barrier",
     ),
+    headless: bool = typer.Option(
+        False,
+        "--headless",
+        help="Stress a raw Python function in-memory instead of discovering HTTP routes",
+    ),
 ) -> None:
     """Verify runtime concurrency and race condition invariants using asyncio.Barrier.
 
     Dynamically discovers FastAPI routes, synthesizes Pydantic payloads,
     seeds SQLAlchemy models, and fires concurrent barrier-synchronized requests.
     """
+    if headless:
+        if function is None:
+            raise typer.BadParameter("--function is required with --headless", param_hint="--function")
+        try:
+            headless_result = verify_function(file_path, function, workers)
+        except (OSError, ValueError, ImportError) as error:
+            raise typer.BadParameter(str(error), param_hint="file_path") from error
+        status = "[bold red]INVARIANT VIOLATION PROVEN[/bold red]" if headless_result["invariant_violated"] else "[bold green]INVARIANT HELD[/bold green]"
+        console.print(
+            Panel(
+                f"[bold]Function:[/bold] {headless_result['function_name']}\n"
+                f"[bold]Execution mode:[/bold] {headless_result['execution_mode']}\n"
+                f"[bold]Barrier workers:[/bold] {headless_result['workers']}\n"
+                f"[bold]Observed state:[/bold] {headless_result['state_name']}[{headless_result['key']!r}]\n"
+                f"[bold]Completed workers:[/bold] {headless_result['completed_workers']}\n"
+                f"[bold]Expected value:[/bold] {headless_result['expected_value']}\n"
+                f"[bold]Actual value:[/bold] {headless_result['actual_value']}\n\n{status}",
+                title="Headless Runtime Verification",
+                border_style="red" if headless_result["invariant_violated"] else "green",
+            )
+        )
+        raise typer.Exit(code=1 if headless_result["invariant_violated"] else 0)
+
     results: list[DynamicBarrierResult] = asyncio.run(
         run_dynamic_barrier_verification(
             file_path=file_path,
@@ -233,7 +270,7 @@ def fix(
         None,
         "--rule",
         "-r",
-        help="Specific rule to fix (e.g. CG-001, CG-002, CG-004). Defaults to all supported rules.",
+        help="Specific rule to fix (e.g. CG-001, CG-006, CG-007, CG-009). Defaults to all supported rules.",
     ),
     write: bool = typer.Option(
         False,
@@ -276,6 +313,9 @@ def fix(
         "CG-001": "Appended .with_for_update() row lock to query",
         "CG-002": "Injected idempotency_key: str = Header(...) parameter",
         "CG-004": "Wrapped commit in try/except IntegrityError with rollback",
+        "CG-006": "Wrapped async shared-state mutation in asyncio.Lock",
+        "CG-007": "Wrapped threaded shared-state mutation in threading.Lock",
+        "CG-009": "Wrapped concurrent file write in FileLock",
     }
 
     seen_fixes: set[tuple[str, str]] = set()
