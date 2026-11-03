@@ -6,18 +6,29 @@ import { joinWaitlist } from "../actions/waitlist";
 
 type Status = "idle" | "loading" | "success" | "error";
 
+function nameFromEmail(email: string) {
+  const localPart = email.split("@", 1)[0] ?? "there";
+  const name = localPart.replace(/[._-]+/g, " ").trim().slice(0, 36);
+
+  return name ? name.replace(/\b\w/g, (character) => character.toUpperCase()) : "there";
+}
+
 export function WaitlistForm() {
   const [status, setStatus] = useState<Status>("idle");
   const [error, setError] = useState("");
+  const [name, setName] = useState("there");
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setStatus("loading");
     setError("");
 
-    const result = await joinWaitlist(new FormData(event.currentTarget));
+    const formData = new FormData(event.currentTarget);
+    const email = formData.get("email");
+    const result = await joinWaitlist(formData);
 
     if (result.success) {
+      if (typeof email === "string") setName(nameFromEmail(email));
       setStatus("success");
       return;
     }
@@ -28,7 +39,8 @@ export function WaitlistForm() {
 
   if (status === "success") {
     return <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ duration: 0.35, ease: "easeOut" }} className="mt-8 rounded-xl border border-white/15 bg-black px-5 py-4 text-sm leading-6 text-zinc-200 shadow-[0_18px_60px_rgba(0,0,0,0.35)]" role="status" aria-live="polite">
-      <span className="font-medium text-white">Thank you for joining the waitlist!</span> We will notify you when cguard is live.
+      <motion.p initial={{ opacity: 0, y: 5 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.08, duration: 0.3 }} className="m-0 font-medium text-white">Thank you, {name}.</motion.p>
+      <motion.p initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ delay: 0.18, duration: 0.3 }} className="m-0 text-zinc-400">We will notify you when cguard is live.</motion.p>
     </motion.div>;
   }
 
