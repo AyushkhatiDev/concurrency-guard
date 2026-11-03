@@ -61,10 +61,13 @@ Real-world concurrency bugs rarely live in a single 10-line function. A web rout
 ### 2. Data-Flow Semantic Taint Tracking (`CG-015`)
 When shared state (globals, class-level caches, Redis connections, or singleton pools) is passed across variable assignments, aliased through local dictionaries, or unpacked into parameters, simple AST pattern matchers lose track. `cguard` employs a forward data-flow taint tracker that labels mutable shared references at their origin and propagates taint through assignments, attribute lookups, and function calls. An issue is raised if a tainted reference reaches an unguarded mutation sink (`AugAssign`, `.append()`, `.pop()`, `.set()`, `.update()`).
 
-### 3. Headless Runtime Stress Verification (`cguard verify --headless`)
+### 3. Deep Alias & Control Flow Tracking
+v2.2.0 follows proven object aliases across assignments such as `wallet → w`, while keeping transaction and row-lock state scoped to the exact lexical control-flow path. A Django read-modify-write is only treated as protected when `select_for_update()` is held inside the same `transaction.atomic()` scope; ambiguous branches, dynamic dispatch, and unsupported data flow intentionally produce no finding or automatic patch.
+
+### 4. Headless Runtime Stress Verification (`cguard verify --headless`)
 Static analysis identifies potential hazards; `cguard`'s verification engine mathematically proves them. You no longer need a running web server or live database. `cguard verify` dynamically imports raw Python callables, initializes synchronized barriers (`asyncio.Barrier` for coroutines or `threading.Barrier` for OS threads), and releases up to 100 concurrent workers at the exact same microsecond. By comparing the observed post-execution state against mathematical expectations, it confirms race conditions (such as balance double-spends or lost updates) with zero false alarms.
 
-### 4. Lossless `LibCST` Auto-Patching (`cguard fix --write`)
+### 5. Lossless `LibCST` Auto-Patching (`cguard fix --write`)
 Fixing security bugs by hand introduces syntax errors and disrupts formatting. `cguard` uses Concrete Syntax Tree (`libcst`) manipulation to safely modify code in place. It injects required locks (`.with_for_update()`, Django `select_for_update()`, `asyncio.Lock`, `threading.Lock`, or `filelock.FileLock`), wraps vulnerable mutations in synchronization contexts, and adds error guards while **100% preserving your comments, docstrings, indentation, and formatting**.
 
 ---

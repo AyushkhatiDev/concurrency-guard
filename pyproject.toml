@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "concurrency-guard"
-version = "2.1.0"
+version = "2.2.0"
 description = "Universal static concurrency analysis, semantic taint tracking, and runtime verification for Python"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -38,6 +38,13 @@ cguard = "concurrency_guard.cli:app"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/concurrency_guard"]
+
+[tool.hatch.build]
+exclude = [
+    "/dist",
+    "/website/.next",
+    "/website/node_modules",
+]
 
 [tool.mypy]
 # Mypy itself no longer supports a Python 3.9 target; runtime support remains >=3.9.

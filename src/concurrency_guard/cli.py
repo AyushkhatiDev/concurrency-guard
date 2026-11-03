@@ -17,7 +17,7 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
-from concurrency_guard.patcher.cst_fixer import apply_all_fixes
+from concurrency_guard.patcher.cst_fixer import apply_all_fixes, apply_all_fixes_with_report
 from concurrency_guard.reporter.github_pr import generate_github_pr_markdown
 from concurrency_guard.runner.barrier_engine import (
     BarrierResult,
@@ -283,7 +283,18 @@ def fix(
     initial_findings = scan_file(file_path)
 
     rules_filter = {rule.upper()} if rule else None
-    patched_code = apply_all_fixes(source_code, rules=rules_filter)
+    patch_result = apply_all_fixes_with_report(source_code, rules=rules_filter)
+    patched_code = patch_result.code
+
+    if patch_result.skipped:
+        skipped_table = Table(title="Manual Review Required", show_header=True, header_style="bold yellow")
+        skipped_table.add_column("Rule ID", style="bold yellow")
+        skipped_table.add_column("Function", style="magenta")
+        skipped_table.add_column("Line", justify="right")
+        skipped_table.add_column("Reason")
+        for skipped in patch_result.skipped:
+            skipped_table.add_row(skipped.rule_id, skipped.function_name, str(skipped.lineno), skipped.reason)
+        console.print(skipped_table)
 
     if source_code == patched_code:
         console.print(
