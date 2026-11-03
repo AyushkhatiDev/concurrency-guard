@@ -41,6 +41,16 @@ class ASTFinding:
     suggested_fix_hint: str
 
 
+@dataclass
+class _DjangoObjectFlow:
+    """Provenance for one statically resolved Django model reference."""
+
+    fetch: ast.Call
+    row_locked: bool
+    atomic_scopes: frozenset[int]
+    mutated: bool = False
+
+
 @dataclass(frozen=True)
 class CFGNode:
     """A deliberately small, inspectable control-flow graph node.
@@ -672,47 +682,114 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
     def _check_cg_016(
         self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], local_nodes: list[ast.AST]
     ) -> None:
-        """Rule CG-016: Django object fetch/mutate/save without select_for_update()."""
-        tracked_models: set[str] = set()
-        unlocked_fetches: dict[str, ast.Call] = {}
-        mutated: set[str] = set()
+        """Rule CG-016: prove an unsafe Django fetch/mutate/save path.
 
-        statements = sorted((item for item in local_nodes if isinstance(item, ast.stmt)), key=lambda item: item.lineno)
-        for statement in statements:
-            if isinstance(statement, ast.Assign) and len(statement.targets) == 1:
-                target = statement.targets[0]
-                if isinstance(target, ast.Name):
-                    if isinstance(statement.value, ast.Call):
-                        is_fetch, has_lock = _django_manager_call(statement.value)
-                        if is_fetch:
-                            tracked_models.add(target.id)
-                            if not has_lock:
-                                unlocked_fetches[target.id] = statement.value
-                    elif isinstance(statement.value, ast.Name) and statement.value.id in tracked_models:
-                        # Preserve taint through aliases such as ``account = user``.
-                        tracked_models.add(target.id)
-                        if statement.value.id in unlocked_fetches:
-                            unlocked_fetches[target.id] = unlocked_fetches[statement.value.id]
-            elif isinstance(statement, ast.AugAssign) and _target_root_name(statement.target) in tracked_models:
-                mutated.add(_target_root_name(statement.target))
-            elif isinstance(statement, ast.Assign):
-                for target in statement.targets:
-                    if isinstance(target, ast.Attribute) and _target_root_name(target) in tracked_models:
-                        mutated.add(_target_root_name(target))
+        Only straight-line flow within one lexical control-flow path is merged.
+        This deliberately avoids inventing provenance through conditionals, loops,
+        dynamic dispatch, or a transaction boundary that has already ended.
+        """
+        def is_atomic_context(expression: ast.AST) -> bool:
+            if not isinstance(expression, ast.Call):
+                return False
+            return _expr_name(expression.func) in {
+                "atomic", "transaction.atomic", "django.db.transaction.atomic",
+            }
 
-            for call in (item for item in ast.walk(statement) if isinstance(item, ast.Call)):
-                if isinstance(call.func, ast.Attribute) and call.func.attr == "save":
-                    saved_name = _target_root_name(call.func.value)
-                    fetch = unlocked_fetches.get(saved_name)
-                    if fetch is not None and saved_name in mutated:
-                        self._add(
-                            "CG-016",
-                            fetch,
-                            node.name,
-                            "Django Unlocked Read-Modify-Write: a model fetched through objects is mutated and saved without select_for_update().",
-                            "Fetch the row with '.objects.select_for_update().get(...)' (or before filter().first()) inside transaction.atomic().",
+        def clone(flows: dict[str, _DjangoObjectFlow]) -> dict[str, _DjangoObjectFlow]:
+            copies: dict[int, _DjangoObjectFlow] = {}
+            for flow in flows.values():
+                copies.setdefault(id(flow), _DjangoObjectFlow(
+                    fetch=flow.fetch,
+                    row_locked=flow.row_locked,
+                    atomic_scopes=flow.atomic_scopes,
+                    mutated=flow.mutated,
+                ))
+            return {name: copies[id(flow)] for name, flow in flows.items()}
+
+        def calls(statement: ast.AST) -> Iterator[ast.Call]:
+            for child in ast.iter_child_nodes(statement):
+                if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)):
+                    continue
+                if isinstance(child, ast.Call):
+                    yield child
+                yield from calls(child)
+
+        def protected(flow: _DjangoObjectFlow, active_scopes: tuple[int, ...]) -> bool:
+            return flow.row_locked and bool(flow.atomic_scopes.intersection(active_scopes))
+
+        def analyze_statement(
+            statement: ast.stmt, active_scopes: tuple[int, ...], flows: dict[str, _DjangoObjectFlow]
+        ) -> bool:
+            if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
+                target = statement.targets[0].id
+                if isinstance(statement.value, ast.Call):
+                    is_fetch, has_lock = _django_manager_call(statement.value)
+                    if is_fetch:
+                        flows[target] = _DjangoObjectFlow(
+                            fetch=statement.value,
+                            row_locked=has_lock,
+                            atomic_scopes=frozenset(active_scopes),
                         )
-                        return
+                    else:
+                        flows.pop(target, None)
+                elif isinstance(statement.value, ast.Name) and statement.value.id in flows:
+                    flows[target] = flows[statement.value.id]
+                else:
+                    flows.pop(target, None)
+            elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and statement.value is not None:
+                target = statement.target.id
+                if isinstance(statement.value, ast.Name) and statement.value.id in flows:
+                    flows[target] = flows[statement.value.id]
+                else:
+                    flows.pop(target, None)
+
+            mutation_targets: list[ast.AST] = []
+            if isinstance(statement, ast.AugAssign):
+                mutation_targets.append(statement.target)
+            elif isinstance(statement, ast.Assign):
+                mutation_targets.extend(target for target in statement.targets if isinstance(target, ast.Attribute))
+            for mutation_target in mutation_targets:
+                flow = flows.get(_target_root_name(mutation_target))
+                if flow is not None:
+                    flow.mutated = True
+
+            for call in calls(statement):
+                if not isinstance(call.func, ast.Attribute) or call.func.attr != "save":
+                    continue
+                flow = flows.get(_target_root_name(call.func.value))
+                if flow is not None and flow.mutated and not protected(flow, active_scopes):
+                    self._add(
+                        "CG-016",
+                        flow.fetch,
+                        node.name,
+                        "Django Unlocked Read-Modify-Write: a model fetched through objects is mutated and saved without a row lock held by transaction.atomic().",
+                        "Fetch the row with '.objects.select_for_update().get(...)' (or before filter().first()) inside transaction.atomic().",
+                    )
+                    return True
+            return False
+
+        def analyze_block(
+            statements: list[ast.stmt], active_scopes: tuple[int, ...], flows: dict[str, _DjangoObjectFlow]
+        ) -> bool:
+            for statement in statements:
+                if isinstance(statement, (ast.With, ast.AsyncWith)):
+                    added_scopes = tuple(id(item.context_expr) for item in statement.items if is_atomic_context(item.context_expr))
+                    if analyze_block(statement.body, active_scopes + added_scopes, clone(flows)):
+                        return True
+                elif isinstance(statement, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+                    if analyze_block(statement.body, active_scopes, clone(flows)):
+                        return True
+                    if analyze_block(statement.orelse, active_scopes, clone(flows)):
+                        return True
+                elif isinstance(statement, ast.Try):
+                    branches = [statement.body, statement.orelse, statement.finalbody] + [handler.body for handler in statement.handlers]
+                    if any(analyze_block(branch, active_scopes, clone(flows)) for branch in branches):
+                        return True
+                elif analyze_statement(statement, active_scopes, flows):
+                    return True
+            return False
+
+        analyze_block(node.body, (), {})
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """Inspect sync function definitions for rule CG-005."""

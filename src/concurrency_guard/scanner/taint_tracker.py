@@ -126,6 +126,10 @@ class _FunctionFlow:
 
     def _statements(self, statements: list[ast.stmt], locked: bool) -> None:
         for statement in statements:
+            # Nested definitions execute in a separate lexical scope. Walking
+            # into them here would incorrectly inherit the caller's aliases.
+            if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                continue
             if isinstance(statement, (ast.With, ast.AsyncWith)):
                 protected = locked or any(_is_lock_context(item.context_expr) for item in statement.items)
                 self._statements(statement.body, protected)
@@ -153,6 +157,8 @@ class _FunctionFlow:
                         self._sink(statement.target, statement.lineno, locked)
                     if _has_taint(statement.value, self.tainted):
                         self.tainted.update(_target_names(statement.target))
+                    elif isinstance(statement.target, ast.Name):
+                        self.tainted.discard(statement.target.id)
             elif isinstance(statement, ast.AugAssign):
                 self._sink(statement.target, statement.lineno, locked)
             else:

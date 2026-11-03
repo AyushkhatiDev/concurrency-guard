@@ -2,12 +2,108 @@
 
 from __future__ import annotations
 
+import ast
+from dataclasses import dataclass
 from typing import Optional, Union
 
 import libcst as cst
 from libcst.metadata import MetadataWrapper, ParentNodeProvider
 
-from concurrency_guard.scanner.ast_rules import scan_source_code
+from concurrency_guard.scanner.ast_rules import ASTFinding, scan_source_code
+
+
+@dataclass(frozen=True)
+class PatchSkip:
+    """A requested automatic fix that requires manual review."""
+
+    rule_id: str
+    function_name: str
+    lineno: int
+    reason: str
+
+
+@dataclass(frozen=True)
+class PatchResult:
+    """Patched source plus targets intentionally left unchanged."""
+
+    code: str
+    skipped: tuple[PatchSkip, ...] = ()
+
+
+_DYNAMIC_DISPATCH_NAMES = frozenset({"eval", "exec", "getattr", "globals", "locals", "__import__"})
+
+
+def _dotted_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        base = _dotted_name(node.value)
+        return f"{base}.{node.attr}" if base else node.attr
+    if isinstance(node, ast.Call):
+        return _dotted_name(node.func)
+    return ""
+
+
+def _function_nodes(tree: ast.AST) -> dict[str, list[ast.AST]]:
+    nodes: dict[str, list[ast.AST]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            nodes.setdefault(node.name, []).append(node)
+    return nodes
+
+
+def _contains_dynamic_or_unpacking(node: ast.AST) -> bool:
+    for child in ast.walk(node):
+        if not isinstance(child, ast.Call):
+            continue
+        if _dotted_name(child.func).split(".")[-1] in _DYNAMIC_DISPATCH_NAMES:
+            return True
+        if any(keyword.arg is None for keyword in child.keywords):
+            return True
+    return False
+
+
+def _is_atomic_with(node: Union[ast.With, ast.AsyncWith]) -> bool:
+    for item in node.items:
+        if isinstance(item.context_expr, ast.Call) and _dotted_name(item.context_expr.func) in {
+            "atomic", "transaction.atomic", "django.db.transaction.atomic",
+        }:
+            return True
+    return False
+
+
+def _finding_is_inside_atomic(function: ast.AST, lineno: int) -> bool:
+    return any(
+        _is_atomic_with(node)
+        and node.lineno <= lineno <= getattr(node, "end_lineno", node.lineno)
+        for node in ast.walk(function)
+        if isinstance(node, (ast.With, ast.AsyncWith))
+    )
+
+
+def _preflight_targets(source_code: str, rule_id: str, findings: list[ASTFinding]) -> tuple[set[str], list[PatchSkip]]:
+    """Return static targets only; ambiguous source is deliberately not patched."""
+    tree = ast.parse(source_code)
+    functions = _function_nodes(tree)
+    safe: set[str] = set()
+    skipped: list[PatchSkip] = []
+    for finding in findings:
+        function_name = finding.function_name
+        lineno = finding.lineno
+        candidates = functions.get(function_name, [])
+        if len(candidates) != 1:
+            skipped.append(PatchSkip(rule_id, function_name, lineno, "Target function is missing or ambiguous; manual review is required."))
+            continue
+        function = candidates[0]
+        if _contains_dynamic_or_unpacking(function):
+            skipped.append(PatchSkip(rule_id, function_name, lineno, "Dynamic dispatch or **kwargs requires a manual fix."))
+        elif rule_id == "CG-016" and not _finding_is_inside_atomic(function, lineno):
+            skipped.append(PatchSkip(rule_id, function_name, lineno, "select_for_update() must be added inside transaction.atomic() manually."))
+        else:
+            safe.add(function_name)
+
+    skipped_names = {item.function_name for item in skipped}
+    return safe - skipped_names, skipped
 
 
 def _is_select_chain(node: cst.CSTNode) -> bool:
@@ -411,6 +507,7 @@ class DjangoSelectForUpdateTransformer(cst.CSTTransformer):
     def __init__(self, target_functions: set[str]) -> None:
         self.target_functions = target_functions
         self._active = False
+        self._atomic_depth = 0
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
         self._active = node.name.value in self.target_functions
@@ -421,11 +518,22 @@ class DjangoSelectForUpdateTransformer(cst.CSTTransformer):
     ) -> cst.FunctionDef:
         if original_node.name.value in self.target_functions:
             self._active = False
+            self._atomic_depth = 0
+        return updated_node
+
+    def visit_With(self, node: cst.With) -> bool:
+        if self._active and any(_get_module_name(item.item) in {"atomic", "transaction.atomic", "django.db.transaction.atomic"} for item in node.items):
+            self._atomic_depth += 1
+        return True
+
+    def leave_With(self, original_node: cst.With, updated_node: cst.With) -> cst.With:
+        if self._active and any(_get_module_name(item.item) in {"atomic", "transaction.atomic", "django.db.transaction.atomic"} for item in original_node.items):
+            self._atomic_depth -= 1
         return updated_node
 
     def leave_Call(self, original_node: cst.Call, updated_node: cst.Call) -> cst.Call:
         """Rewrite Model.objects.get/filter into a select_for_update manager chain."""
-        if not self._active or not isinstance(original_node.func, cst.Attribute):
+        if not self._active or not self._atomic_depth or not isinstance(original_node.func, cst.Attribute):
             return updated_node
         if original_node.func.attr.value not in {"get", "filter"}:
             return updated_node
@@ -440,15 +548,22 @@ class DjangoSelectForUpdateTransformer(cst.CSTTransformer):
         return updated_node.with_changes(func=updated_node.func.with_changes(value=locked_manager))
 
 
-def apply_all_fixes(source_code: str, rules: Optional[set[str]] = None) -> str:
-    """Apply auto-patch fixes for specified concurrency and idempotency rules."""
+def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = None) -> PatchResult:
+    """Apply only statically validated fixes and report skipped targets."""
     selected_rules = rules if rules is not None else {"CG-001", "CG-002", "CG-004", "CG-006", "CG-007", "CG-009", "CG-016"}
     current_code = source_code
     findings = scan_source_code(current_code)
+    skipped: list[PatchSkip] = []
+
+    def targets_for(rule_id: str) -> set[str]:
+        matches = [finding for finding in findings if finding.rule_id == rule_id]
+        targets, skipped_targets = _preflight_targets(current_code, rule_id, matches)
+        skipped.extend(skipped_targets)
+        return targets
 
     # 1. CG-001: WithForUpdateTransformer
     if "CG-001" in selected_rules:
-        cg001_targets = {f.function_name for f in findings if f.rule_id == "CG-001"}
+        cg001_targets = targets_for("CG-001")
         if cg001_targets:
             tree = cst.parse_module(current_code)
             wrapper = MetadataWrapper(tree)
@@ -459,7 +574,7 @@ def apply_all_fixes(source_code: str, rules: Optional[set[str]] = None) -> str:
 
     # 2. CG-002: IdempotencyHeaderTransformer
     if "CG-002" in selected_rules:
-        cg002_targets = {f.function_name for f in findings if f.rule_id == "CG-002"}
+        cg002_targets = targets_for("CG-002")
         if cg002_targets:
             tree = cst.parse_module(current_code)
             tree = tree.visit(IdempotencyHeaderTransformer(target_functions=cg002_targets))
@@ -469,7 +584,7 @@ def apply_all_fixes(source_code: str, rules: Optional[set[str]] = None) -> str:
 
     # 3. CG-004: IntegrityErrorGuardTransformer
     if "CG-004" in selected_rules:
-        cg004_targets = {f.function_name for f in findings if f.rule_id == "CG-004"}
+        cg004_targets = targets_for("CG-004")
         if cg004_targets:
             tree = cst.parse_module(current_code)
             tree = tree.visit(IntegrityErrorGuardTransformer(target_functions=cg004_targets))
@@ -480,7 +595,7 @@ def apply_all_fixes(source_code: str, rules: Optional[set[str]] = None) -> str:
     # 4. CG-006: protect async shared-state mutations.
     if "CG-006" in selected_rules:
         findings = scan_source_code(current_code)
-        targets = {finding.function_name for finding in findings if finding.rule_id == "CG-006"}
+        targets = targets_for("CG-006")
         if targets:
             tree = cst.parse_module(current_code).visit(
                 SharedStateLockTransformer(targets, asynchronous=True)
@@ -490,7 +605,7 @@ def apply_all_fixes(source_code: str, rules: Optional[set[str]] = None) -> str:
     # 5. CG-007: protect threaded shared-state mutations.
     if "CG-007" in selected_rules:
         findings = scan_source_code(current_code)
-        targets = {finding.function_name for finding in findings if finding.rule_id == "CG-007"}
+        targets = targets_for("CG-007")
         if targets:
             tree = cst.parse_module(current_code).visit(
                 SharedStateLockTransformer(targets, asynchronous=False)
@@ -501,7 +616,7 @@ def apply_all_fixes(source_code: str, rules: Optional[set[str]] = None) -> str:
     # that used the pre-release file-rule identifier.
     if {"CG-008", "CG-009"}.intersection(selected_rules):
         findings = scan_source_code(current_code)
-        targets = {finding.function_name for finding in findings if finding.rule_id == "CG-009"}
+        targets = targets_for("CG-009")
         if targets:
             tree = cst.parse_module(current_code).visit(FileLockTransformer(targets))
             current_code = _ensure_import(tree, "filelock", "FileLock").code
@@ -509,13 +624,20 @@ def apply_all_fixes(source_code: str, rules: Optional[set[str]] = None) -> str:
     # 7. CG-016: lock a Django ORM fetch before its read-modify-write sequence.
     if "CG-016" in selected_rules:
         findings = scan_source_code(current_code)
-        targets = {finding.function_name for finding in findings if finding.rule_id == "CG-016"}
+        targets = targets_for("CG-016")
         if targets:
             current_code = cst.parse_module(current_code).visit(
                 DjangoSelectForUpdateTransformer(targets)
             ).code
 
-    return current_code
+    ast.parse(current_code)
+    cst.parse_module(current_code)
+    return PatchResult(code=current_code, skipped=tuple(skipped))
+
+
+def apply_all_fixes(source_code: str, rules: Optional[set[str]] = None) -> str:
+    """Compatibility wrapper returning only the safely patched source code."""
+    return apply_all_fixes_with_report(source_code, rules).code
 
 
 def apply_with_for_update_fix(source_code: str) -> str:
