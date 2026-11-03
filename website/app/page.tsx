@@ -3,7 +3,8 @@
 import { ArrowUpRight, Check, Copy, Moon, Sun } from "lucide-react";
 import { motion, useScroll, useSpring } from "framer-motion";
 import { useState } from "react";
-import type { CSSProperties, FormEvent } from "react";
+import type { CSSProperties } from "react";
+import { WaitlistForm } from "../components/WaitlistForm";
 import { BugExplorer } from "./components/bug-explorer";
 import { Pipeline } from "./components/pipeline";
 import { RaceTimeline } from "./components/race-timeline";
@@ -21,32 +22,12 @@ function CopyCommand({ command }: { command: string }) {
 }
 
 function Waitlist() {
-  const [email, setEmail] = useState("");
-  const [state, setState] = useState<"idle" | "success" | "error" | "loading">("idle");
-  const [message, setMessage] = useState("");
-  async function submit(event: FormEvent) {
-    event.preventDefault();
-    if (!/^\S+@\S+\.\S+$/.test(email)) { setState("error"); setMessage("Enter a valid email address."); return; }
-    const endpoint = process.env.NEXT_PUBLIC_FORMSPREE_ENDPOINT;
-    if (!endpoint) { setState("error"); setMessage("Waitlist endpoint is not configured yet."); return; }
-    setState("loading"); setMessage("");
-    try {
-      const response = await fetch(endpoint, { method: "POST", headers: { "Content-Type": "application/json", Accept: "application/json" }, body: JSON.stringify({ email }) });
-      if (!response.ok) throw new Error();
-      setState("success"); setMessage("You’re on the list."); setEmail("");
-    } catch { setState("error"); setMessage("Could not submit right now. Please try again."); }
-  }
   return <section id="waitlist" className="waitlist" aria-labelledby="waitlist-heading">
     <div>
       <span className="section-marker">06 / GITHUB APP</span>
       <h2 id="waitlist-heading">Put the finding on the pull request.</h2>
       <p>Early access for a GitHub App that turns a detected race into a reviewable patch.</p>
-      <form className={`waitlist-form is-${state}`} onSubmit={submit} noValidate>
-        <label className="sr-only" htmlFor="email">Email address</label>
-        <input id="email" type="email" value={email} onChange={(event) => setEmail(event.target.value)} placeholder="you@company.com" aria-invalid={state === "error"} aria-describedby="waitlist-message" disabled={state === "loading"} />
-        <button disabled={state === "loading"}>{state === "loading" ? "Joining…" : "Join waitlist"} <ArrowUpRight /></button>
-      </form>
-      <p id="waitlist-message" className={`form-message ${state === "error" ? "danger-text" : state === "success" ? "safe-text" : ""}`} role={state === "error" ? "alert" : "status"} aria-live="polite">{message || "No marketing drip. Just product access."}</p>
+      <WaitlistForm />
     </div>
     <aside className="pr-comment"><div><span className="bot-dot">c</span><b>cguard bot</b><small>commented now</small></div><p><strong>CG-016</strong> unlocked Django mutation in <code>wallet.py:12</code></p><pre><del>Wallet.objects.get(id=user_id)</del>{`\n`}<ins>Wallet.objects.select_for_update().get(id=user_id)</ins></pre><button type="button">Apply suggested fix</button></aside>
   </section>;
