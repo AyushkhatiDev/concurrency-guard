@@ -12,6 +12,7 @@ from typing import Any, Optional, Union
 import yaml  # type: ignore[import-untyped]
 
 from concurrency_guard.scanner.call_graph import build_call_graph
+from concurrency_guard.scanner.suppression import SuppressionFilter
 from concurrency_guard.scanner.taint_tracker import (
     find_tainted_shared_state_mutations,
     find_tainted_shared_state_mutations_in_source,
@@ -902,6 +903,7 @@ def scan_file(
     file_path: Path,
     custom_rules: Optional[list[dict[str, Any]]] = None,
     cache_manager: Optional[Any] = None,
+    suppression_filter: Optional[SuppressionFilter] = None,
 ) -> list[ASTFinding]:
     """Scan a Python file for concurrency vulnerabilities, skipping unparseable files."""
     if cache_manager is not None:
@@ -909,7 +911,10 @@ def scan_file(
         if cached is not None:
             from concurrency_guard.cache.manager import dict_to_finding
 
-            return [dict_to_finding(d) for d in cached]
+            findings = [dict_to_finding(d) for d in cached]
+            if suppression_filter is not None:
+                return suppression_filter.filter_findings(findings, file_path=file_path)
+            return SuppressionFilter().filter_findings(findings, file_path=file_path)
 
     try:
         source_code = file_path.read_text(encoding="utf-8")
@@ -926,13 +931,16 @@ def scan_file(
 
         cache_manager.update_cache(file_path, [finding_to_dict(f) for f in findings])
 
-    return findings
+    filter_obj = suppression_filter or SuppressionFilter()
+    filter_obj.parse_source(source_code, filepath=file_path)
+    return filter_obj.filter_findings(findings, file_path=file_path)
 
 
 def scan_directory(
     dir_path: Path,
     custom_rules: Optional[list[dict[str, Any]]] = None,
     cache_manager: Optional[Any] = None,
+    suppression_filter: Optional[SuppressionFilter] = None,
 ) -> list[ASTFinding]:
     """Scan a directory recursively, including cross-file call-chain analysis."""
     return scan_project(
@@ -940,6 +948,7 @@ def scan_directory(
         roots=[dir_path],
         custom_rules=custom_rules,
         cache_manager=cache_manager,
+        suppression_filter=suppression_filter,
     )
 
 
@@ -948,6 +957,7 @@ def scan_project(
     roots: Optional[list[Path]] = None,
     custom_rules: Optional[list[dict[str, Any]]] = None,
     cache_manager: Optional[Any] = None,
+    suppression_filter: Optional[SuppressionFilter] = None,
 ) -> list[ASTFinding]:
     """Scan files and propagate shared-state hazards to transitive callers.
 
@@ -955,30 +965,41 @@ def scan_project(
     function that mutates module shared state. Graph construction reads source
     only; no scanned code is imported or executed.
     """
+    active_filter = suppression_filter or SuppressionFilter()
+
     findings: list[ASTFinding] = []
     for file_path in file_paths:
         findings.extend(
-            scan_file(file_path, custom_rules=custom_rules, cache_manager=cache_manager)
+            scan_file(
+                file_path,
+                custom_rules=custom_rules,
+                cache_manager=cache_manager,
+                suppression_filter=active_filter,
+            )
         )
     graph = build_call_graph(file_paths, roots=roots)
     taint_findings = find_tainted_shared_state_mutations(file_paths, graph)
-    findings.extend(
-        ASTFinding(
-            rule_id="CG-015",
-            filename=finding.filename,
-            lineno=finding.lineno,
-            function_name=finding.function_name,
-            message=(
-                "Tainted Shared State Mutation: a local variable referencing shared state is "
-                "mutated without concurrency controls."
-            ),
-            suggested_fix_hint=(
-                "Protect the complete shared-state access with the appropriate lock or atomic "
-                "operation before mutating the local reference."
-            ),
-        )
-        for finding in taint_findings
-    )
+    for finding in taint_findings:
+        if not active_filter.should_suppress("CG-015", Path(finding.filename), finding.lineno):
+            findings.append(
+                ASTFinding(
+                    rule_id="CG-015",
+                    filename=finding.filename,
+                    lineno=finding.lineno,
+                    function_name=finding.function_name,
+                    message=(
+                        "Tainted Shared State Mutation: a local variable referencing shared state is "
+                        "mutated without concurrency controls."
+                    ),
+                    suggested_fix_hint=(
+                        "Protect the complete shared-state access with the appropriate lock or atomic "
+                        "operation before mutating the local reference."
+                    ),
+                )
+            )
+        else:
+            active_filter.suppressed_count += 1
+
     reported: set[tuple[str, str]] = set()
     for mutation in graph.shared_mutations:
         mutated = graph.functions[mutation]
@@ -990,20 +1011,25 @@ def scan_project(
             if key in reported:
                 continue
             reported.add(key)
-            findings.append(
-                ASTFinding(
-                    rule_id="CG-014",
-                    filename=caller.filename,
-                    lineno=caller.lineno,
-                    function_name=caller.name,
-                    message=(
-                        f"Inter-procedural shared-state race: call chain reaches '{mutation}', "
-                        "which mutates module shared state."
-                    ),
-                    suggested_fix_hint=(
-                        "Propagate a lock or synchronization boundary through the call chain, "
-                        "or make the shared-state operation atomic in the callee."
-                    ),
+            if not active_filter.should_suppress("CG-014", Path(caller.filename), caller.lineno):
+                findings.append(
+                    ASTFinding(
+                        rule_id="CG-014",
+                        filename=caller.filename,
+                        lineno=caller.lineno,
+                        function_name=caller.name,
+                        message=(
+                            f"Inter-procedural shared-state race: call chain reaches '{mutation}', "
+                            "which mutates module shared state."
+                        ),
+                        suggested_fix_hint=(
+                            "Propagate a lock or synchronization boundary through the call chain, "
+                            "or make the shared-state operation atomic in the callee."
+                        ),
+                    )
                 )
-            )
+            else:
+                active_filter.suppressed_count += 1
+
+    return list(dict.fromkeys(findings))
     return list(dict.fromkeys(findings))
