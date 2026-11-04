@@ -17,6 +17,12 @@ from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.table import Table
 
+from concurrency_guard import __version__
+from concurrency_guard.cache.manager import (
+    DEFAULT_CACHE_FILE,
+    CacheManager,
+    compute_rules_hash,
+)
 from concurrency_guard.patcher.cst_fixer import apply_all_fixes, apply_all_fixes_with_report
 from concurrency_guard.reporter.github_pr import generate_github_pr_markdown
 from concurrency_guard.runner.barrier_engine import (
@@ -56,6 +62,16 @@ def scan(
         help="Output format: 'table' or 'json'",
     ),
     rules: Optional[Path] = typer.Option(None, "--rules", help="YAML file containing custom concurrency rules"),
+    cache_path: Optional[Path] = typer.Option(
+        None,
+        "--cache-path",
+        help="Path to SQLite cache database (defaults to .concurrency_guard_cache.db)",
+    ),
+    no_cache: bool = typer.Option(
+        False,
+        "--no-cache",
+        help="Bypass cache reads and writes completely",
+    ),
 ) -> None:
     """Scan Python files or directories for concurrency vulnerabilities."""
     start_time = time.perf_counter()
@@ -65,11 +81,25 @@ def scan(
     except (OSError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(str(error), param_hint="--rules") from error
 
+    cache_mgr: Optional[CacheManager] = None
+    if not no_cache:
+        db_file = cache_path or DEFAULT_CACHE_FILE
+        rules_hash = compute_rules_hash(rules_path=rules, custom_rules=custom_rules)
+        cache_mgr = CacheManager(
+            cache_db_path=db_file,
+            scanner_version=__version__,
+            rules_hash=rules_hash,
+        )
+
     findings = scan_project(
         py_files,
         roots=[path] if path.is_dir() else [path.parent],
         custom_rules=custom_rules,
+        cache_manager=cache_mgr,
     )
+
+    if cache_mgr is not None and path.is_dir():
+        cache_mgr.purge_stale_entries(set(py_files))
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000
 
