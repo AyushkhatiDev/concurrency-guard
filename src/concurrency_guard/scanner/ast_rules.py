@@ -898,26 +898,56 @@ def discover_python_files(path: Path) -> list[Path]:
     return sorted(py_files)
 
 
-def scan_file(file_path: Path, custom_rules: Optional[list[dict[str, Any]]] = None) -> list[ASTFinding]:
+def scan_file(
+    file_path: Path,
+    custom_rules: Optional[list[dict[str, Any]]] = None,
+    cache_manager: Optional[Any] = None,
+) -> list[ASTFinding]:
     """Scan a Python file for concurrency vulnerabilities, skipping unparseable files."""
+    if cache_manager is not None:
+        cached = cache_manager.get_cached_findings(file_path)
+        if cached is not None:
+            from concurrency_guard.cache.manager import dict_to_finding
+
+            return [dict_to_finding(d) for d in cached]
+
     try:
         source_code = file_path.read_text(encoding="utf-8")
     except (UnicodeDecodeError, OSError):
         return []
 
     try:
-        return scan_source_code(source_code, filename=str(file_path), custom_rules=custom_rules)
+        findings = scan_source_code(source_code, filename=str(file_path), custom_rules=custom_rules)
     except SyntaxError:
-        return []
+        findings = []
+
+    if cache_manager is not None:
+        from concurrency_guard.cache.manager import finding_to_dict
+
+        cache_manager.update_cache(file_path, [finding_to_dict(f) for f in findings])
+
+    return findings
 
 
-def scan_directory(dir_path: Path, custom_rules: Optional[list[dict[str, Any]]] = None) -> list[ASTFinding]:
+def scan_directory(
+    dir_path: Path,
+    custom_rules: Optional[list[dict[str, Any]]] = None,
+    cache_manager: Optional[Any] = None,
+) -> list[ASTFinding]:
     """Scan a directory recursively, including cross-file call-chain analysis."""
-    return scan_project(discover_python_files(dir_path), roots=[dir_path], custom_rules=custom_rules)
+    return scan_project(
+        discover_python_files(dir_path),
+        roots=[dir_path],
+        custom_rules=custom_rules,
+        cache_manager=cache_manager,
+    )
 
 
 def scan_project(
-    file_paths: list[Path], roots: Optional[list[Path]] = None, custom_rules: Optional[list[dict[str, Any]]] = None
+    file_paths: list[Path],
+    roots: Optional[list[Path]] = None,
+    custom_rules: Optional[list[dict[str, Any]]] = None,
+    cache_manager: Optional[Any] = None,
 ) -> list[ASTFinding]:
     """Scan files and propagate shared-state hazards to transitive callers.
 
@@ -927,7 +957,9 @@ def scan_project(
     """
     findings: list[ASTFinding] = []
     for file_path in file_paths:
-        findings.extend(scan_file(file_path, custom_rules=custom_rules))
+        findings.extend(
+            scan_file(file_path, custom_rules=custom_rules, cache_manager=cache_manager)
+        )
     graph = build_call_graph(file_paths, roots=roots)
     taint_findings = find_tainted_shared_state_mutations(file_paths, graph)
     findings.extend(
