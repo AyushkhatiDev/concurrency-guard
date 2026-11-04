@@ -50,6 +50,7 @@ class _DjangoObjectFlow:
     row_locked: bool
     atomic_scopes: frozenset[int]
     mutated: bool = False
+    reported: bool = False
 
 
 @dataclass(frozen=True)
@@ -373,23 +374,15 @@ def _django_manager_call(call: ast.Call) -> tuple[bool, bool]:
     """Return whether a call fetches a Django model and has a row lock.
 
     The supported forms are ``Model.objects.get(...)`` and
-    ``Model.objects.filter(...).first()``. The second value records a
-    ``select_for_update()`` anywhere in the manager chain.
+    ``Model.objects.filter(...).first()``, with optional ``select_for_update()``.
     """
     if not isinstance(call.func, ast.Attribute):
         return False, False
     method = call.func.attr
-    manager: Optional[ast.AST] = None
-    if method == "get":
-        manager = call.func.value
-    elif method == "first" and isinstance(call.func.value, ast.Call):
-        filter_call = call.func.value
-        if isinstance(filter_call.func, ast.Attribute) and filter_call.func.attr == "filter":
-            manager = filter_call.func.value
-    if manager is None:
+    if method not in {"get", "first", "last"}:
         return False, False
-    manager_name = _expr_name(manager)
-    is_django_manager = manager_name.endswith(".objects") or ".objects." in manager_name
+    manager_name = _expr_name(call.func.value)
+    is_django_manager = ".objects" in manager_name or manager_name == "objects"
     has_row_lock = any(
         isinstance(child, ast.Attribute) and child.attr == "select_for_update"
         for child in ast.walk(call)
@@ -413,6 +406,83 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         self.shared_names: set[str] = set()
         self.thread_targets: set[str] = set()
         self.lock_orders: list[tuple[str, str, int, str]] = []
+        self.aliases: dict[str, str] = {}
+        self.context_stack: list[Union[ast.With, ast.AsyncWith]] = []
+
+    def resolve_alias(self, name: str) -> str:
+        """Resolve an alias to its source name through the alias chain."""
+        visited: set[str] = set()
+        curr = name
+        while curr in self.aliases and curr not in visited:
+            visited.add(curr)
+            curr = self.aliases[curr]
+        return curr
+
+    def set_alias(self, target: str, source: str) -> None:
+        """Record an alias mapping from target to source."""
+        resolved_source = self.resolve_alias(source)
+        if target != resolved_source:
+            self.aliases[target] = resolved_source
+
+    def remove_alias(self, target: str) -> None:
+        """Remove target from the active alias table."""
+        self.aliases.pop(target, None)
+
+    def is_in_async_lock(self) -> bool:
+        """Return True if currently inside an active async with lock/semaphore block."""
+        return any(
+            isinstance(ctx, ast.AsyncWith) and any(_is_lock_expr(item.context_expr) for item in ctx.items)
+            for ctx in self.context_stack
+        )
+
+    def is_in_sync_lock(self) -> bool:
+        """Return True if currently inside an active with lock/semaphore block."""
+        return any(
+            isinstance(ctx, ast.With) and any(_is_lock_expr(item.context_expr) for item in ctx.items)
+            for ctx in self.context_stack
+        )
+
+    def visit_With(self, node: ast.With) -> None:
+        """Track entering and exiting sync with blocks."""
+        self.context_stack.append(node)
+        self.generic_visit(node)
+        self.context_stack.pop()
+
+    def visit_AsyncWith(self, node: ast.AsyncWith) -> None:
+        """Track entering and exiting async with blocks."""
+        self.context_stack.append(node)
+        self.generic_visit(node)
+        self.context_stack.pop()
+
+    def visit_Assign(self, node: ast.Assign) -> None:
+        """Track variable assignments and aliases."""
+        for target in node.targets:
+            if isinstance(target, ast.Name):
+                if isinstance(node.value, ast.Name):
+                    self.set_alias(target.id, node.value.id)
+                else:
+                    self.remove_alias(target.id)
+            elif (
+                isinstance(target, (ast.Tuple, ast.List))
+                and isinstance(node.value, (ast.Tuple, ast.List))
+                and len(target.elts) == len(node.value.elts)
+            ):
+                for t_elt, v_elt in zip(target.elts, node.value.elts):
+                    if isinstance(t_elt, ast.Name):
+                        if isinstance(v_elt, ast.Name):
+                            self.set_alias(t_elt.id, v_elt.id)
+                        else:
+                            self.remove_alias(t_elt.id)
+        self.generic_visit(node)
+
+    def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
+        """Track annotated variable assignments and aliases."""
+        if isinstance(node.target, ast.Name):
+            if isinstance(node.value, ast.Name):
+                self.set_alias(node.target.id, node.value.id)
+            else:
+                self.remove_alias(node.target.id)
+        self.generic_visit(node)
 
     def visit_Module(self, node: ast.Module) -> None:
         """Collect module shared state and thread entry points before functions."""
@@ -439,17 +509,70 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
     ) -> None:
         """Detect shared-memory and file races without framework/ORM assumptions."""
         locked = _has_lock_context(node)
-        mutations = _mutated_targets(node)
-        shared_mutations = [m for m in mutations if m.split("[")[0].split(".")[0] in self.shared_names]
         is_thread_target = node.name in self.thread_targets
 
-        if isinstance(node, ast.AsyncFunctionDef) and shared_mutations and not locked:
+        unlocked_async_mutations: list[tuple[str, ast.AST]] = []
+        unlocked_sync_mutations: list[tuple[str, ast.AST]] = []
+
+        def inspect_statements(
+            stmts: list[ast.stmt], in_async_lock: bool, in_sync_lock: bool
+        ) -> None:
+            for stmt in stmts:
+                if isinstance(stmt, ast.Assign):
+                    for target in stmt.targets:
+                        if isinstance(target, ast.Name) and isinstance(stmt.value, ast.Name):
+                            self.set_alias(target.id, stmt.value.id)
+                        elif isinstance(target, ast.Name):
+                            self.remove_alias(target.id)
+                elif isinstance(stmt, ast.AnnAssign):
+                    if isinstance(stmt.target, ast.Name) and isinstance(stmt.value, ast.Name):
+                        self.set_alias(stmt.target.id, stmt.value.id)
+                    elif isinstance(stmt.target, ast.Name):
+                        self.remove_alias(stmt.target.id)
+
+                if isinstance(stmt, ast.AsyncWith):
+                    has_lock = any(_is_lock_expr(item.context_expr) for item in stmt.items)
+                    inspect_statements(stmt.body, in_async_lock or has_lock, in_sync_lock)
+                elif isinstance(stmt, ast.With):
+                    has_lock = any(_is_lock_expr(item.context_expr) for item in stmt.items)
+                    inspect_statements(stmt.body, in_async_lock, in_sync_lock or has_lock)
+                elif isinstance(stmt, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+                    inspect_statements(stmt.body, in_async_lock, in_sync_lock)
+                    inspect_statements(stmt.orelse, in_async_lock, in_sync_lock)
+                elif isinstance(stmt, ast.Try):
+                    inspect_statements(stmt.body, in_async_lock, in_sync_lock)
+                    inspect_statements(stmt.orelse, in_async_lock, in_sync_lock)
+                    inspect_statements(stmt.finalbody, in_async_lock, in_sync_lock)
+                    for handler in stmt.handlers:
+                        inspect_statements(handler.body, in_async_lock, in_sync_lock)
+                elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                else:
+                    if (
+                        isinstance(stmt, ast.Assign)
+                        and all(isinstance(t, ast.Name) for t in stmt.targets)
+                        and all(t.id not in self.shared_names for t in stmt.targets if isinstance(t, ast.Name))
+                    ):
+                        continue
+                    mutations = _mutated_targets(stmt)
+                    for m in mutations:
+                        root = m.split("[")[0].split(".")[0]
+                        resolved = self.resolve_alias(root)
+                        if root in self.shared_names or resolved in self.shared_names:
+                            if not in_async_lock:
+                                unlocked_async_mutations.append((m, stmt))
+                            if not in_sync_lock:
+                                unlocked_sync_mutations.append((m, stmt))
+
+        inspect_statements(node.body, in_async_lock=False, in_sync_lock=False)
+
+        if isinstance(node, ast.AsyncFunctionDef) and unlocked_async_mutations:
             self._add(
                 "CG-006", node, node.name,
                 "Async shared-state mutation without an asyncio.Lock context manager.",
                 "Create a shared asyncio.Lock and wrap the read/write section in 'async with lock:'.",
             )
-        if (is_thread_target or any(_is_concurrency_api(n) for n in local_nodes)) and shared_mutations and not locked:
+        if (is_thread_target or any(_is_concurrency_api(n) for n in local_nodes)) and unlocked_sync_mutations:
             self._add(
                 "CG-007", node, node.name,
                 "Threaded shared built-in mutation without a threading.Lock or threading.RLock.",
@@ -690,9 +813,8 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         dynamic dispatch, or a transaction boundary that has already ended.
         """
         def is_atomic_context(expression: ast.AST) -> bool:
-            if not isinstance(expression, ast.Call):
-                return False
-            return _expr_name(expression.func) in {
+            expr_name = _expr_name(expression.func) if isinstance(expression, ast.Call) else _expr_name(expression)
+            return expr_name in {
                 "atomic", "transaction.atomic", "django.db.transaction.atomic",
             }
 
@@ -704,6 +826,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                     row_locked=flow.row_locked,
                     atomic_scopes=flow.atomic_scopes,
                     mutated=flow.mutated,
+                    reported=flow.reported,
                 ))
             return {name: copies[id(flow)] for name, flow in flows.items()}
 
@@ -721,8 +844,38 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         def analyze_statement(
             statement: ast.stmt, active_scopes: tuple[int, ...], flows: dict[str, _DjangoObjectFlow]
         ) -> bool:
-            if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
-                target = statement.targets[0].id
+            if isinstance(statement, ast.Assign):
+                target_names = [t.id for t in statement.targets if isinstance(t, ast.Name)]
+                if target_names:
+                    if isinstance(statement.value, ast.Call):
+                        is_fetch, has_lock = _django_manager_call(statement.value)
+                        for target in target_names:
+                            if is_fetch:
+                                flows[target] = _DjangoObjectFlow(
+                                    fetch=statement.value,
+                                    row_locked=has_lock,
+                                    atomic_scopes=frozenset(active_scopes),
+                                )
+                                self.remove_alias(target)
+                            else:
+                                flows.pop(target, None)
+                                self.remove_alias(target)
+                    elif isinstance(statement.value, ast.Name):
+                        src_id = statement.value.id
+                        resolved_src = self.resolve_alias(src_id)
+                        for target in target_names:
+                            self.set_alias(target, src_id)
+                            src_flow = flows.get(src_id) or flows.get(resolved_src)
+                            if src_flow is not None:
+                                flows[target] = src_flow
+                            else:
+                                flows.pop(target, None)
+                    else:
+                        for target in target_names:
+                            flows.pop(target, None)
+                            self.remove_alias(target)
+            elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
+                target = statement.target.id
                 if isinstance(statement.value, ast.Call):
                     is_fetch, has_lock = _django_manager_call(statement.value)
                     if is_fetch:
@@ -731,34 +884,56 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                             row_locked=has_lock,
                             atomic_scopes=frozenset(active_scopes),
                         )
+                        self.remove_alias(target)
                     else:
                         flows.pop(target, None)
-                elif isinstance(statement.value, ast.Name) and statement.value.id in flows:
-                    flows[target] = flows[statement.value.id]
+                        self.remove_alias(target)
+                elif isinstance(statement.value, ast.Name):
+                    src_id = statement.value.id
+                    resolved_src = self.resolve_alias(src_id)
+                    self.set_alias(target, src_id)
+                    src_flow = flows.get(src_id) or flows.get(resolved_src)
+                    if src_flow is not None:
+                        flows[target] = src_flow
+                    else:
+                        flows.pop(target, None)
                 else:
                     flows.pop(target, None)
-            elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name) and statement.value is not None:
-                target = statement.target.id
-                if isinstance(statement.value, ast.Name) and statement.value.id in flows:
-                    flows[target] = flows[statement.value.id]
-                else:
-                    flows.pop(target, None)
+                    self.remove_alias(target)
 
             mutation_targets: list[ast.AST] = []
             if isinstance(statement, ast.AugAssign):
                 mutation_targets.append(statement.target)
             elif isinstance(statement, ast.Assign):
-                mutation_targets.extend(target for target in statement.targets if isinstance(target, ast.Attribute))
+                mutation_targets.extend(
+                    target for target in statement.targets if isinstance(target, (ast.Attribute, ast.Subscript))
+                )
+
             for mutation_target in mutation_targets:
-                flow = flows.get(_target_root_name(mutation_target))
+                root = _target_root_name(mutation_target)
+                resolved_root = self.resolve_alias(root)
+                flow = flows.get(root) or flows.get(resolved_root)
                 if flow is not None:
                     flow.mutated = True
+                    if not protected(flow, active_scopes) and not flow.reported:
+                        flow.reported = True
+                        self._add(
+                            "CG-016",
+                            flow.fetch,
+                            node.name,
+                            "Django Unlocked Read-Modify-Write: a model fetched through objects is mutated and saved without a row lock held by transaction.atomic().",
+                            "Fetch the row with '.objects.select_for_update().get(...)' (or before filter().first()) inside transaction.atomic().",
+                        )
+                        return True
 
             for call in calls(statement):
                 if not isinstance(call.func, ast.Attribute) or call.func.attr != "save":
                     continue
-                flow = flows.get(_target_root_name(call.func.value))
-                if flow is not None and flow.mutated and not protected(flow, active_scopes):
+                root = _target_root_name(call.func.value)
+                resolved_root = self.resolve_alias(root)
+                flow = flows.get(root) or flows.get(resolved_root)
+                if flow is not None and flow.mutated and not protected(flow, active_scopes) and not flow.reported:
+                    flow.reported = True
                     self._add(
                         "CG-016",
                         flow.fetch,
@@ -774,8 +949,19 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         ) -> bool:
             for statement in statements:
                 if isinstance(statement, (ast.With, ast.AsyncWith)):
-                    added_scopes = tuple(id(item.context_expr) for item in statement.items if is_atomic_context(item.context_expr))
-                    if analyze_block(statement.body, active_scopes + added_scopes, clone(flows)):
+                    self.context_stack.append(statement)
+                    added_scopes = tuple(
+                        id(item.context_expr)
+                        for item in statement.items
+                        if is_atomic_context(item.context_expr)
+                    )
+                    res = analyze_block(
+                        statement.body,
+                        active_scopes + added_scopes,
+                        clone(flows),
+                    )
+                    self.context_stack.pop()
+                    if res:
                         return True
                 elif isinstance(statement, (ast.If, ast.For, ast.AsyncFor, ast.While)):
                     if analyze_block(statement.body, active_scopes, clone(flows)):
@@ -794,14 +980,20 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """Inspect sync function definitions for rule CG-005."""
+        self.aliases.clear()
+        self.context_stack.clear()
         local_nodes = list(_walk_local_nodes(node))
         self._check_cg_005(node, local_nodes)
         self._check_cg_016(node, local_nodes)
         self._check_standard_library_rules(node, local_nodes)
         self.generic_visit(node)
+        self.aliases.clear()
+        self.context_stack.clear()
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         """Inspect async function definitions for rules CG-001, CG-002, CG-003, CG-004, and CG-005."""
+        self.aliases.clear()
+        self.context_stack.clear()
         local_nodes = list(_walk_local_nodes(node))
         self._check_cg_001(node, local_nodes)
         self._check_cg_002(node, local_nodes)
@@ -811,6 +1003,8 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         self._check_cg_016(node, local_nodes)
         self._check_standard_library_rules(node, local_nodes)
         self.generic_visit(node)
+        self.aliases.clear()
+        self.context_stack.clear()
 
 
 def _custom_rule_findings(tree: ast.AST, filename: str, rules: list[dict[str, Any]]) -> list[ASTFinding]:
