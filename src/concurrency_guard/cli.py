@@ -39,6 +39,7 @@ from concurrency_guard.scanner.ast_rules import (
     scan_project,
     scan_source_code,
 )
+from concurrency_guard.scanner.suppression import SuppressionFilter
 
 app = typer.Typer(no_args_is_help=True, help="Deterministic Concurrency & Idempotency Verifier")
 console = Console()
@@ -91,23 +92,28 @@ def scan(
             rules_hash=rules_hash,
         )
 
+    suppression_filter = SuppressionFilter()
     findings = scan_project(
         py_files,
         roots=[path] if path.is_dir() else [path.parent],
         custom_rules=custom_rules,
         cache_manager=cache_mgr,
+        suppression_filter=suppression_filter,
     )
 
     if cache_mgr is not None and path.is_dir():
         cache_mgr.purge_stale_entries(set(py_files))
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000
+    suppressed_count = suppression_filter.suppressed_count
+    suppressed_text = f" ({suppressed_count} suppressed)" if suppressed_count > 0 else ""
 
     if format.lower() == "json":
         payload = {
             "scanned_files": len(py_files),
             "elapsed_ms": round(elapsed_ms, 2),
             "findings_count": len(findings),
+            "suppressed_count": suppressed_count,
             "findings": [
                 {
                     "rule_id": f.rule_id,
@@ -147,8 +153,8 @@ def scan(
         console.print(table)
         console.print(
             Panel(
-                f"[bold red]Found {len(findings)} concurrency vulnerability issue(s).[/bold red]\n"
-                f"[dim]Scanned {len(py_files)} file(s) in {elapsed_ms:.1f} ms | Found {len(findings)} issue(s)[/dim]",
+                f"[bold red]Found {len(findings)} concurrency vulnerability issue(s){suppressed_text}.[/bold red]\n"
+                f"[dim]Scanned {len(py_files)} file(s) in {elapsed_ms:.1f} ms | Found {len(findings)} issue(s){suppressed_text}[/dim]",
                 border_style="red",
             )
         )
@@ -156,8 +162,8 @@ def scan(
 
     console.print(
         Panel(
-            f"[bold green]All AST concurrency checks passed. No vulnerabilities found.[/bold green]\n"
-            f"[dim]Scanned {len(py_files)} file(s) in {elapsed_ms:.1f} ms | Found 0 issue(s)[/dim]",
+            f"[bold green]All AST concurrency checks passed. No vulnerabilities found{suppressed_text}.[/bold green]\n"
+            f"[dim]Scanned {len(py_files)} file(s) in {elapsed_ms:.1f} ms | Found 0 issue(s){suppressed_text}[/dim]",
             border_style="green",
         )
     )
