@@ -200,3 +200,4 @@ async def route_b(db):
     data = json.loads(res_json.stdout)
     assert data["findings_count"] == 1
     assert data["suppressed_count"] == 1
+

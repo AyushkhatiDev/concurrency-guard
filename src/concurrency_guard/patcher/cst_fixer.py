@@ -643,3 +643,31 @@ def apply_all_fixes(source_code: str, rules: Optional[set[str]] = None) -> str:
 def apply_with_for_update_fix(source_code: str) -> str:
     """Parse source code, apply WithForUpdateTransformer, and return modified code."""
     return apply_all_fixes(source_code, rules={"CG-001"})
+
+
+from concurrency_guard.patcher.diff_utils import (
+    DiffGenerator,
+    DiffResult,
+    colorize_diff,
+    generate_unified_diff,
+    validate_patch_syntax,
+)
+
+__all__ = [
+    "DiffGenerator",
+    "DiffResult",
+    "DjangoSelectForUpdateTransformer",
+    "FileLockTransformer",
+    "IdempotencyHeaderTransformer",
+    "IntegrityErrorGuardTransformer",
+    "PatchResult",
+    "PatchSkip",
+    "SharedStateLockTransformer",
+    "WithForUpdateTransformer",
+    "apply_all_fixes",
+    "apply_all_fixes_with_report",
+    "apply_with_for_update_fix",
+    "colorize_diff",
+    "generate_unified_diff",
+    "validate_patch_syntax",
+]
