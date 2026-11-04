@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import difflib
 import importlib.util
 import json
 import sys
@@ -23,7 +22,8 @@ from concurrency_guard.cache.manager import (
     CacheManager,
     compute_rules_hash,
 )
-from concurrency_guard.patcher.cst_fixer import apply_all_fixes, apply_all_fixes_with_report
+from concurrency_guard.patcher.cst_fixer import apply_all_fixes
+from concurrency_guard.patcher.diff_utils import DiffGenerator, colorize_diff
 from concurrency_guard.reporter.github_pr import generate_github_pr_markdown
 from concurrency_guard.runner.barrier_engine import (
     BarrierResult,
@@ -313,22 +313,55 @@ def fix(
         "--write",
         help="Write the patched code back to disk",
     ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        "--diff",
+        help="Print unified diff of changes without modifying files on disk",
+    ),
 ) -> None:
     """Auto-patch concurrency race conditions and idempotency bugs using LibCST."""
     source_code = file_path.read_text(encoding="utf-8")
     initial_findings = scan_file(file_path)
 
     rules_filter = {rule.upper()} if rule else None
-    patch_result = apply_all_fixes_with_report(source_code, rules=rules_filter)
-    patched_code = patch_result.code
+    diff_gen = DiffGenerator(rules=rules_filter)
+    diff_result = diff_gen.generate_diff(
+        source_code,
+        filepath=file_path,
+        fromfile=str(file_path),
+        tofile=f"{file_path} (patched)",
+    )
 
-    if patch_result.skipped:
+    if not diff_result.is_valid:
+        console.print(
+            Panel(
+                f"[bold red]❌ Preflight syntax validation failed for {file_path}:[/bold red]\n"
+                f"[red]{diff_result.error_message}[/red]\n"
+                "[yellow]Patch discarded. File was not modified.[/yellow]",
+                title="[bold red]Patch Rejected[/bold red]",
+                border_style="red",
+            )
+        )
+        raise typer.Exit(code=1)
+
+    patched_code = diff_result.patched_code
+
+    if dry_run:
+        if diff_result.diff:
+            colored = colorize_diff(diff_result.diff, is_tty=sys.stdout.isatty())
+            sys.stdout.write(colored)
+            if not colored.endswith("\n"):
+                sys.stdout.write("\n")
+        raise typer.Exit(code=0)
+
+    if diff_result.skipped:
         skipped_table = Table(title="Manual Review Required", show_header=True, header_style="bold yellow")
         skipped_table.add_column("Rule ID", style="bold yellow")
         skipped_table.add_column("Function", style="magenta")
         skipped_table.add_column("Line", justify="right")
         skipped_table.add_column("Reason")
-        for skipped in patch_result.skipped:
+        for skipped in diff_result.skipped:
             skipped_table.add_row(skipped.rule_id, skipped.function_name, str(skipped.lineno), skipped.reason)
         console.print(skipped_table)
 
@@ -379,15 +412,7 @@ def fix(
 
     console.print(summary_table)
 
-    diff = "".join(
-        difflib.unified_diff(
-            source_code.splitlines(keepends=True),
-            patched_code.splitlines(keepends=True),
-            fromfile=str(file_path),
-            tofile=f"{file_path} (patched)",
-        )
-    )
-
+    diff = diff_result.diff
     diff_syntax = Syntax(diff, "diff", theme="monokai", line_numbers=True)
     console.print(
         Panel(
