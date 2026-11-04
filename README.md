@@ -5,7 +5,7 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![GitHub](https://img.shields.io/badge/GitHub-AyushkhatiDev%2Fconcurrency--guard-181717?logo=github)](https://github.com/AyushkhatiDev/concurrency-guard)
 
-**v2.1.0 — Enterprise-Grade Semantic SAST Platform & Headless Runtime Race Verifier for Python.**
+**v2.3.0 — Enterprise-Grade Semantic SAST Platform & Headless Runtime Race Verifier for Python.**
 
 Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy**, **Celery**, **Redis**, **asyncio**, and multi-threaded Python systems.
 
@@ -40,19 +40,22 @@ Traditional code security tools are fundamentally blind to concurrency. Syntax l
 
 ## Why `cguard`? The Architectural Difference
 
-`concurrency-guard` does not use naive regexes or brittle token searches. It parses and analyzes Python code using four enterprise-grade architectural pillars:
+`concurrency-guard` does not use naive regexes or brittle token searches. It parses and analyzes Python code using enterprise-grade architectural pillars:
 
 ```mermaid
 flowchart TD
-    A["Source Codebase (.py)"] --> B["Static AST Scanner"]
-    B --> C["Inter-Procedural Call Graph"]
-    B --> D["Semantic Data-Flow Taint Engine"]
-    C --> E["Deterministic Findings (CG-001 to CG-016)"]
-    D --> E
-    E --> F["Headless Runtime Verifier (asyncio/threading Barrier)"]
-    E --> G["Lossless LibCST Auto-Patcher"]
-    F --> H["Empirical Exploit Proof"]
-    G --> I["Production-Ready Patched Code"]
+    A["Source Codebase (.py)"] --> B["Incremental SQLite Cache / AST Scanner"]
+    B --> C["Tokenized # cg:ignore Filter"]
+    C --> D["Inter-Procedural Call Graph Engine"]
+    C --> E["Semantic Data-Flow & Deep Alias Tracker"]
+    D --> F["Deterministic Findings (CG-001 to CG-016)"]
+    E --> F
+    F --> G["Headless Runtime Verifier (Barrier Engine)"]
+    F --> H["Non-Destructive In-Memory Diff (--diff)"]
+    F --> I["Preflight Syntax-Validated Patcher (--write)"]
+    G --> J["Empirical Exploit Proof"]
+    H --> K["Lossless Patch Review"]
+    I --> L["Safe Patched Source"]
 ```
 
 ### 1. Inter-Procedural Call Graph Analysis (`CG-014`)
@@ -61,13 +64,25 @@ Real-world concurrency bugs rarely live in a single 10-line function. A web rout
 ### 2. Data-Flow Semantic Taint Tracking (`CG-015`)
 When shared state (globals, class-level caches, Redis connections, or singleton pools) is passed across variable assignments, aliased through local dictionaries, or unpacked into parameters, simple AST pattern matchers lose track. `cguard` employs a forward data-flow taint tracker that labels mutable shared references at their origin and propagates taint through assignments, attribute lookups, and function calls. An issue is raised if a tainted reference reaches an unguarded mutation sink (`AugAssign`, `.append()`, `.pop()`, `.set()`, `.update()`).
 
-### 3. Deep Alias & Control Flow Tracking
-v2.2.0 follows proven object aliases across assignments such as `wallet → w`, while keeping transaction and row-lock state scoped to the exact lexical control-flow path. A Django read-modify-write is only treated as protected when `select_for_update()` is held inside the same `transaction.atomic()` scope; ambiguous branches, dynamic dispatch, and unsupported data flow intentionally produce no finding or automatic patch.
+### 3. Deep Alias & Context-Aware Lock Detection (`CG-006`, `CG-016`)
+`cguard` dynamically tracks stateful variable aliases (`wallet → w1 → w2`) across local function scopes. Tainted database queries or shared objects maintain their vulnerability provenance across reassignments and immediately trigger findings on in-place mutations (`w.balance -= 50`). Context-aware lock tracking audits `with` and `async with` block lifecycles—suppressing false positives when shared collections are protected inside `async with lock:` and enforcing that Django row locks are actively held inside `with transaction.atomic():`.
 
-### 4. Headless Runtime Stress Verification (`cguard verify --headless`)
+### 4. Incremental SQLite Caching Engine (`cguard scan --cache`)
+For enterprise monorepos and high-frequency CI pipelines, `cguard` provides an incremental scanning cache backed by a thread-safe SQLite database (`.concurrency_guard_cache.db`). Scan keys are computed via SHA-256 hashes of file contents, scanner engine version, and active rules configuration. Unchanged source files skip AST parsing entirely, accelerating repository-wide scans down to sub-millisecond execution.
+
+### 5. Inline `# cg:ignore` Directive Engine
+False positives and intentional low-level synchronization patterns can be suppressed directly in source code using Python's standard `tokenize` module. `cguard` accurately ignores directives inside comments without mistaking docstrings or string literals:
+- **Line-level:** `wallet.balance -= 50  # cg:ignore[CG-016] rationale="Protected upstream"`
+- **Block-level:** `# cg:ignore-start[CG-006]` ... `# cg:ignore-end[CG-006]`
+- **File-level:** `# cg:ignore-file[CG-001, CG-002]`
+
+### 6. Non-Destructive In-Memory Diffs & Preflight AST Validation (`cguard fix --diff`)
+Review automated security patches without touching files on disk. `cguard fix --diff` (or `--dry-run`) generates standard colorized unified diffs in memory using `difflib`. Before displaying or applying any patch, a preflight syntax validator parses the modified AST with `ast.parse()`; if a syntax error or code corruption is detected, the patch is safely aborted and discarded.
+
+### 7. Headless Runtime Stress Verification (`cguard verify --headless`)
 Static analysis identifies potential hazards; `cguard`'s verification engine mathematically proves them. You no longer need a running web server or live database. `cguard verify` dynamically imports raw Python callables, initializes synchronized barriers (`asyncio.Barrier` for coroutines or `threading.Barrier` for OS threads), and releases up to 100 concurrent workers at the exact same microsecond. By comparing the observed post-execution state against mathematical expectations, it confirms race conditions (such as balance double-spends or lost updates) with zero false alarms.
 
-### 5. Lossless `LibCST` Auto-Patching (`cguard fix --write`)
+### 8. Lossless `LibCST` Auto-Patching (`cguard fix --write`)
 Fixing security bugs by hand introduces syntax errors and disrupts formatting. `cguard` uses Concrete Syntax Tree (`libcst`) manipulation to safely modify code in place. It injects required locks (`.with_for_update()`, Django `select_for_update()`, `asyncio.Lock`, `threading.Lock`, or `filelock.FileLock`), wraps vulnerable mutations in synchronization contexts, and adds error guards while **100% preserving your comments, docstrings, indentation, and formatting**.
 
 ---
@@ -94,11 +109,30 @@ cguard scan app/routers/wallet.py
 # Scan an entire repository (auto-excludes .venv, migrations, and build caches)
 cguard scan src/
 
+# Run with sub-millisecond SQLite incremental caching
+cguard scan src/ --cache
+
 # Output structured JSON for CI/CD pipelines
 cguard scan src/ --format json
 ```
 
-### 2. Verify race conditions empirically
+### 2. Suppress intentional designs with inline `# cg:ignore`
+Silence false positives or intentional low-level synchronization cleanly in code:
+
+```python
+# Line-level ignore
+wallet.balance -= 50  # cg:ignore[CG-016] rationale="Locked upstream in orchestrator"
+
+# Multi-rule block-level ignore
+# cg:ignore-start[CG-006, CG-007]
+shared_cache[key] = val
+# cg:ignore-end[CG-006, CG-007]
+
+# Entire file ignore (e.g. at top of tests or legacy modules)
+# cg:ignore-file[CG-001]
+```
+
+### 3. Verify race conditions empirically
 Prove vulnerabilities at runtime using synchronized barrier stress-testing.
 
 #### Option A: FastAPI & SQLAlchemy Endpoint Verification
@@ -130,14 +164,14 @@ Expected Increments: 50
 Observed State Value: 14 (Lost 36 state updates due to unguarded RMW race!)
 ```
 
-### 3. Automatically patch vulnerabilities in-place
-Review changes with a dry-run diff, or write deterministic fixes directly to disk:
+### 4. Review non-destructive diffs and auto-patch in-place
+Preview colorized unified diffs safely in memory, then apply syntax-validated fixes:
 
 ```bash
-# Preview the unified diff (dry-run)
-cguard fix app/routers/wallet.py
+# Preview the unified diff in memory without touching disk (dry-run)
+cguard fix app/routers/wallet.py --diff
 
-# Apply fixes directly to files
+# Apply preflight syntax-validated fixes directly to files
 cguard fix app/routers/wallet.py --write
 ```
 
