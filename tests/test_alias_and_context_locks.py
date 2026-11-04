@@ -267,3 +267,4 @@ t = threading.Thread(target=worker)
     findings = _cg007(source)
     assert len(findings) == 1
     assert findings[0].rule_id == "CG-007"
+
