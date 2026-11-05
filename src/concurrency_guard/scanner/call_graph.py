@@ -33,6 +33,7 @@ class CallSite:
     target: str
     lineno: int
     arguments: tuple[str, ...]
+    keywords: tuple[tuple[str, str], ...] = ()
 
 
 @dataclass
@@ -58,6 +59,8 @@ class CallGraph:
 
 
 def _dotted_name(node: ast.AST) -> str:
+    if isinstance(node, ast.Call):
+        return _dotted_name(node.func)
     if isinstance(node, ast.Name):
         return node.id
     if isinstance(node, ast.Attribute):
@@ -68,8 +71,12 @@ def _dotted_name(node: ast.AST) -> str:
 
 def _module_name(path: Path, roots: list[Path]) -> str:
     """Use the nearest supplied root as a stable Python-ish module name."""
-    root = max((candidate for candidate in roots if candidate in path.parents), key=lambda p: len(p.parts))
-    relative = path.relative_to(root).with_suffix("")
+    resolved_path = path.resolve()
+    resolved_roots = [candidate.resolve() for candidate in roots]
+    root = max((candidate for candidate in resolved_roots if candidate == resolved_path.parent or candidate in resolved_path.parents), key=lambda p: len(p.parts), default=None)
+    if root is None:
+        return resolved_path.stem
+    relative = resolved_path.relative_to(root).with_suffix("")
     parts = relative.parts
     return ".".join(parts[:-1] if parts[-1] == "__init__" else parts)
 
@@ -189,6 +196,7 @@ def build_call_graph(files: list[Path], roots: Optional[list[Path]] = None) -> C
                                 target=candidate,
                                 lineno=call.lineno,
                                 arguments=tuple(_dotted_name(argument).split(".")[0] for argument in call.args),
+                                keywords=tuple((keyword.arg, _dotted_name(keyword.value).split(".")[0]) for keyword in call.keywords if keyword.arg is not None),
                             )
                         )
     return graph
