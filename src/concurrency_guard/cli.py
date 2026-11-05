@@ -70,11 +70,7 @@ def scan(
         "--cache-path",
         help="Path to SQLite cache database (defaults to .concurrency_guard_cache.db)",
     ),
-    no_cache: bool = typer.Option(
-        False,
-        "--no-cache",
-        help="Bypass cache reads and writes completely",
-    ),
+    cache: bool = typer.Option(True, "--cache/--no-cache", help="Enable or bypass incremental cache reads and writes."),
 ) -> None:
     """Scan Python files or directories for concurrency vulnerabilities."""
     start_time = time.perf_counter()
@@ -87,7 +83,7 @@ def scan(
         raise typer.BadParameter(str(error), param_hint="--rules") from error
 
     cache_mgr: Optional[CacheManager] = None
-    if not no_cache and config.cache:
+    if cache and config.cache:
         db_file = cache_path or DEFAULT_CACHE_FILE
         rules_hash = compute_rules_hash(rules_path=effective_rules, custom_rules=custom_rules)
         cache_mgr = CacheManager(

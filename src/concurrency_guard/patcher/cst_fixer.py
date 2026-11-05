@@ -10,6 +10,7 @@ import libcst as cst
 from libcst.metadata import MetadataWrapper, ParentNodeProvider
 
 from concurrency_guard.scanner.ast_rules import ASTFinding, scan_source_code
+from concurrency_guard.scanner.suppression import SuppressionFilter
 
 
 @dataclass(frozen=True)
@@ -577,7 +578,9 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
     """Apply only statically validated fixes and report skipped targets."""
     selected_rules = rules if rules is not None else {"CG-001", "CG-002", "CG-004", "CG-006", "CG-007", "CG-009", "CG-016"}
     current_code = source_code
-    findings = scan_source_code(current_code)
+    suppressions = SuppressionFilter()
+    suppressions.parse_source(current_code, filepath="<memory>")
+    findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
     skipped: list[PatchSkip] = []
 
     def targets_for(rule_id: str) -> set[str]:
@@ -595,7 +598,8 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
             current_code = wrapper.visit(
                 WithForUpdateTransformer(target_functions=cg001_targets)
             ).code
-            findings = scan_source_code(current_code)
+            suppressions.parse_source(current_code, filepath="<memory>")
+            findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
 
     # 2. CG-002: IdempotencyHeaderTransformer
     if "CG-002" in selected_rules:
@@ -619,7 +623,8 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
 
     # 4. CG-006: protect async shared-state mutations.
     if "CG-006" in selected_rules:
-        findings = scan_source_code(current_code)
+        suppressions.parse_source(current_code, filepath="<memory>")
+        findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
         targets = targets_for("CG-006")
         if targets:
             tree = cst.parse_module(current_code).visit(
@@ -630,7 +635,8 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
 
     # 5. CG-007: protect threaded shared-state mutations.
     if "CG-007" in selected_rules:
-        findings = scan_source_code(current_code)
+        suppressions.parse_source(current_code, filepath="<memory>")
+        findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
         targets = targets_for("CG-007")
         if targets:
             tree = cst.parse_module(current_code).visit(
@@ -642,7 +648,8 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
     # 6. CG-009 is concurrent file overwrite. CG-008 is accepted for callers
     # that used the pre-release file-rule identifier.
     if {"CG-008", "CG-009"}.intersection(selected_rules):
-        findings = scan_source_code(current_code)
+        suppressions.parse_source(current_code, filepath="<memory>")
+        findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
         targets = targets_for("CG-009")
         if targets:
             tree = cst.parse_module(current_code).visit(FileLockTransformer(targets))
@@ -650,7 +657,8 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
 
     # 7. CG-016: lock a Django ORM fetch before its read-modify-write sequence.
     if "CG-016" in selected_rules:
-        findings = scan_source_code(current_code)
+        suppressions.parse_source(current_code, filepath="<memory>")
+        findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
         targets = targets_for("CG-016")
         if targets:
             current_code = cst.parse_module(current_code).visit(

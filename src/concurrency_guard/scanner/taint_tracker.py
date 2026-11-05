@@ -66,9 +66,11 @@ def _is_lock_context(node: ast.AST) -> bool:
 def _is_concurrent(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> bool:
     if isinstance(node, ast.AsyncFunctionDef):
         return True
-    decorators = " ".join(ast.unparse(decorator).lower() for decorator in node.decorator_list)
-    body = " ".join(ast.unparse(statement).lower() for statement in node.body)
-    return any(token in decorators or token in body for token in ("thread", "executor", "create_task", ".post", ".put", ".patch"))
+    for decorator in node.decorator_list:
+        rendered = ast.unparse(decorator).lower()
+        if any(token in rendered for token in (".post", ".put", ".patch", ".delete", ".task", "shared_task")):
+            return True
+    return any(isinstance(call, ast.Call) and ast.unparse(call.func) in {"threading.Thread", "asyncio.create_task", "asyncio.gather"} for call in ast.walk(node))
 
 
 def _module_sources(tree: ast.Module) -> set[str]:
@@ -186,6 +188,13 @@ def _function_ast_by_key(
                 if key:
                     definitions[key] = node
                     source_names[key] = sources
+            elif isinstance(node, ast.ClassDef):
+                for method in node.body:
+                    if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        key = by_location.get((str(path), method.name))
+                        if key:
+                            definitions[key] = method
+                            source_names[key] = sources
     return definitions, source_names
 
 
@@ -214,6 +223,12 @@ def find_tainted_shared_state_mutations(files: list[Path], graph: CallGraph) -> 
             for index, argument in enumerate(site.arguments):
                 if index < len(parameters) and argument in caller_taint and parameters[index].arg not in parameter_taint[site.target]:
                     parameter_taint[site.target].add(parameters[index].arg)
+                    changed = True
+            parameters_by_name = {parameter.arg: parameter for parameter in parameters + callee.args.kwonlyargs}
+            for name, argument in site.keywords:
+                parameter = parameters_by_name.get(name)
+                if parameter is not None and argument in caller_taint and parameter.arg not in parameter_taint[site.target]:
+                    parameter_taint[site.target].add(parameter.arg)
                     changed = True
         if not changed:
             break

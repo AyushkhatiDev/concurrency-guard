@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import importlib
 import importlib.util
 import inspect
+import sys
 import threading
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
@@ -38,11 +40,23 @@ class HeadlessVerificationResult(TypedDict):
 
 def load_function(file_path: Path, function_name: str) -> tuple[ModuleType, Callable[..., Any]]:
     """Import ``function_name`` from a source file under an isolated module name."""
-    module_id = hashlib.sha256(str(file_path.resolve()).encode()).hexdigest()[:12]
-    spec = importlib.util.spec_from_file_location(f"cguard_target_{module_id}", file_path)
+    resolved = file_path.resolve()
+    package_parts: list[str] = []
+    cursor = resolved.parent
+    while (cursor / "__init__.py").is_file():
+        package_parts.insert(0, cursor.name)
+        cursor = cursor.parent
+    if package_parts and str(cursor) not in sys.path:
+        sys.path.insert(0, str(cursor))
+    module_id = hashlib.sha256(str(resolved).encode()).hexdigest()[:12]
+    qualified = ".".join([*package_parts, resolved.stem]) if package_parts else f"cguard_target_{module_id}"
+    if package_parts:
+        importlib.import_module(".".join(package_parts))
+    spec = importlib.util.spec_from_file_location(qualified, resolved)
     if spec is None or spec.loader is None:
         raise ValueError(f"Unable to create an import specification for {file_path}.")
     module = importlib.util.module_from_spec(spec)
+    sys.modules[qualified] = module
     spec.loader.exec_module(module)
     target = getattr(module, function_name, None)
     if target is None or not callable(target):
@@ -133,6 +147,19 @@ def verify_function(file_path: Path, function_name: str, workers: int = 20) -> H
     args, kwargs = _synthesize_arguments(target, state)
     key, initial_value = _numeric_state(state)
 
+    # Measure the callable's actual one-run effect in a fresh module before
+    # extrapolating. This supports deductions and arbitrary deterministic deltas.
+    baseline_module, baseline_target = load_function(file_path, function_name)
+    _, baseline_state = _select_state(baseline_module)
+    baseline_args, baseline_kwargs = _synthesize_arguments(baseline_target, baseline_state)
+    baseline_key, baseline_initial = _numeric_state(baseline_state)
+    if inspect.iscoroutinefunction(baseline_target):
+        asyncio.run(baseline_target(*baseline_args, **baseline_kwargs))
+    else:
+        baseline_target(*baseline_args, **baseline_kwargs)
+    baseline_after = baseline_state.get(baseline_key, baseline_initial)
+    single_delta = baseline_after - baseline_initial if isinstance(baseline_after, int) else 0
+
     if inspect.iscoroutinefunction(target):
         completed, errors = asyncio.run(_verify_async(target, args, kwargs, workers))
         mode = "asyncio"
@@ -143,7 +170,7 @@ def verify_function(file_path: Path, function_name: str, workers: int = 20) -> H
     actual_value = state.get(key, 0)
     if not isinstance(actual_value, int) or isinstance(actual_value, bool):
         actual_value = 0
-    expected_value = initial_value + completed
+    expected_value = initial_value + (single_delta * completed)
     return HeadlessVerificationResult(
         function_name=function_name,
         workers=workers,
