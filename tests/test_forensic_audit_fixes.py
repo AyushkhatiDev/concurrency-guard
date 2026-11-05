@@ -71,3 +71,74 @@ def test_headless_uses_measured_delta(tmp_path: Path, delta: int) -> None:
 ])
 def test_suppression_rule_parser_is_deterministic(raw: str | None, expected: set[str]) -> None:
     assert parse_rules(raw) == expected
+
+
+def test_sync_class_rmw_heuristic_and_concurrency_detection() -> None:
+    # 1. Synchronous AST/CST class mutating self.depth += 1 / -= 1 or doing RMW
+    # even with 'atomic' or 'lock' in identifiers must produce 0 CG-008 findings.
+    sync_transformer = """
+class CSTAtomicDepthTransformer:
+    def __init__(self):
+        self.atomic_depth = 0
+        self.lock_count = 0
+    def visit_With(self, node):
+        self.atomic_depth += 1
+        d = self.lock_count
+        self.lock_count = d + 1
+    def leave_With(self, node):
+        self.atomic_depth -= 1
+        d = self.lock_count
+        self.lock_count = d - 1
+"""
+    sync_findings = [f for f in scan_source_code(sync_transformer) if f.rule_id == "CG-008"]
+    assert len(sync_findings) == 0
+
+    # 2. Synchronous LibCST transformer modifying local list elements (like cst_fixer.py)
+    # must produce 0 CG-008 findings.
+    sync_list_mod = """
+class IdempotencyHeaderTransformer:
+    def leave_FunctionDef(self, original_node, updated_node):
+        old_params = list(updated_node.params.params)
+        if old_params:
+            last = old_params[-1]
+            old_params[-1] = last.with_changes(comma=None)
+"""
+    list_findings = [f for f in scan_source_code(sync_list_mod) if f.rule_id == "CG-008"]
+    assert len(list_findings) == 0
+
+    # 3. Explicitly verified multi-threaded target executing RMW must trigger CG-008.
+    threaded_target = """
+import threading
+state = {}
+def worker():
+    val = state['count']
+    state['count'] = val + 1
+t = threading.Thread(target=worker)
+"""
+    threaded_findings = [f for f in scan_source_code(threaded_target) if f.rule_id == "CG-008"]
+    assert len(threaded_findings) == 1
+    assert threaded_findings[0].rule_id == "CG-008"
+
+    # 4. Async coroutine with intervening await suspension point must trigger CG-008.
+    async_with_await = """
+import asyncio
+state = {}
+async def async_worker():
+    val = state['count']
+    await asyncio.sleep(0.01)
+    state['count'] = val + 1
+"""
+    async_findings = [f for f in scan_source_code(async_with_await) if f.rule_id == "CG-008"]
+    assert len(async_findings) == 1
+    assert async_findings[0].rule_id == "CG-008"
+
+    # 5. Async coroutine WITHOUT intervening await suspension point must NOT trigger CG-008.
+    async_without_await = """
+state = {}
+async def safe_async_worker():
+    val = state['count']
+    state['count'] = val + 1
+"""
+    safe_async_findings = [f for f in scan_source_code(async_without_await) if f.rule_id == "CG-008"]
+    assert len(safe_async_findings) == 0
+

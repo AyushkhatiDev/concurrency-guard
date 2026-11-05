@@ -137,7 +137,24 @@ def _mutated_targets(node: ast.AST) -> set[str]:
 
 
 def _is_concurrency_api(node: ast.AST) -> bool:
-    return any(token in _expr_name(node).lower() for token in ("thread", "executor", "create_task", "gather", "process"))
+    name = _expr_name(node).lower()
+    if any(
+        token in name
+        for token in (
+            "threading.thread",
+            "threadpoolexecutor",
+            "processpoolexecutor",
+            "asyncio.create_task",
+            "asyncio.gather",
+            "multiprocessing.process",
+        )
+    ):
+        return True
+    parts = name.split(".")
+    base = parts[-1]
+    if base in {"thread", "create_task", "gather"}:
+        return True
+    return bool(len(parts) > 1 and parts[-2] in {"threading", "multiprocessing", "asyncio"})
 
 
 def _is_file_write(call: ast.Call) -> bool:
@@ -235,6 +252,22 @@ def _is_post_route(node: ast.AsyncFunctionDef) -> bool:
         if isinstance(func, ast.Attribute) and func.attr == "post":
             return True
     return False
+
+
+def _is_web_route(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> bool:
+    """Check if function is decorated with a web route decorator."""
+    for dec in node.decorator_list:
+        func = dec.func if isinstance(dec, ast.Call) else dec
+        if isinstance(func, ast.Attribute) and func.attr.lower() in {
+            "get", "post", "put", "delete", "patch", "route", "api_route", "websocket"
+        }:
+            return True
+    return False
+
+
+def _has_celery_decorator(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> bool:
+    """Check if function is decorated with a Celery task decorator."""
+    return any(_is_celery_task(dec) for dec in node.decorator_list)
 
 
 def _has_idempotency_param(node: ast.AsyncFunctionDef) -> bool:
@@ -500,11 +533,25 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                     self.shared_names.update(_assignment_target_name(t) for t in targets)
         for call in (n for n in ast.walk(node) if isinstance(n, ast.Call) and _is_concurrency_api(n.func)):
             for keyword in call.keywords:
-                if keyword.arg in {"target", "fn", "func"} and isinstance(keyword.value, ast.Name):
-                    self.thread_targets.add(keyword.value.id)
-            for arg in call.args:
-                if isinstance(arg, ast.Name):
-                    self.thread_targets.add(arg.id)
+                if keyword.arg in {"target", "fn", "func"}:
+                    if isinstance(keyword.value, ast.Name):
+                        self.thread_targets.add(keyword.value.id)
+                    elif isinstance(keyword.value, ast.Attribute):
+                        self.thread_targets.add(keyword.value.attr)
+            func_name = _expr_name(call.func).lower()
+            if any(func_name.endswith(method) for method in (".submit", ".apply_async", ".apply", "create_task")) or func_name in {"submit", "apply_async", "apply", "create_task"}:
+                if call.args:
+                    first_arg = call.args[0]
+                    if isinstance(first_arg, ast.Name):
+                        self.thread_targets.add(first_arg.id)
+                    elif isinstance(first_arg, ast.Attribute):
+                        self.thread_targets.add(first_arg.attr)
+            elif "thread" in func_name and len(call.args) >= 2:
+                target_arg = call.args[1]
+                if isinstance(target_arg, ast.Name):
+                    self.thread_targets.add(target_arg.id)
+                elif isinstance(target_arg, ast.Attribute):
+                    self.thread_targets.add(target_arg.attr)
         self.generic_visit(node)
 
     def _add(self, rule_id: str, node: ast.AST, function: str, message: str, hint: str) -> None:
@@ -618,17 +665,38 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         # Semantic RMW: remember a value read from an attribute/subscript, then
         # identify its later assignment back. This catches arbitrary classes,
         # schemas, and in-memory objects rather than only ORM entities.
-        reads: dict[str, str] = {}
-        for statement in sorted((n for n in local_nodes if isinstance(n, ast.stmt)), key=lambda n: n.lineno):
+        is_web_route = _is_web_route(node)
+        is_celery = _has_celery_decorator(node)
+        is_async = isinstance(node, ast.AsyncFunctionDef)
+        is_concurrent_func = is_thread_target or is_web_route or is_celery or is_async
+
+        rmw_reads: dict[str, tuple[str, int]] = {}
+        for statement in sorted((n for n in local_nodes if isinstance(n, ast.stmt)), key=lambda n: getattr(n, "lineno", 0)):
             if isinstance(statement, ast.Assign) and len(statement.targets) == 1 and isinstance(statement.targets[0], ast.Name):
                 value = statement.value
                 if isinstance(value, (ast.Attribute, ast.Subscript)):
-                    reads[statement.targets[0].id] = ast.unparse(value)
+                    rmw_reads[statement.targets[0].id] = (ast.unparse(value), getattr(statement, "lineno", 0))
             if isinstance(statement, ast.Assign):
                 for target in statement.targets:
                     target_name = _assignment_target_name(target)
                     value_names = {n.id for n in ast.walk(statement.value) if isinstance(n, ast.Name)}
-                    if target_name in reads.values() and value_names.intersection(reads) and not locked:
+                    matching_vars = [var for var in value_names if var in rmw_reads and rmw_reads[var][0] == target_name]
+                    if matching_vars and not locked and is_concurrent_func:
+                        read_var = matching_vars[0]
+                        _read_expr, read_lineno = rmw_reads[read_var]
+                        write_lineno = getattr(statement, "lineno", 0)
+
+                        # If async coroutine without thread/web/celery concurrency, it is only a race
+                        # if there is an intervening await suspension point between read and write.
+                        if is_async and not (is_thread_target or is_web_route or is_celery):
+                            has_intervening_await = any(
+                                isinstance(n, (ast.Await, ast.AsyncFor, ast.AsyncWith))
+                                and read_lineno <= getattr(n, "lineno", 0) <= write_lineno
+                                for n in local_nodes
+                            )
+                            if not has_intervening_await:
+                                continue
+
                         self._add(
                             "CG-008", statement, node.name,
                             "Read-Modify-Write race: state is read, transformed, and written back without a lock.",
