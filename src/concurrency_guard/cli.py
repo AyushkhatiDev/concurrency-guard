@@ -22,9 +22,11 @@ from concurrency_guard.cache.manager import (
     CacheManager,
     compute_rules_hash,
 )
+from concurrency_guard.config import load_project_config
 from concurrency_guard.patcher.cst_fixer import apply_all_fixes
 from concurrency_guard.patcher.diff_utils import DiffGenerator, colorize_diff
 from concurrency_guard.reporter.github_pr import generate_github_pr_markdown
+from concurrency_guard.reporter.sarif import findings_to_sarif
 from concurrency_guard.runner.barrier_engine import (
     BarrierResult,
     DynamicBarrierResult,
@@ -60,7 +62,7 @@ def scan(
     format: str = typer.Option(
         "table",
         "--format",
-        help="Output format: 'table' or 'json'",
+        help="Output format: 'table', 'json', or 'sarif'",
     ),
     rules: Optional[Path] = typer.Option(None, "--rules", help="YAML file containing custom concurrency rules"),
     cache_path: Optional[Path] = typer.Option(
@@ -76,16 +78,18 @@ def scan(
 ) -> None:
     """Scan Python files or directories for concurrency vulnerabilities."""
     start_time = time.perf_counter()
-    py_files = discover_python_files(path)
+    config = load_project_config(path)
+    py_files = [item for item in discover_python_files(path) if not any(pattern in item.parts or str(item).endswith(pattern) for pattern in config.exclude)]
+    effective_rules = rules or (path.parent / config.rules_file if config.rules_file and path.is_file() else path / config.rules_file if config.rules_file else None)
     try:
-        custom_rules = load_yaml_rules(rules) if rules else None
+        custom_rules = load_yaml_rules(effective_rules) if effective_rules else None
     except (OSError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(str(error), param_hint="--rules") from error
 
     cache_mgr: Optional[CacheManager] = None
-    if not no_cache:
+    if not no_cache and config.cache:
         db_file = cache_path or DEFAULT_CACHE_FILE
-        rules_hash = compute_rules_hash(rules_path=rules, custom_rules=custom_rules)
+        rules_hash = compute_rules_hash(rules_path=effective_rules, custom_rules=custom_rules)
         cache_mgr = CacheManager(
             cache_db_path=db_file,
             scanner_version=__version__,
@@ -100,6 +104,7 @@ def scan(
         cache_manager=cache_mgr,
         suppression_filter=suppression_filter,
     )
+    findings = [finding for finding in findings if finding.rule_id not in config.ignore]
 
     if cache_mgr is not None and path.is_dir():
         cache_mgr.purge_stale_entries(set(py_files))
@@ -128,6 +133,13 @@ def scan(
         }
         typer.echo(json.dumps(payload, indent=2))
         raise typer.Exit(code=1 if findings else 0)
+
+    if format.lower() == "sarif":
+        typer.echo(json.dumps(findings_to_sarif(findings), indent=2))
+        raise typer.Exit(code=1 if findings else 0)
+
+    if format.lower() != "table":
+        raise typer.BadParameter("format must be one of: table, json, sarif", param_hint="--format")
 
     if findings:
         table = Table(

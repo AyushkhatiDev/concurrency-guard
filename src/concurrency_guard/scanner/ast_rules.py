@@ -515,9 +515,23 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         unlocked_sync_mutations: list[tuple[str, ast.AST]] = []
 
         def inspect_statements(
-            stmts: list[ast.stmt], in_async_lock: bool, in_sync_lock: bool
+            stmts: list[ast.stmt], in_async_lock: bool, in_sync_lock: bool, epoch: int = 0,
+            reads: Optional[dict[str, int]] = None,
         ) -> None:
+            """Visit executable statements while modelling asyncio suspension epochs.
+
+            A coroutine cannot be interleaved with another coroutine until it reaches
+            an await/async-for/async-with boundary.  Consequently a bare mutation of
+            a module collection is not itself a CG-006 race; it becomes one only
+            when its read/modify/write window crosses an epoch.
+            """
+            reads = {} if reads is None else reads
             for stmt in stmts:
+                if isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Await):
+                    epoch += 1
+                    continue
+                if isinstance(stmt, (ast.AsyncFor, ast.AsyncWith)):
+                    epoch += 1
                 if isinstance(stmt, ast.Assign):
                     for target in stmt.targets:
                         if isinstance(target, ast.Name) and isinstance(stmt.value, ast.Name):
@@ -532,22 +546,30 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
                 if isinstance(stmt, ast.AsyncWith):
                     has_lock = any(_is_lock_expr(item.context_expr) for item in stmt.items)
-                    inspect_statements(stmt.body, in_async_lock or has_lock, in_sync_lock)
+                    inspect_statements(stmt.body, in_async_lock or has_lock, in_sync_lock, epoch, dict(reads))
                 elif isinstance(stmt, ast.With):
                     has_lock = any(_is_lock_expr(item.context_expr) for item in stmt.items)
-                    inspect_statements(stmt.body, in_async_lock, in_sync_lock or has_lock)
+                    inspect_statements(stmt.body, in_async_lock, in_sync_lock or has_lock, epoch, dict(reads))
                 elif isinstance(stmt, (ast.If, ast.For, ast.AsyncFor, ast.While)):
-                    inspect_statements(stmt.body, in_async_lock, in_sync_lock)
-                    inspect_statements(stmt.orelse, in_async_lock, in_sync_lock)
+                    inspect_statements(stmt.body, in_async_lock, in_sync_lock, epoch, dict(reads))
+                    inspect_statements(stmt.orelse, in_async_lock, in_sync_lock, epoch, dict(reads))
                 elif isinstance(stmt, ast.Try):
-                    inspect_statements(stmt.body, in_async_lock, in_sync_lock)
-                    inspect_statements(stmt.orelse, in_async_lock, in_sync_lock)
-                    inspect_statements(stmt.finalbody, in_async_lock, in_sync_lock)
+                    inspect_statements(stmt.body, in_async_lock, in_sync_lock, epoch, dict(reads))
+                    inspect_statements(stmt.orelse, in_async_lock, in_sync_lock, epoch, dict(reads))
+                    inspect_statements(stmt.finalbody, in_async_lock, in_sync_lock, epoch, dict(reads))
                     for handler in stmt.handlers:
-                        inspect_statements(handler.body, in_async_lock, in_sync_lock)
+                        inspect_statements(handler.body, in_async_lock, in_sync_lock, epoch, dict(reads))
                 elif isinstance(stmt, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     continue
                 else:
+                    read_expression: Optional[ast.AST] = None
+                    if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+                        read_expression = stmt.value
+                    for child in ast.walk(read_expression) if read_expression is not None else ():
+                        if isinstance(child, ast.Subscript):
+                            root = _target_root_name(child)
+                            if root in self.shared_names or self.resolve_alias(root) in self.shared_names:
+                                reads.setdefault(root, epoch)
                     if (
                         isinstance(stmt, ast.Assign)
                         and all(isinstance(t, ast.Name) for t in stmt.targets)
@@ -559,10 +581,18 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         root = m.split("[")[0].split(".")[0]
                         resolved = self.resolve_alias(root)
                         if root in self.shared_names or resolved in self.shared_names:
-                            if not in_async_lock:
+                            # A direct subscription read in an earlier epoch is a
+                            # real cooperative RMW window.  Synchronous updates in
+                            # one epoch are atomic with respect to asyncio tasks.
+                            source_epoch = reads.get(root, reads.get(resolved))
+                            # A blind write remains a potentially conflicting
+                            # publication; a read/modify/write sequence is only
+                            # unsafe when its read predates a suspension.
+                            if not in_async_lock and (source_epoch is None or source_epoch < epoch):
                                 unlocked_async_mutations.append((m, stmt))
                             if not in_sync_lock:
                                 unlocked_sync_mutations.append((m, stmt))
+
 
         inspect_statements(node.body, in_async_lock=False, in_sync_lock=False)
 
