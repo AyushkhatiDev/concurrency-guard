@@ -46,7 +46,7 @@ class ASTFinding:
 class _DjangoObjectFlow:
     """Provenance for one statically resolved Django model reference."""
 
-    fetch: ast.Call
+    fetch: ast.AST
     row_locked: bool
     atomic_scopes: frozenset[int]
     mutated: bool = False
@@ -370,19 +370,25 @@ def _has_idempotency_or_lock(local_nodes: list[ast.AST], docstring: Optional[str
     return False
 
 
-def _django_manager_call(call: ast.Call) -> tuple[bool, bool]:
+def _django_manager_call(call: ast.AST) -> tuple[bool, bool]:
     """Return whether a call fetches a Django model and has a row lock.
 
     The supported forms are ``Model.objects.get(...)`` and
     ``Model.objects.filter(...).first()``, with optional ``select_for_update()``.
     """
+    if isinstance(call, ast.Await) and isinstance(call.value, ast.Call):
+        call = call.value
+    if not isinstance(call, ast.Call):
+        return False, False
     if not isinstance(call.func, ast.Attribute):
         return False, False
     method = call.func.attr
-    if method not in {"get", "first", "last"}:
+    if method not in {"get", "first", "last", "aget", "afirst", "alast"}:
         return False, False
     manager_name = _expr_name(call.func.value)
-    is_django_manager = ".objects" in manager_name or manager_name == "objects"
+    chain = manager_name.split(".")
+    is_model_chain = bool(chain and chain[0][:1].isupper() and len(chain) >= 2)
+    is_django_manager = ".objects" in manager_name or manager_name == "objects" or is_model_chain
     has_row_lock = any(
         isinstance(child, ast.Attribute) and child.attr == "select_for_update"
         for child in ast.walk(call)
@@ -877,7 +883,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             if isinstance(statement, ast.Assign):
                 target_names = [t.id for t in statement.targets if isinstance(t, ast.Name)]
                 if target_names:
-                    if isinstance(statement.value, ast.Call):
+                    if isinstance(statement.value, (ast.Call, ast.Await)):
                         is_fetch, has_lock = _django_manager_call(statement.value)
                         for target in target_names:
                             if is_fetch:
@@ -906,7 +912,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                             self.remove_alias(target)
             elif isinstance(statement, ast.AnnAssign) and isinstance(statement.target, ast.Name):
                 target = statement.target.id
-                if isinstance(statement.value, ast.Call):
+                if isinstance(statement.value, (ast.Call, ast.Await)):
                     is_fetch, has_lock = _django_manager_call(statement.value)
                     if is_fetch:
                         flows[target] = _DjangoObjectFlow(
@@ -957,7 +963,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         return True
 
             for call in calls(statement):
-                if not isinstance(call.func, ast.Attribute) or call.func.attr != "save":
+                if not isinstance(call.func, ast.Attribute) or call.func.attr not in {"save", "asave"}:
                     continue
                 root = _target_root_name(call.func.value)
                 resolved_root = self.resolve_alias(root)
@@ -1010,31 +1016,33 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """Inspect sync function definitions for rule CG-005."""
-        self.aliases.clear()
-        self.context_stack.clear()
-        local_nodes = list(_walk_local_nodes(node))
-        self._check_cg_005(node, local_nodes)
-        self._check_cg_016(node, local_nodes)
-        self._check_standard_library_rules(node, local_nodes)
-        self.generic_visit(node)
-        self.aliases.clear()
-        self.context_stack.clear()
+        saved_aliases, saved_context = self.aliases, self.context_stack
+        self.aliases, self.context_stack = {}, []
+        try:
+            local_nodes = list(_walk_local_nodes(node))
+            self._check_cg_005(node, local_nodes)
+            self._check_cg_016(node, local_nodes)
+            self._check_standard_library_rules(node, local_nodes)
+            self.generic_visit(node)
+        finally:
+            self.aliases, self.context_stack = saved_aliases, saved_context
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         """Inspect async function definitions for rules CG-001, CG-002, CG-003, CG-004, and CG-005."""
-        self.aliases.clear()
-        self.context_stack.clear()
-        local_nodes = list(_walk_local_nodes(node))
-        self._check_cg_001(node, local_nodes)
-        self._check_cg_002(node, local_nodes)
-        self._check_cg_003(node)
-        self._check_cg_004(node, local_nodes)
-        self._check_cg_005(node, local_nodes)
-        self._check_cg_016(node, local_nodes)
-        self._check_standard_library_rules(node, local_nodes)
-        self.generic_visit(node)
-        self.aliases.clear()
-        self.context_stack.clear()
+        saved_aliases, saved_context = self.aliases, self.context_stack
+        self.aliases, self.context_stack = {}, []
+        try:
+            local_nodes = list(_walk_local_nodes(node))
+            self._check_cg_001(node, local_nodes)
+            self._check_cg_002(node, local_nodes)
+            self._check_cg_003(node)
+            self._check_cg_004(node, local_nodes)
+            self._check_cg_005(node, local_nodes)
+            self._check_cg_016(node, local_nodes)
+            self._check_standard_library_rules(node, local_nodes)
+            self.generic_visit(node)
+        finally:
+            self.aliases, self.context_stack = saved_aliases, saved_context
 
 
 def _custom_rule_findings(tree: ast.AST, filename: str, rules: list[dict[str, Any]]) -> list[ASTFinding]:
