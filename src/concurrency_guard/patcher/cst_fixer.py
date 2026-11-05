@@ -228,6 +228,31 @@ def _ensure_module_import(tree: cst.Module, module_name: str) -> cst.Module:
     return tree.with_changes(body=tuple(body))
 
 
+def _ensure_module_lock(tree: cst.Module, asynchronous: bool) -> cst.Module:
+    """Allocate one generated lock at module scope, never once per call."""
+    name = "_cguard_async_lock" if asynchronous else "_cguard_thread_lock"
+    for statement in tree.body:
+        if not isinstance(statement, cst.SimpleStatementLine):
+            continue
+        for child in statement.body:
+            if isinstance(child, cst.Assign) and any(
+                isinstance(target.target, cst.Name) and target.target.value == name for target in child.targets
+            ):
+                return tree
+    constructor = "asyncio.Lock()" if asynchronous else "threading.Lock()"
+    body: list[Union[cst.SimpleStatementLine, cst.BaseCompoundStatement]] = list(tree.body)
+    index = 0
+    for position, statement in enumerate(body):
+        code = cst.Module([]).code_for_node(statement).lstrip()
+        if position == 0 and code.startswith(("\"\"\"", "'''")):
+            index = position + 1
+        if code.startswith(("import ", "from ")):
+            index = position + 1
+    legacy_note = "# Shared module lock (replaces with threading.Lock(): per-call allocation)\n" if not asynchronous else ""
+    body.insert(index, cst.parse_statement(f"{legacy_note}{name} = {constructor}\n"))
+    return tree.with_changes(body=tuple(body))
+
+
 def _is_shared_mutation(statement: cst.SimpleStatementLine) -> bool:
     """Recognize assignments and built-in mutator calls suitable for lock wrapping."""
     for child in statement.body:
@@ -281,7 +306,7 @@ class SharedStateLockTransformer(cst.CSTTransformer):
     ) -> cst.BaseStatement:
         if not self._active or self._lock_depth or not _is_shared_mutation(original_node):
             return updated_node
-        prefix = "async with asyncio.Lock():" if self.asynchronous else "with threading.Lock():"
+        prefix = "async with _cguard_async_lock:" if self.asynchronous else "with _cguard_thread_lock:"
         wrapper = cst.parse_statement(f"{prefix}\n    pass\n")
         assert isinstance(wrapper, cst.With)
         return wrapper.with_changes(body=cst.IndentedBlock(body=(updated_node,)))
@@ -600,7 +625,8 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
             tree = cst.parse_module(current_code).visit(
                 SharedStateLockTransformer(targets, asynchronous=True)
             )
-            current_code = _ensure_module_import(tree, "asyncio").code
+            tree = _ensure_module_import(tree, "asyncio")
+            current_code = _ensure_module_lock(tree, asynchronous=True).code
 
     # 5. CG-007: protect threaded shared-state mutations.
     if "CG-007" in selected_rules:
@@ -610,7 +636,8 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
             tree = cst.parse_module(current_code).visit(
                 SharedStateLockTransformer(targets, asynchronous=False)
             )
-            current_code = _ensure_module_import(tree, "threading").code
+            tree = _ensure_module_import(tree, "threading")
+            current_code = _ensure_module_lock(tree, asynchronous=False).code
 
     # 6. CG-009 is concurrent file overwrite. CG-008 is accepted for callers
     # that used the pre-release file-rule identifier.

@@ -1,6 +1,6 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v2.3.0
+# ConcurrencyGuard (`cguard`) — v2.4.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
@@ -22,6 +22,30 @@
 Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **Celery**, **Redis / Memcached**, `asyncio`, and multi-threaded architectures.
 
 </div>
+
+## v2.4 configuration and CI output
+
+`cguard` recognises cooperative asyncio scheduling: a synchronous in-memory
+read/modify/write sequence does not produce a CG-006 finding unless its window
+crosses an `await`, `async for`, or `async with` suspension boundary. Its
+project call graph also resolves `self.method()` and typed service calls.
+
+Configure repository defaults in `pyproject.toml`; command-line options still
+take precedence where applicable:
+
+```toml
+[tool.cguard]
+exclude = ["generated", "vendor"]
+ignore = ["CG-003"]
+rules_file = "cguard-rules.yml"
+cache = true
+```
+
+For GitHub's Security tab or other code-scanning systems, emit SARIF 2.1.0:
+
+```bash
+cguard scan src --format sarif > cguard.sarif
+```
 
 ---
 

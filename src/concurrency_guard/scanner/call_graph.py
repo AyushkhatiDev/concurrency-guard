@@ -137,6 +137,7 @@ def build_call_graph(files: list[Path], roots: Optional[list[Path]] = None) -> C
 
     graph = CallGraph()
     aliases_by_module: dict[str, dict[str, str]] = {}
+    # Index module functions and class methods under stable Class.method names.
     for path, module, tree in parsed:
         aliases_by_module[module] = _module_aliases(tree, module)
         for node in tree.body:
@@ -145,16 +146,39 @@ def build_call_graph(files: list[Path], roots: Optional[list[Path]] = None) -> C
                 graph.functions[qualified] = FunctionNode(qualified, str(path), node.lineno, node.name, isinstance(node, ast.AsyncFunctionDef))
                 if _mutates_shared(node, _shared_names(tree)):
                     graph.shared_mutations.add(qualified)
+            elif isinstance(node, ast.ClassDef):
+                for method in node.body:
+                    if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        qualified = f"{module}.{node.name}.{method.name}".strip(".")
+                        graph.functions[qualified] = FunctionNode(qualified, str(path), method.lineno, method.name, isinstance(method, ast.AsyncFunctionDef))
+                        if _mutates_shared(method, _shared_names(tree)):
+                            graph.shared_mutations.add(qualified)
 
     for _, module, tree in parsed:
         aliases = aliases_by_module[module]
-        for function in (node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))):
-            source = f"{module}.{function.name}".strip(".")
+        functions: list[tuple[Union[ast.FunctionDef, ast.AsyncFunctionDef], str, dict[str, str]]] = []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                functions.append((node, f"{module}.{node.name}".strip("."), {}))
+            elif isinstance(node, ast.ClassDef):
+                for method in node.body:
+                    if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        annotations: dict[str, str] = {}
+                        for arg in method.args.args + method.args.kwonlyargs:
+                            if arg.annotation is not None:
+                                annotations[arg.arg] = _dotted_name(arg.annotation).split(".")[-1]
+                        functions.append((method, f"{module}.{node.name}.{method.name}".strip("."), annotations))
+        for function, source, annotations in functions:
             for call in (node for node in ast.walk(function) if isinstance(node, ast.Call)):
                 name = _dotted_name(call.func)
                 first, _, suffix = name.partition(".")
                 resolved = f"{aliases[first]}.{suffix}" if first in aliases and suffix else aliases.get(first, name)
-                candidates = (resolved, f"{module}.{name}".strip("."))
+                owner = source.rsplit(".", 1)[0]
+                candidates: tuple[str, ...] = (resolved, f"{module}.{name}".strip("."))
+                if first in {"self", "cls"} and suffix:
+                    candidates += (f"{owner}.{suffix}",)
+                if first in annotations and suffix:
+                    candidates += (f"{module}.{annotations[first]}.{suffix}",)
                 for candidate in candidates:
                     if candidate in graph.functions:
                         graph.edges[source].add(candidate)
