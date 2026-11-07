@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v2.4.0
+# ConcurrencyGuard (`cguard`) — v2.5.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-104%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-147%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![GitHub](https://img.shields.io/badge/GitHub-AyushkhatiDev%2Fconcurrency--guard-181717?logo=github)](https://github.com/AyushkhatiDev/concurrency-guard)
@@ -19,16 +19,23 @@
 <br/>
 
 **Deterministic AST static analysis, inter-procedural taint propagation, microsecond barrier verification, and compiler-grade LibCST code repair for Python backends.**  
-Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **Celery**, **Redis / Memcached**, `asyncio`, and multi-threaded architectures.
+Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **Celery**, **Redis / Memcached**, `asyncio.TaskGroup`, `anyio`, and multi-threaded architectures.
 
 </div>
 
-## v2.4 configuration and CI output
+## 🚀 What's New in v2.5.0
 
-`cguard` recognises cooperative asyncio scheduling: a synchronous in-memory
-read/modify/write sequence does not produce a CG-006 finding unless its window
-crosses an `await`, `async for`, or `async with` suspension boundary. Its
-project call graph also resolves `self.method()` and typed service calls.
+`cguard` v2.5.0 introduces enterprise-grade static analysis capabilities for modern asynchronous systems:
+
+1. **Structured Concurrency Detection:** Deep AST awareness of `asyncio.TaskGroup` (`tg.create_task(...)`), `anyio.create_task_group()` (`tg.start_soon(...)`), FastAPI `BackgroundTasks.add_task(...)`, and `loop.create_task(...)`.
+2. **Compiler-Grade Deadlock Analysis (`CG-013`):**
+   - **Intra-Function Self-Deadlocks:** Detects non-reentrant locks re-acquired within the same execution path.
+   - **Inter-Procedural Self-Deadlocks:** Cross-function static call graph analysis catching parent functions that invoke children acquiring the same held non-reentrant lock.
+   - **Async Coroutine Sync-Lock Hazards:** Detects synchronous `threading.Lock` acquired via `with` inside `async def` routines—flagging event-loop thread blocking and deterministic deadlocks across `await` suspension points.
+   - **Smart `threading.RLock` Suppression:** Automatic detection of reentrant lock semantics to eliminate false positives.
+3. **SQLAlchemy 2.0 Fluent Chains & LibCST Precision:** Full support for `select(...).where(...).with_for_update()` fluent chains with precision AST transformer targeting inner `select(...)` calls inside `session.execute(...)` and `session.scalar(...)`.
+4. **Git-Diff Aware Incremental Scanning:** `--changed-only` and `--base-ref` CLI flags for ultra-fast local workflows and PR checks.
+5. **Native Pre-Commit Hooks:** Seamless `.pre-commit-hooks.yaml` integration for CI and local git hooks.
 
 Configure repository defaults in `pyproject.toml`; command-line options still
 take precedence where applicable:
@@ -298,8 +305,14 @@ cguard scan src/
 # Run ultra-fast incremental scanning using SQLite caching
 cguard scan src/ --cache
 
+# Scan ONLY files modified in git (staged, unstaged, or untracked)
+cguard scan src/ --changed-only
+
+# Compare against a git base branch (e.g. in CI or PR checks)
+cguard scan src/ --base-ref origin/main
+
 # Specify a custom cache database path
-cguard scan src/ --cache --cache-db /tmp/custom_cguard_cache.db
+cguard scan src/ --cache --cache-path .concurrency_guard_cache.db
 
 # Output structured JSON for automated security dashboards or CI/CD
 cguard scan src/ --format json
@@ -513,6 +526,26 @@ jobs:
         if: failure()
         run: cguard report src/ >> $GITHUB_STEP_SUMMARY
 ```
+
+---
+
+## 🪝 Native Pre-Commit Hooks
+
+`concurrency-guard` natively integrates with [pre-commit](https://pre-commit.com/) to block concurrency regressions before they reach your repository.
+
+Add this to your `.pre-commit-config.yaml`:
+
+```yaml
+repos:
+  - repo: https://github.com/AyushkhatiDev/concurrency-guard
+    rev: v2.5.0
+    hooks:
+      - id: cguard-scan
+      - id: cguard-fix-diff
+```
+
+- **`cguard-scan`**: Scans staged Python files for concurrency vulnerabilities.
+- **`cguard-fix-diff`**: Previews suggested LibCST diffs in memory without modifying files on disk.
 
 ---
 

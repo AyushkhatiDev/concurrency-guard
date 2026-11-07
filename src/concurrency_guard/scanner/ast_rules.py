@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import os
+from collections import defaultdict
 from collections.abc import Iterator
 from dataclasses import dataclass
 from pathlib import Path
@@ -146,15 +147,36 @@ def _is_concurrency_api(node: ast.AST) -> bool:
             "processpoolexecutor",
             "asyncio.create_task",
             "asyncio.gather",
+            "asyncio.taskgroup",
+            "taskgroup",
             "multiprocessing.process",
+            "backgroundtasks",
+            "create_task_group",
         )
     ):
         return True
     parts = name.split(".")
     base = parts[-1]
-    if base in {"thread", "create_task", "gather"}:
+    if base in {"thread", "create_task", "gather", "add_task", "start_soon"}:
         return True
-    return bool(len(parts) > 1 and parts[-2] in {"threading", "multiprocessing", "asyncio"})
+    return bool(len(parts) > 1 and parts[-2] in {"threading", "multiprocessing", "asyncio", "anyio"})
+
+
+def _extract_callable_name(node: ast.AST) -> Optional[str]:
+    """Extract callable target name from Name, Attribute, or Call node."""
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        return node.attr
+    if isinstance(node, ast.Call):
+        return _extract_callable_name(node.func)
+    return None
+
+
+def _is_reentrant_lock(name: str) -> bool:
+    """Check if lock expression name indicates a reentrant lock (e.g. RLock)."""
+    low = name.lower()
+    return "rlock" in low or "reentrant" in low
 
 
 def _is_file_write(call: ast.Call) -> bool:
@@ -218,14 +240,18 @@ def _is_db_or_session(val: ast.AST) -> bool:
 
 
 def _is_query_call(node: ast.AST) -> bool:
-    """Check if node is a select(...) call or SQLAlchemy 2.0 scalar/scalars/get query."""
+    """Check if node is a select(...) call or SQLAlchemy query."""
     if _is_select_call(node):
         return True
+    if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
+        return False
+    if node.func.attr in ("scalar", "scalars", "get", "all", "first", "one", "one_or_none"):
+        return _is_db_or_session(node.func.value)
     return bool(
-        isinstance(node, ast.Call)
-        and isinstance(node.func, ast.Attribute)
-        and node.func.attr in ("scalar", "scalars", "get")
+        node.func.attr == "execute"
         and _is_db_or_session(node.func.value)
+        and node.args
+        and any(_is_select_call(arg) or any(_is_select_call(c) for c in ast.walk(arg)) for arg in node.args)
     )
 
 
@@ -447,6 +473,13 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         self.lock_orders: list[tuple[str, str, int, str]] = []
         self.aliases: dict[str, str] = {}
         self.context_stack: list[Union[ast.With, ast.AsyncWith]] = []
+        self.reentrant_locks: set[str] = set()
+        self.function_locks: dict[str, set[str]] = defaultdict(set)
+        self.calls_under_lock: list[tuple[str, str, str, int]] = []
+
+    def _is_reentrant(self, name: str) -> bool:
+        low = name.lower()
+        return "rlock" in low or "reentrant" in low or name in self.reentrant_locks or name.split(".")[-1] in self.reentrant_locks
 
     def resolve_alias(self, name: str) -> str:
         """Resolve an alias to its source name through the alias chain."""
@@ -494,8 +527,13 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         self.context_stack.pop()
 
     def visit_Assign(self, node: ast.Assign) -> None:
-        """Track variable assignments and aliases."""
+        """Track variable assignments, aliases, and reentrant locks."""
         for target in node.targets:
+            val_name = _expr_name(node.value).lower()
+            if "rlock" in val_name or "reentrant" in val_name:
+                tname = _expr_name(target)
+                if tname:
+                    self.reentrant_locks.add(tname)
             if isinstance(target, ast.Name):
                 if isinstance(node.value, ast.Name):
                     self.set_alias(target.id, node.value.id)
@@ -515,7 +553,13 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
     def visit_AnnAssign(self, node: ast.AnnAssign) -> None:
-        """Track annotated variable assignments and aliases."""
+        """Track annotated variable assignments, aliases, and reentrant locks."""
+        if node.value is not None:
+            val_name = _expr_name(node.value).lower()
+            if "rlock" in val_name or "reentrant" in val_name:
+                tname = _expr_name(node.target)
+                if tname:
+                    self.reentrant_locks.add(tname)
         if isinstance(node.target, ast.Name):
             if isinstance(node.value, ast.Name):
                 self.set_alias(node.target.id, node.value.id)
@@ -534,24 +578,19 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         for call in (n for n in ast.walk(node) if isinstance(n, ast.Call) and _is_concurrency_api(n.func)):
             for keyword in call.keywords:
                 if keyword.arg in {"target", "fn", "func"}:
-                    if isinstance(keyword.value, ast.Name):
-                        self.thread_targets.add(keyword.value.id)
-                    elif isinstance(keyword.value, ast.Attribute):
-                        self.thread_targets.add(keyword.value.attr)
+                    target = _extract_callable_name(keyword.value)
+                    if target:
+                        self.thread_targets.add(target)
             func_name = _expr_name(call.func).lower()
-            if any(func_name.endswith(method) for method in (".submit", ".apply_async", ".apply", "create_task")) or func_name in {"submit", "apply_async", "apply", "create_task"}:
+            if any(func_name.endswith(method) for method in (".submit", ".apply_async", ".apply", "create_task", "add_task", "start_soon")) or func_name in {"submit", "apply_async", "apply", "create_task", "add_task", "start_soon"}:
                 if call.args:
-                    first_arg = call.args[0]
-                    if isinstance(first_arg, ast.Name):
-                        self.thread_targets.add(first_arg.id)
-                    elif isinstance(first_arg, ast.Attribute):
-                        self.thread_targets.add(first_arg.attr)
+                    target = _extract_callable_name(call.args[0])
+                    if target:
+                        self.thread_targets.add(target)
             elif "thread" in func_name and len(call.args) >= 2:
-                target_arg = call.args[1]
-                if isinstance(target_arg, ast.Name):
-                    self.thread_targets.add(target_arg.id)
-                elif isinstance(target_arg, ast.Attribute):
-                    self.thread_targets.add(target_arg.attr)
+                target = _extract_callable_name(call.args[1])
+                if target:
+                    self.thread_targets.add(target)
         self.generic_visit(node)
 
     def _add(self, rule_id: str, node: ast.AST, function: str, message: str, hint: str) -> None:
@@ -731,11 +770,42 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
         for with_node in (n for n in ast.walk(node) if isinstance(n, (ast.With, ast.AsyncWith))):
             outer = [_expr_name(item.context_expr) for item in with_node.items if _is_lock_expr(item.context_expr)]
+            for lname in outer:
+                if lname:
+                    self.function_locks[node.name].add(lname)
+            for call_child in (n for n in ast.walk(with_node) if isinstance(n, ast.Call)):
+                callee_expr = _expr_name(call_child.func)
+                callee_base = callee_expr.split(".")[-1]
+                for olock in outer:
+                    if olock:
+                        self.calls_under_lock.append((node.name, olock, callee_base, with_node.lineno))
+                        if callee_expr != callee_base:
+                            self.calls_under_lock.append((node.name, olock, callee_expr, with_node.lineno))
+
+            if len(outer) > 1:
+                seen_locks: set[str] = set()
+                for l in outer:
+                    if l in seen_locks and not self._is_reentrant(l):
+                        self._add(
+                            "CG-013", with_node, node.name,
+                            f"Non-reentrant self-deadlock: lock '{l}' is acquired multiple times in the same statement.",
+                            f"Use threading.RLock or remove duplicate acquisition of '{l}'.",
+                        )
+                    seen_locks.add(l)
+
             for nested in (n for n in ast.walk(with_node) if n is not with_node and isinstance(n, (ast.With, ast.AsyncWith))):
                 inner = [_expr_name(item.context_expr) for item in nested.items if _is_lock_expr(item.context_expr)]
                 for first in outer:
                     for second in inner:
-                        self.lock_orders.append((first, second, with_node.lineno, node.name))
+                        if first == second:
+                            if not self._is_reentrant(first):
+                                self._add(
+                                    "CG-013", nested, node.name,
+                                    f"Non-reentrant self-deadlock: lock '{first}' is acquired while already held.",
+                                    f"Use threading.RLock instead of non-reentrant locks, or avoid re-acquiring '{first}'.",
+                                )
+                        else:
+                            self.lock_orders.append((first, second, with_node.lineno, node.name))
 
     def _check_deadlocks(self) -> None:
         reported: set[tuple[str, str]] = set()
@@ -745,6 +815,34 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 if first == reverse_second and second == reverse_first and first != second and pair not in reported:
                     reported.add(pair)
                     self.findings.append(ASTFinding("CG-013", self.filename, line, function, f"Potential deterministic deadlock: locks '{first}' and '{second}' are acquired in reverse order.", "Adopt one global lock ordering, or replace nested locks with a single higher-level lock."))
+
+        # Inter-procedural non-reentrant self-deadlock
+        inter_reported: set[tuple[str, str, str]] = set()
+        for caller, lock, callee, lineno in self.calls_under_lock:
+            callee_locks = self.function_locks.get(callee, set())
+            if not callee_locks:
+                base = callee.split(".")[-1]
+                callee_locks = self.function_locks.get(base, set())
+            if lock in callee_locks and not self._is_reentrant(lock):
+                key = (caller, callee, lock)
+                if key not in inter_reported:
+                    inter_reported.add(key)
+                    self.findings.append(
+                        ASTFinding(
+                            rule_id="CG-013",
+                            filename=self.filename,
+                            lineno=lineno,
+                            function_name=caller,
+                            message=(
+                                f"Potential inter-procedural self-deadlock: '{caller}' acquires non-reentrant lock "
+                                f"'{lock}' and calls '{callee}', which re-acquires the same lock."
+                            ),
+                            suggested_fix_hint=(
+                                f"Use threading.RLock instead of non-reentrant lock '{lock}', "
+                                f"or refactor '{callee}' to accept an already-locked context."
+                            ),
+                        )
+                    )
 
     def _check_cg_001(self, node: ast.AsyncFunctionDef, local_nodes: list[ast.AST]) -> None:
         """Rule CG-001: Unlocked Read-Modify-Write Race Condition."""
@@ -1096,7 +1194,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             self.aliases, self.context_stack = saved_aliases, saved_context
 
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
-        """Inspect async function definitions for rules CG-001, CG-002, CG-003, CG-004, and CG-005."""
+        """Inspect async function definitions for rules CG-001, CG-002, CG-003, CG-004, CG-005, and CG-013."""
         saved_aliases, saved_context = self.aliases, self.context_stack
         self.aliases, self.context_stack = {}, []
         try:
@@ -1108,6 +1206,51 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             self._check_cg_005(node, local_nodes)
             self._check_cg_016(node, local_nodes)
             self._check_standard_library_rules(node, local_nodes)
+
+            # Check for synchronous locks acquired inside async coroutine
+            for with_node in (n for n in local_nodes if isinstance(n, ast.With)):
+                for item in with_node.items:
+                    if _is_lock_expr(item.context_expr):
+                        lock_name = _expr_name(item.context_expr) or "lock"
+                        has_await_inside = any(
+                            isinstance(child, (ast.Await, ast.AsyncFor, ast.AsyncWith))
+                            for child in ast.walk(with_node)
+                        )
+                        if has_await_inside:
+                            self.findings.append(
+                                ASTFinding(
+                                    rule_id="CG-013",
+                                    filename=self.filename,
+                                    lineno=with_node.lineno,
+                                    function_name=node.name,
+                                    message=(
+                                        f"Potential event loop deadlock: synchronous lock '{lock_name}' "
+                                        f"held across 'await' boundary in coroutine '{node.name}'."
+                                    ),
+                                    suggested_fix_hint=(
+                                        f"Replace synchronous lock '{lock_name}' with 'async with asyncio.Lock()' "
+                                        "to prevent deadlocking other coroutines waiting for the event loop."
+                                    ),
+                                )
+                            )
+                        else:
+                            self.findings.append(
+                                ASTFinding(
+                                    rule_id="CG-013",
+                                    filename=self.filename,
+                                    lineno=with_node.lineno,
+                                    function_name=node.name,
+                                    message=(
+                                        f"Blocking synchronization in async coroutine: synchronous lock '{lock_name}' "
+                                        f"acquired via 'with' inside coroutine '{node.name}'."
+                                    ),
+                                    suggested_fix_hint=(
+                                        "Use 'async with asyncio.Lock()' instead of synchronous threading.Lock "
+                                        "to avoid blocking the event loop thread."
+                                    ),
+                                )
+                            )
+
             self.generic_visit(node)
         finally:
             self.aliases, self.context_stack = saved_aliases, saved_context
@@ -1331,5 +1474,4 @@ def scan_project(
             else:
                 active_filter.suppressed_count += 1
 
-    return list(dict.fromkeys(findings))
     return list(dict.fromkeys(findings))
