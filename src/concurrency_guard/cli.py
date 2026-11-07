@@ -41,6 +41,7 @@ from concurrency_guard.scanner.ast_rules import (
     scan_project,
     scan_source_code,
 )
+from concurrency_guard.scanner.git_filter import get_changed_python_files
 from concurrency_guard.scanner.suppression import SuppressionFilter
 
 app = typer.Typer(no_args_is_help=True, help="Deterministic Concurrency & Idempotency Verifier")
@@ -71,6 +72,16 @@ def scan(
         help="Path to SQLite cache database (defaults to .concurrency_guard_cache.db)",
     ),
     cache: bool = typer.Option(True, "--cache/--no-cache", help="Enable or bypass incremental cache reads and writes."),
+    changed_only: bool = typer.Option(
+        False,
+        "--changed-only",
+        help="Only scan files modified in git (staged, unstaged, or untracked).",
+    ),
+    base_ref: Optional[str] = typer.Option(
+        None,
+        "--base-ref",
+        help="Git base reference (e.g. origin/main, HEAD~1) to compare against for changed files.",
+    ),
 ) -> None:
     """Scan Python files or directories for concurrency vulnerabilities."""
     start_time = time.perf_counter()
@@ -81,6 +92,11 @@ def scan(
         custom_rules = load_yaml_rules(effective_rules) if effective_rules else None
     except (OSError, ValueError, RuntimeError) as error:
         raise typer.BadParameter(str(error), param_hint="--rules") from error
+
+    changed_files: Optional[set[Path]] = None
+    if changed_only or base_ref:
+        repo_dir = path if path.is_dir() else path.parent
+        changed_files = get_changed_python_files(repo_dir, base_ref=base_ref)
 
     cache_mgr: Optional[CacheManager] = None
     if cache and config.cache:
@@ -101,6 +117,10 @@ def scan(
         suppression_filter=suppression_filter,
     )
     findings = [finding for finding in findings if finding.rule_id not in config.ignore]
+
+    if changed_files is not None:
+        findings = [f for f in findings if Path(f.filename).resolve() in changed_files]
+        py_files = [p for p in py_files if p.resolve() in changed_files]
 
     if cache_mgr is not None and path.is_dir():
         cache_mgr.purge_stale_entries(set(py_files))
@@ -327,8 +347,24 @@ def fix(
         "--diff",
         help="Print unified diff of changes without modifying files on disk",
     ),
+    changed_only: bool = typer.Option(
+        False,
+        "--changed-only",
+        help="Only patch the file if it has git changes.",
+    ),
+    base_ref: Optional[str] = typer.Option(
+        None,
+        "--base-ref",
+        help="Git base reference (e.g. origin/main, main) to check for changes.",
+    ),
 ) -> None:
     """Auto-patch concurrency race conditions and idempotency bugs using LibCST."""
+    if changed_only or base_ref:
+        changed_files = get_changed_python_files(file_path.parent, base_ref=base_ref)
+        if file_path.resolve() not in changed_files:
+            console.print(f"[dim]Skipping {file_path}: not changed in git.[/dim]")
+            raise typer.Exit(code=0)
+
     source_code = file_path.read_text(encoding="utf-8")
     initial_findings = scan_file(file_path)
 

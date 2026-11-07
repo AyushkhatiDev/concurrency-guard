@@ -121,6 +121,21 @@ def _is_select_chain(node: cst.CSTNode) -> bool:
     return False
 
 
+def _chain_has_with_for_update(node: cst.CSTNode) -> bool:
+    """Check if with_for_update is called anywhere in the call chain."""
+    curr: Optional[cst.CSTNode] = node
+    while curr is not None:
+        if isinstance(curr, cst.Call):
+            if isinstance(curr.func, cst.Attribute) and curr.func.attr.value == "with_for_update":
+                return True
+            curr = curr.func
+        elif isinstance(curr, cst.Attribute):
+            curr = curr.value
+        else:
+            break
+    return False
+
+
 def _get_module_name(node: Optional[cst.CSTNode]) -> str:
     """Extract dotted module or variable name from CST node."""
     if node is None:
@@ -393,11 +408,8 @@ class WithForUpdateTransformer(cst.CSTTransformer):
         if isinstance(parent, cst.Attribute) and parent.value is original_node:
             return updated_node
 
-        # Do not append if already ending with with_for_update
-        if (
-            isinstance(original_node.func, cst.Attribute)
-            and original_node.func.attr.value == "with_for_update"
-        ):
+        # Do not append if already contains with_for_update anywhere in chain
+        if _chain_has_with_for_update(original_node):
             return updated_node
 
         # Append .with_for_update()

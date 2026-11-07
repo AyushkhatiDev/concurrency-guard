@@ -1,0 +1,10 @@
+- id: cguard-scan
+  name: ConcurrencyGuard Static Analysis
+  entry: cguard scan
+  language: python
+  types: [python]
+- id: cguard-fix-diff
+  name: ConcurrencyGuard Patch Review
+  entry: cguard fix --diff
+  language: python
+  types: [python]

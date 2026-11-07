@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "concurrency-guard"
-version = "2.4.1"
+version = "2.5.0"
 description = "Universal static concurrency analysis, semantic taint tracking, and runtime verification for Python"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -40,11 +40,23 @@ cguard = "concurrency_guard.cli:app"
 [tool.hatch.build.targets.wheel]
 packages = ["src/concurrency_guard"]
 
-[tool.hatch.build]
+[tool.hatch.build.targets.sdist]
+include = [
+    "/src/concurrency_guard",
+    "/tests",
+    "/README.md",
+    "/LICENSE",
+    "/pyproject.toml",
+    "/action.yml",
+    "/.pre-commit-hooks.yaml",
+]
 exclude = [
+    "/demo.gif",
+    "/website",
+    "/.concurrency_guard_cache.db*",
     "/dist",
-    "/website/.next",
-    "/website/node_modules",
+    "/.venv",
+    "/examples",
 ]
 
 [tool.mypy]

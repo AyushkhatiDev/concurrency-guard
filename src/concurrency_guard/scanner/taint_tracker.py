@@ -70,7 +70,11 @@ def _is_concurrent(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> bool:
         rendered = ast.unparse(decorator).lower()
         if any(token in rendered for token in (".post", ".put", ".patch", ".delete", ".task", "shared_task")):
             return True
-    return any(isinstance(call, ast.Call) and ast.unparse(call.func) in {"threading.Thread", "asyncio.create_task", "asyncio.gather"} for call in ast.walk(node))
+    return any(
+        isinstance(call, ast.Call)
+        and any(token in ast.unparse(call.func).lower() for token in ("thread", "create_task", "gather", "taskgroup", "add_task", "start_soon"))
+        for call in ast.walk(node)
+    )
 
 
 def _module_sources(tree: ast.Module) -> set[str]:
