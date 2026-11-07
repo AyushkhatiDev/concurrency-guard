@@ -8,3 +8,4 @@
   entry: cguard fix --diff
   language: python
   types: [python]
+

@@ -10,6 +10,7 @@
 [![Test Suite](https://img.shields.io/badge/tests-147%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
 [![GitHub](https://img.shields.io/badge/GitHub-AyushkhatiDev%2Fconcurrency--guard-181717?logo=github)](https://github.com/AyushkhatiDev/concurrency-guard)
 
 <br/>
@@ -20,6 +21,8 @@
 
 **Deterministic AST static analysis, inter-procedural taint propagation, microsecond barrier verification, and compiler-grade LibCST code repair for Python backends.**  
 Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **Celery**, **Redis / Memcached**, `asyncio.TaskGroup`, `anyio`, and multi-threaded architectures.
+
+Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
 
@@ -120,9 +123,46 @@ def withdraw(user_id: int, amount: float):
 
 ---
 
+## 🌐 Interactive Web Sandbox & Race Explorer ([concurrencyguard.dev](https://concurrencyguard.dev))
+
+Explore ConcurrencyGuard interactively in your browser at **[concurrencyguard.dev](https://concurrencyguard.dev)** — a full-featured web companion and visual evidence platform for understanding and debugging Python concurrency races.
+
+[![ConcurrencyGuard Website Preview](https://img.shields.io/badge/Live%20Demo-concurrencyguard.dev-FF4D1C?style=for-the-badge&logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
+
+### What You Can Explore on the Website:
+
+1. **Interactive Race Condition Simulator:**
+   - Step through a real-world financial double-withdrawal timeline (Request A vs. Request B) frame-by-frame.
+   - Switch between **Unsafe Execution** (showing interleaving reads, conflicting writes, and balance overdrafts) and **Serialized Execution** (demonstrating how `SELECT FOR UPDATE` blocks Request B until Request A commits).
+   - Visualize transaction boundaries, lock hold durations, and race windows with millisecond timestamps.
+
+2. **Interactive AST Bug Explorer:**
+   - Compare vulnerable code patterns and lossless LibCST patches side-by-side across major Python ecosystems:
+     - **Django ORM (`CG-016`):** Unlocked `User.objects.get()` vs. `@transaction.atomic` + `select_for_update()`.
+     - **FastAPI (`CG-001`):** Unlocked `await db.get(...)` vs. `select(...).with_for_update()`.
+     - **Celery (`CG-005`):** Non-idempotent task retry vs. `acks_late=True` with distributed idempotency locks.
+     - **SQLAlchemy 2.0 (`CG-004`):** Check-then-act uniqueness races vs. `IntegrityError` atomic handling.
+     - **asyncio (`CG-006`):** Unsynchronized shared cache mutations vs. `async with asyncio.Lock():`.
+   - Hover over highlighted hot lines to inspect precise AST taint propagation and trigger conditions.
+
+3. **Searchable 16-Rule Security Catalog:**
+   - Filter and search the complete catalog of concurrency rules by ecosystem (**FastAPI**, **Django**, **Celery**, **SQLAlchemy**, **Redis**, **asyncio**, **Threads**, **Filesystem**).
+   - View severity ratings, AST detection logic, rationale, and whether the rule supports automated LibCST patch generation.
+
+4. **Real Microsecond Concurrency Engine Telemetry:**
+   - Deep dive into `cguard`'s 4-stage pipeline: AST Taint Visitor, Bipartite Lock-Order Cycle Detector, `asyncio.Barrier` Headless Verifier, and SQLite SHA-256 Incremental Cache.
+   - Live benchmarks comparing cold vs. hot cached scan speeds (24ms vs. 1.2ms).
+
+5. **GitHub App Early Access:**
+   - Join the early access waitlist for the ConcurrencyGuard GitHub App to automatically review incoming PRs, post inline thread-safety comments, and propose verified LibCST patches.
+
+---
+
 ## ⚖️ The Comparison Matrix: Why `cguard` Wins
 
-| Concurrency Vector | Rule ID | Syntax Linters (`ruff`, `flake8`) | AI / LLM Code Reviewers | `cguard` Semantic SAST (v2.3.0) |
+*(Browse the full interactive rule index and test cases at [concurrencyguard.dev](https://concurrencyguard.dev))*
+
+| Concurrency Vector | Rule ID | Syntax Linters (`ruff`, `flake8`) | AI / LLM Code Reviewers | `cguard` Semantic SAST (v2.5.0) |
 |:---|:---:|:---:|:---:|:---:|
 | **SQLAlchemy Unlocked RMW** | `CG-001` | ❌ Blind to DB semantics | ⚠️ Hallucinates, misses context | ✅ **Deterministic AST query-chain audit** |
 | **Missing Idempotency Keys** | `CG-002` | ❌ Ignored | ⚠️ Inconsistent pattern matching | ✅ **Sub-millisecond route signature check** |
@@ -553,6 +593,7 @@ repos:
 
 Distributed under the **MIT License**. See [LICENSE](LICENSE) for details.
 
+- **Official Website & Live Sandbox**: [concurrencyguard.dev](https://concurrencyguard.dev)
 - **PyPI Package**: [pypi.org/project/concurrency-guard](https://pypi.org/project/concurrency-guard/)
 - **Source Repository**: [github.com/AyushkhatiDev/concurrency-guard](https://github.com/AyushkhatiDev/concurrency-guard)
 - **Issue Tracker**: [github.com/AyushkhatiDev/concurrency-guard/issues](https://github.com/AyushkhatiDev/concurrency-guard/issues)
