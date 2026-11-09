@@ -144,3 +144,34 @@ def test_colorize_diff_ansi_escapes() -> None:
     assert "\033[36m@@ -1,1 +1,1 @@\033[0m" in colored
     assert "\033[1m--- a/test.py\033[0m" in colored
     assert "\033[1m+++ b/test.py\033[0m" in colored
+
+
+def test_fix_command_supports_directory_target(tmp_path: Path) -> None:
+    """cguard fix accepts a directory path without raising IsADirectoryError."""
+    sub_dir = tmp_path / "services"
+    sub_dir.mkdir()
+    f1 = sub_dir / "service_a.py"
+    f1.write_text("""
+from fastapi import FastAPI, Depends
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+app = FastAPI()
+
+@app.post("/items")
+async def create_item(db: AsyncSession = Depends()):
+    stmt = select(Item).where(Item.id == 1)
+    res = await db.execute(stmt)
+    item = res.scalar_one_or_none()
+    item.stock -= 1
+    await db.commit()
+""", encoding="utf-8")
+
+    f2 = sub_dir / "service_b.py"
+    f2.write_text("def clean_func(): pass\n", encoding="utf-8")
+
+    runner = CliRunner()
+    result = runner.invoke(app, ["fix", str(sub_dir), "--diff"])
+    assert result.exit_code == 0
+    assert "service_a.py" in result.stdout
+    assert ".with_for_update()" in result.stdout

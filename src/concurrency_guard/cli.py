@@ -335,13 +335,13 @@ def fix(
     file_path: Path = typer.Argument(
         ...,
         exists=True,
-        help="Target Python file to auto-patch with concurrency fixes",
+        help="Target Python file or directory to auto-patch with concurrency fixes",
     ),
     rule: Optional[str] = typer.Option(
         None,
         "--rule",
         "-r",
-        help="Specific rule to fix (e.g. CG-001, CG-006, CG-007, CG-009, CG-016). Defaults to all supported rules.",
+        help="Specific rule to fix (e.g. CG-001, CG-006, CG-007, CG-009, CG-016, CG-017). Defaults to all supported rules.",
     ),
     write: bool = typer.Option(
         False,
@@ -357,7 +357,7 @@ def fix(
     changed_only: bool = typer.Option(
         False,
         "--changed-only",
-        help="Only patch the file if it has git changes.",
+        help="Only patch files that have git changes.",
     ),
     base_ref: Optional[str] = typer.Option(
         None,
@@ -366,79 +366,25 @@ def fix(
     ),
 ) -> None:
     """Auto-patch concurrency race conditions and idempotency bugs using LibCST."""
-    if changed_only or base_ref:
-        changed_files = get_changed_python_files(file_path.parent, base_ref=base_ref)
-        if file_path.resolve() not in changed_files:
-            console.print(f"[dim]Skipping {file_path}: not changed in git.[/dim]")
-            raise typer.Exit(code=0)
+    config = load_project_config(file_path)
+    if file_path.is_dir():
+        target_files = [
+            f for f in discover_python_files(file_path)
+            if not any(pattern in f.parts or str(f).endswith(pattern) for pattern in config.exclude)
+        ]
+    else:
+        target_files = [file_path]
 
-    source_code = file_path.read_text(encoding="utf-8")
-    initial_findings = scan_file(file_path)
+    changed_files: Optional[set[Path]] = None
+    if changed_only or base_ref:
+        repo_dir = file_path if file_path.is_dir() else file_path.parent
+        changed_files = get_changed_python_files(repo_dir, base_ref=base_ref)
 
     rules_filter = {rule.upper()} if rule else None
     diff_gen = DiffGenerator(rules=rules_filter)
-    diff_result = diff_gen.generate_diff(
-        source_code,
-        filepath=file_path,
-        fromfile=str(file_path),
-        tofile=f"{file_path} (patched)",
-    )
 
-    if not diff_result.is_valid:
-        console.print(
-            Panel(
-                f"[bold red]❌ Preflight syntax validation failed for {file_path}:[/bold red]\n"
-                f"[red]{diff_result.error_message}[/red]\n"
-                "[yellow]Patch discarded. File was not modified.[/yellow]",
-                title="[bold red]Patch Rejected[/bold red]",
-                border_style="red",
-            )
-        )
-        raise typer.Exit(code=1)
-
-    patched_code = diff_result.patched_code
-
-    if dry_run:
-        if diff_result.diff:
-            colored = colorize_diff(diff_result.diff, is_tty=sys.stdout.isatty())
-            sys.stdout.write(colored)
-            if not colored.endswith("\n"):
-                sys.stdout.write("\n")
-        raise typer.Exit(code=0)
-
-    if diff_result.skipped:
-        skipped_table = Table(title="Manual Review Required", show_header=True, header_style="bold yellow")
-        skipped_table.add_column("Rule ID", style="bold yellow")
-        skipped_table.add_column("Function", style="magenta")
-        skipped_table.add_column("Line", justify="right")
-        skipped_table.add_column("Reason")
-        for skipped in diff_result.skipped:
-            skipped_table.add_row(skipped.rule_id, skipped.function_name, str(skipped.lineno), skipped.reason)
-        console.print(skipped_table)
-
-    if source_code == patched_code:
-        console.print(
-            Panel(
-                f"[bold green]No concurrency fixes needed for {file_path}.[/bold green]",
-                border_style="green",
-            )
-        )
-        raise typer.Exit(code=0)
-
-    # Determine which rules were fixed
-    remaining_findings = scan_source_code(patched_code, filename=str(file_path))
-    remaining_ids = {f.rule_id for f in remaining_findings}
-    fixed_findings = [f for f in initial_findings if f.rule_id not in remaining_ids]
-
-    # Render summary table of patched rules
-    summary_table = Table(
-        title="LibCST Auto-Patch Summary",
-        show_header=True,
-        header_style="bold green",
-    )
-    summary_table.add_column("Rule ID", style="bold yellow")
-    summary_table.add_column("Function", style="magenta")
-    summary_table.add_column("Fix Applied", style="white")
+    total_patched_files = 0
+    any_preflight_failed = False
 
     rule_descriptions = {
         "CG-001": "Appended .with_for_update() row lock to query",
@@ -448,46 +394,144 @@ def fix(
         "CG-007": "Wrapped threaded shared-state mutation in threading.Lock",
         "CG-009": "Wrapped concurrent file write in FileLock",
         "CG-016": "Added Django select_for_update() to ORM fetch",
+        "CG-017": "Replaced in-memory arithmetic with atomic database F() expression",
     }
 
-    seen_fixes: set[tuple[str, str]] = set()
-    for f in fixed_findings:
-        key = (f.rule_id, f.function_name)
-        if key not in seen_fixes:
-            seen_fixes.add(key)
-            summary_table.add_row(
-                f.rule_id,
-                f.function_name,
-                rule_descriptions.get(f.rule_id, "Applied auto-fix patch"),
-            )
+    for target in target_files:
+        if changed_files is not None and target.resolve() not in changed_files:
+            if len(target_files) == 1:
+                console.print(f"[dim]Skipping {target}: not changed in git.[/dim]")
+            continue
 
-    console.print(summary_table)
+        try:
+            source_code = target.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
 
-    diff = diff_result.diff
-    diff_syntax = Syntax(diff, "diff", theme="monokai", line_numbers=True)
-    console.print(
-        Panel(
-            diff_syntax,
-            title=f"[bold cyan]LibCST Auto-Patch Preview: {file_path}[/bold cyan]",
-            border_style="cyan",
+        initial_findings = scan_file(target)
+
+        diff_result = diff_gen.generate_diff(
+            source_code,
+            filepath=target,
+            fromfile=str(target),
+            tofile=f"{target} (patched)",
         )
-    )
 
-    if write:
-        file_path.write_text(patched_code, encoding="utf-8")
+        if not diff_result.is_valid:
+            console.print(
+                Panel(
+                    f"[bold red]❌ Preflight syntax validation failed for {target}:[/bold red]\n"
+                    f"[red]{diff_result.error_message}[/red]\n"
+                    "[yellow]Patch discarded. File was not modified.[/yellow]",
+                    title="[bold red]Patch Rejected[/bold red]",
+                    border_style="red",
+                )
+            )
+            any_preflight_failed = True
+            continue
+
+        patched_code = diff_result.patched_code
+
+        if dry_run:
+            if diff_result.diff:
+                colored = colorize_diff(diff_result.diff, is_tty=sys.stdout.isatty())
+                sys.stdout.write(colored)
+                if not colored.endswith("\n"):
+                    sys.stdout.write("\n")
+            continue
+
+        if diff_result.skipped:
+            skipped_table = Table(
+                title=f"Manual Review Required: {target}",
+                show_header=True,
+                header_style="bold yellow",
+            )
+            skipped_table.add_column("Rule ID", style="bold yellow")
+            skipped_table.add_column("Function", style="magenta")
+            skipped_table.add_column("Line", justify="right")
+            skipped_table.add_column("Reason")
+            for skipped in diff_result.skipped:
+                skipped_table.add_row(skipped.rule_id, skipped.function_name, str(skipped.lineno), skipped.reason)
+            console.print(skipped_table)
+
+        if source_code == patched_code:
+            if len(target_files) == 1:
+                console.print(
+                    Panel(
+                        f"[bold green]No concurrency fixes needed for {target}.[/bold green]",
+                        border_style="green",
+                    )
+                )
+            continue
+
+        total_patched_files += 1
+
+        # Determine which rules were fixed
+        remaining_findings = scan_source_code(patched_code, filename=str(target))
+        remaining_ids = {f.rule_id for f in remaining_findings}
+        fixed_findings = [f for f in initial_findings if f.rule_id not in remaining_ids]
+
+        # Render summary table of patched rules
+        summary_table = Table(
+            title=f"LibCST Auto-Patch Summary: {target}",
+            show_header=True,
+            header_style="bold green",
+        )
+        summary_table.add_column("Rule ID", style="bold yellow")
+        summary_table.add_column("Function", style="magenta")
+        summary_table.add_column("Fix Applied", style="white")
+
+        seen_fixes: set[tuple[str, str]] = set()
+        for f in fixed_findings:
+            key = (f.rule_id, f.function_name)
+            if key not in seen_fixes:
+                seen_fixes.add(key)
+                summary_table.add_row(
+                    f.rule_id,
+                    f.function_name,
+                    rule_descriptions.get(f.rule_id, "Applied auto-fix patch"),
+                )
+
+        console.print(summary_table)
+
+        diff = diff_result.diff
+        diff_syntax = Syntax(diff, "diff", theme="monokai", line_numbers=True)
         console.print(
             Panel(
-                f"[bold green]✔ Successfully wrote patched code to {file_path}[/bold green]",
+                diff_syntax,
+                title=f"[bold cyan]LibCST Auto-Patch Preview: {target}[/bold cyan]",
+                border_style="cyan",
+            )
+        )
+
+        if write:
+            target.write_text(patched_code, encoding="utf-8")
+            console.print(
+                Panel(
+                    f"[bold green]✔ Successfully wrote patched code to {target}[/bold green]",
+                    border_style="green",
+                )
+            )
+
+    if dry_run:
+        raise typer.Exit(code=1 if any_preflight_failed else 0)
+
+    if total_patched_files == 0 and len(target_files) > 1:
+        console.print(
+            Panel(
+                "[bold green]No concurrency fixes needed across scanned files.[/bold green]",
                 border_style="green",
             )
         )
-    else:
+    elif not write and total_patched_files > 0:
         console.print(
             Panel(
                 "[dim]Dry-run mode: Pass [bold]--write[/bold] to apply the patch directly to disk.[/dim]",
                 border_style="yellow",
             )
         )
+
+    raise typer.Exit(code=1 if any_preflight_failed else 0)
 
 
 @app.command()
