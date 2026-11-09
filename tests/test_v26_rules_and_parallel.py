@@ -302,3 +302,4 @@ def release():
     assert result.exit_code == 1
     data = json.loads(result.stdout)
     assert any(f["rule_id"] == "CG-018" for f in data["findings"])
+
