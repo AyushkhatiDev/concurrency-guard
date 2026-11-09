@@ -586,9 +586,72 @@ class DjangoSelectForUpdateTransformer(cst.CSTTransformer):
         return updated_node.with_changes(func=updated_node.func.with_changes(value=locked_manager))
 
 
+class DjangoFExpressionTransformer(cst.CSTTransformer):
+    """Replace in-memory Django model attribute arithmetic with atomic F() expressions."""
+
+    def __init__(self, target_functions: set[str]) -> None:
+        self.target_functions = target_functions
+        self._active = False
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
+        self._active = node.name.value in self.target_functions
+        return True
+
+    def leave_FunctionDef(
+        self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef
+    ) -> cst.FunctionDef:
+        if original_node.name.value in self.target_functions:
+            self._active = False
+        return updated_node
+
+    def leave_AugAssign(
+        self, original_node: cst.AugAssign, updated_node: cst.AugAssign
+    ) -> Union[cst.AugAssign, cst.Assign]:
+        if not self._active or not isinstance(original_node.target, cst.Attribute):
+            return updated_node
+        attr_name = original_node.target.attr.value
+        op: Optional[cst.BaseBinaryOp] = None
+        if isinstance(original_node.operator, cst.SubtractAssign):
+            op = cst.Subtract()
+        elif isinstance(original_node.operator, cst.AddAssign):
+            op = cst.Add()
+        elif isinstance(original_node.operator, cst.MultiplyAssign):
+            op = cst.Multiply()
+        if op is not None:
+            f_call = cst.Call(
+                func=cst.Name("F"),
+                args=[cst.Arg(cst.SimpleString(f'"{attr_name}"'))],
+            )
+            bin_op = cst.BinaryOperation(left=f_call, operator=op, right=original_node.value)
+            return cst.Assign(
+                targets=[cst.AssignTarget(target=original_node.target)],
+                value=bin_op,
+            )
+        return updated_node
+
+    def leave_Assign(
+        self, original_node: cst.Assign, updated_node: cst.Assign
+    ) -> cst.Assign:
+        if not self._active or len(original_node.targets) != 1:
+            return updated_node
+        target = original_node.targets[0].target
+        if not isinstance(target, cst.Attribute) or not isinstance(original_node.value, cst.BinaryOperation):
+            return updated_node
+        attr_name = target.attr.value
+        binop = original_node.value
+        if isinstance(binop.left, cst.Attribute) and binop.left.attr.value == attr_name:
+            f_call = cst.Call(
+                func=cst.Name("F"),
+                args=[cst.Arg(cst.SimpleString(f'"{attr_name}"'))],
+            )
+            new_binop = binop.with_changes(left=f_call)
+            return updated_node.with_changes(value=new_binop)
+        return updated_node
+
+
 def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = None) -> PatchResult:
     """Apply only statically validated fixes and report skipped targets."""
-    selected_rules = rules if rules is not None else {"CG-001", "CG-002", "CG-004", "CG-006", "CG-007", "CG-009", "CG-016"}
+    selected_rules = rules if rules is not None else {"CG-001", "CG-002", "CG-004", "CG-006", "CG-007", "CG-009", "CG-016", "CG-017"}
     current_code = source_code
     suppressions = SuppressionFilter()
     suppressions.parse_source(current_code, filepath="<memory>")
@@ -676,6 +739,15 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
             current_code = cst.parse_module(current_code).visit(
                 DjangoSelectForUpdateTransformer(targets)
             ).code
+
+    # 8. CG-017: replace in-memory Django arithmetic with atomic F() expression
+    if "CG-017" in selected_rules:
+        suppressions.parse_source(current_code, filepath="<memory>")
+        findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
+        targets = targets_for("CG-017")
+        if targets:
+            tree = cst.parse_module(current_code).visit(DjangoFExpressionTransformer(targets))
+            current_code = _ensure_import(tree, "django.db.models", "F").code
 
     ast.parse(current_code)
     cst.parse_module(current_code)

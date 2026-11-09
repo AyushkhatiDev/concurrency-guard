@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v2.5.0
+# ConcurrencyGuard (`cguard`) — v2.6.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-147%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-165%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -26,16 +26,20 @@ Explore interactive race simulations, rule breakdowns, and live AST patches at *
 
 </div>
 
-## 🚀 What's New in v2.5.0
+## 🚀 What's New in v2.6.0
 
-`cguard` v2.5.0 introduces enterprise-grade static analysis capabilities for modern asynchronous systems:
+`cguard` v2.6.0 expands rule coverage from 16 to **21 enterprise concurrency rules**, adds atomic LibCST `F()` expression code repair, and introduces multi-core parallel scanning:
 
-1. **Structured Concurrency Detection:** Deep AST awareness of `asyncio.TaskGroup` (`tg.create_task(...)`), `anyio.create_task_group()` (`tg.start_soon(...)`), FastAPI `BackgroundTasks.add_task(...)`, and `loop.create_task(...)`.
-2. **Compiler-Grade Deadlock Analysis (`CG-013`):**
-   - **Intra-Function Self-Deadlocks:** Detects non-reentrant locks re-acquired within the same execution path.
-   - **Inter-Procedural Self-Deadlocks:** Cross-function static call graph analysis catching parent functions that invoke children acquiring the same held non-reentrant lock.
-   - **Async Coroutine Sync-Lock Hazards:** Detects synchronous `threading.Lock` acquired via `with` inside `async def` routines—flagging event-loop thread blocking and deterministic deadlocks across `await` suspension points.
-   - **Smart `threading.RLock` Suppression:** Automatic detection of reentrant lock semantics to eliminate false positives.
+1. **New Concurrency Rules (`CG-017` – `CG-021`):**
+   - **`CG-017` (Django Atomic `F()` Expression Optimization):** Detects in-memory model arithmetic before `.save()` / `.asave()` and suggests lock-free database-level `F()` expressions.
+   - **`CG-018` (Distributed Lock TTL & Unsafe Release):** Flags raw `redis.delete(lock_key)` calls that lack token ownership verification, preventing accidental release of another worker's expired lock.
+   - **`CG-019` (FastAPI `BackgroundTasks` DB Session Leak):** Catches request-scoped database sessions passed to background tasks that outlive the HTTP request lifecycle.
+   - **`CG-020` (Unbounded Lock Held Across Network I/O):** Identifies slow HTTP/network requests executed while holding a lock or active database transaction, eliminating connection pool exhaustion.
+   - **`CG-021` (Generator Lock Leak):** Flags `yield` inside a `with lock:` context manager that leaves locks held indefinitely across generator suspension points.
+2. **LibCST Auto-Patching for `CG-017`:** Automatically transforms in-memory Django increments/decrements (`wallet.balance -= amount`) into atomic database updates (`wallet.balance = F("balance") - amount`) and automatically injects `from django.db.models import F`.
+3. **High-Throughput Multi-Core Parallel Scanning:** Added `--workers` / `-w` CLI flag for `cguard scan` with multi-threaded execution and SQLite WAL mode (`PRAGMA journal_mode=WAL;`), providing instantaneous scans on massive monorepos.
+4. **Structured Concurrency Detection (v2.5.0):** Deep AST awareness of `asyncio.TaskGroup`, `anyio.create_task_group()`, and `BackgroundTasks.add_task()`.
+5. **Compiler-Grade Deadlock Analysis (v2.5.0):** Intra-function and inter-procedural self-deadlock detection, smart `RLock` suppression, and sync-lock detection inside `async def` routines.
 3. **SQLAlchemy 2.0 Fluent Chains & LibCST Precision:** Full support for `select(...).where(...).with_for_update()` fluent chains with precision AST transformer targeting inner `select(...)` calls inside `session.execute(...)` and `session.scalar(...)`.
 4. **Git-Diff Aware Incremental Scanning:** `--changed-only` and `--base-ref` CLI flags for ultra-fast local workflows and PR checks.
 5. **Native Pre-Commit Hooks:** Seamless `.pre-commit-hooks.yaml` integration for CI and local git hooks.
@@ -162,7 +166,7 @@ Explore ConcurrencyGuard interactively in your browser at **[concurrencyguard.de
 
 *(Browse the full interactive rule index and test cases at [concurrencyguard.dev](https://concurrencyguard.dev))*
 
-| Concurrency Vector | Rule ID | Syntax Linters (`ruff`, `flake8`) | AI / LLM Code Reviewers | `cguard` Semantic SAST (v2.5.0) |
+| Concurrency Vector | Rule ID | Syntax Linters (`ruff`, `flake8`) | AI / LLM Code Reviewers | `cguard` Semantic SAST (v2.6.0) |
 |:---|:---:|:---:|:---:|:---:|
 | **SQLAlchemy Unlocked RMW** | `CG-001` | ❌ Blind to DB semantics | ⚠️ Hallucinates, misses context | ✅ **Deterministic AST query-chain audit** |
 | **Missing Idempotency Keys** | `CG-002` | ❌ Ignored | ⚠️ Inconsistent pattern matching | ✅ **Sub-millisecond route signature check** |
@@ -180,6 +184,11 @@ Explore ConcurrencyGuard interactively in your browser at **[concurrencyguard.de
 | **Cross-File Call-Chain Races** | `CG-014` | ❌ Single-file scope only | ❌ Exceeds token context window | ✅ **Project-wide Inter-Procedural Call Graph** |
 | **Abstracted Shared-State Taint** | `CG-015` | ❌ Ignored | ⚠️ Loses variable provenance | ✅ **Forward Data-Flow Taint Propagation** |
 | **Django ORM Unlocked RMW** | `CG-016` | ❌ Ignored | ⚠️ Misses ORM transaction scope | ✅ **Scope-aware `select_for_update` audit** |
+| **Django In-Memory Arithmetic** | `CG-017` | ❌ Ignored | ⚠️ Recommends locks over SQL | ✅ **Lock-free atomic `F()` expression audit** |
+| **Distributed Lock Unsafe Delete** | `CG-018` | ❌ Ignored | ⚠️ Overlooks TTL expiration | ✅ **Token-checked Lua & lock manager audit** |
+| **BackgroundTasks Session Leak** | `CG-019` | ❌ Ignored | ⚠️ Blind to async task lifetimes | ✅ **Request-scoped DB session lifetime audit** |
+| **Unbounded Lock Across I/O** | `CG-020` | ❌ Ignored | ⚠️ Misses pool exhaustion risk | ✅ **Connection-pool boundary validation** |
+| **Generator Lock Leak (`yield`)** | `CG-021` | ❌ Ignored | ⚠️ Misses generator suspension | ✅ **Context-aware yield point audit** |
 | **Empirical Runtime Verification** | — | ❌ None | ❌ Cannot execute or stress code | ✅ **Synchronized `Barrier` stress engine** |
 | **Deterministic Code Remediation** | — | ⚠️ Style fixes only | ⚠️ Introduces syntax regressions | ✅ **Lossless `LibCST` + `ast.parse` preflight** |
 
@@ -578,7 +587,7 @@ Add this to your `.pre-commit-config.yaml`:
 ```yaml
 repos:
   - repo: https://github.com/AyushkhatiDev/concurrency-guard
-    rev: v2.5.0
+    rev: v2.6.0
     hooks:
       - id: cguard-scan
       - id: cguard-fix-diff

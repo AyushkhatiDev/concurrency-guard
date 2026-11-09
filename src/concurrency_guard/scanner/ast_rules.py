@@ -1105,11 +1105,21 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
             mutation_targets: list[ast.AST] = []
             if isinstance(statement, ast.AugAssign):
-                mutation_targets.append(statement.target)
-            elif isinstance(statement, ast.Assign):
-                mutation_targets.extend(
-                    target for target in statement.targets if isinstance(target, (ast.Attribute, ast.Subscript))
+                has_f_call = any(
+                    isinstance(c, ast.Call) and _expr_name(c) in {"F", "models.F", "django.db.models.F"}
+                    for c in ast.walk(statement.value)
                 )
+                if not has_f_call:
+                    mutation_targets.append(statement.target)
+            elif isinstance(statement, ast.Assign):
+                has_f_call = any(
+                    isinstance(c, ast.Call) and _expr_name(c) in {"F", "models.F", "django.db.models.F"}
+                    for c in ast.walk(statement.value)
+                )
+                if not has_f_call:
+                    mutation_targets.extend(
+                        target for target in statement.targets if isinstance(target, (ast.Attribute, ast.Subscript))
+                    )
 
             for mutation_target in mutation_targets:
                 root = _target_root_name(mutation_target)
@@ -1180,6 +1190,272 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
         analyze_block(node.body, (), {})
 
+    def _check_cg_017(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], local_nodes: list[ast.AST]
+    ) -> None:
+        """Rule CG-017: Suggest atomic F() expression for in-memory arithmetic on Django model.
+
+        When a Django model's numeric attribute is modified with simple arithmetic (+, -, *)
+        and then saved via save() or asave(), an atomic database F() expression should be
+        preferred to avoid race conditions and lock contention.
+        """
+        django_fetched_vars: dict[str, tuple[ast.AST, str]] = {}
+        arithmetic_mutated_vars: set[str] = set()
+
+        for stmt in local_nodes:
+            if isinstance(stmt, (ast.Assign, ast.AnnAssign)):
+                val = stmt.value
+                targets: list[str] = []
+                if isinstance(stmt, ast.Assign):
+                    targets = [t.id for t in stmt.targets if isinstance(t, ast.Name)]
+                elif isinstance(stmt, ast.AnnAssign) and isinstance(stmt.target, ast.Name):
+                    targets = [stmt.target.id]
+
+                if val is not None and isinstance(val, (ast.Call, ast.Await)):
+                    is_fetch, _ = _django_manager_call(val)
+                    if is_fetch:
+                        model_name = _expr_name(val)
+                        for t in targets:
+                            django_fetched_vars[t] = (val, model_name)
+                elif val is not None and isinstance(val, ast.Name):
+                    resolved_val = self.resolve_alias(val.id)
+                    if val.id in django_fetched_vars:
+                        for t in targets:
+                            django_fetched_vars[t] = django_fetched_vars[val.id]
+                    elif resolved_val in django_fetched_vars:
+                        for t in targets:
+                            django_fetched_vars[t] = django_fetched_vars[resolved_val]
+
+            # Check for AugAssign: product.stock -= 1
+            if (
+                isinstance(stmt, ast.AugAssign)
+                and isinstance(stmt.target, ast.Attribute)
+                and isinstance(stmt.op, (ast.Add, ast.Sub, ast.Mult))
+            ):
+                has_f = any(
+                    isinstance(c, ast.Call) and _expr_name(c) in {"F", "models.F", "django.db.models.F"}
+                    for c in ast.walk(stmt.value)
+                )
+                if not has_f:
+                    root = _target_root_name(stmt.target)
+                    resolved_root = self.resolve_alias(root)
+                    if root in django_fetched_vars or resolved_root in django_fetched_vars:
+                        arithmetic_mutated_vars.add(root)
+                        arithmetic_mutated_vars.add(resolved_root)
+
+            # Check for Assign with BinOp: product.stock = product.stock - 1
+            if (
+                isinstance(stmt, ast.Assign)
+                and len(stmt.targets) == 1
+                and isinstance(stmt.targets[0], ast.Attribute)
+                and isinstance(stmt.value, ast.BinOp)
+                and isinstance(stmt.value.op, (ast.Add, ast.Sub, ast.Mult))
+            ):
+                target = stmt.targets[0]
+                has_f = any(
+                    isinstance(c, ast.Call) and _expr_name(c) in {"F", "models.F", "django.db.models.F"}
+                    for c in ast.walk(stmt.value)
+                )
+                if not has_f:
+                    root = _target_root_name(target)
+                    resolved_root = self.resolve_alias(root)
+                    if root in django_fetched_vars or resolved_root in django_fetched_vars:
+                        arithmetic_mutated_vars.add(root)
+                        arithmetic_mutated_vars.add(resolved_root)
+
+            # Check for save() or asave()
+            for call in (n for n in ast.walk(stmt) if isinstance(n, ast.Call)):
+                if isinstance(call.func, ast.Attribute) and call.func.attr in {"save", "asave"}:
+                    root = _target_root_name(call.func.value)
+                    resolved_root = self.resolve_alias(root)
+                    target_var = (
+                        root if root in arithmetic_mutated_vars
+                        else (resolved_root if resolved_root in arithmetic_mutated_vars else None)
+                    )
+                    if target_var and target_var in django_fetched_vars:
+                        self._add(
+                            "CG-017",
+                            stmt,
+                            node.name,
+                            "Django non-atomic in-memory arithmetic: model attribute is updated in Python memory before save() instead of using an atomic database F() expression.",
+                            "Use 'Model.objects.filter(...).update(field=F(\"field\") +/- amount)' for atomic, lock-free database updates.",
+                        )
+                        arithmetic_mutated_vars.discard(target_var)
+
+    def _check_cg_018(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], local_nodes: list[ast.AST]
+    ) -> None:
+        """Rule CG-018: Detect unsafe distributed lock release via raw delete().
+
+        In distributed locking (e.g. Redis), releasing a lock via client.delete(lock_key)
+        without validating token ownership can release another worker's expired lock.
+        """
+        for stmt in local_nodes:
+            if not isinstance(stmt, ast.Call):
+                continue
+            if not isinstance(stmt.func, ast.Attribute) or stmt.func.attr != "delete":
+                continue
+
+            caller_name = _expr_name(stmt.func.value).lower()
+            is_redis_client = any(
+                k in caller_name for k in ("redis", "client", "cache", "redlock", "conn")
+            ) or caller_name in ("r", "rd", "rc")
+
+            if not is_redis_client and caller_name:
+                continue
+
+            is_lock_delete = False
+            for arg in stmt.args:
+                arg_name = _expr_name(arg).lower()
+                if "lock" in arg_name:
+                    is_lock_delete = True
+                    break
+                elif isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    if "lock" in arg.value.lower():
+                        is_lock_delete = True
+                        break
+                elif isinstance(arg, ast.BinOp):
+                    for child in ast.walk(arg):
+                        if (
+                            isinstance(child, ast.Constant) and isinstance(child.value, str) and "lock" in child.value.lower()
+                        ) or (
+                            isinstance(child, ast.Name) and "lock" in child.id.lower()
+                        ):
+                            is_lock_delete = True
+                            break
+                    if is_lock_delete:
+                        break
+
+            if is_lock_delete:
+                self._add(
+                    "CG-018",
+                    stmt,
+                    node.name,
+                    "Unsafe distributed lock release: deleting lock key directly via delete() without verifying token ownership can release another worker's expired lock.",
+                    "Release distributed locks using a token-checked Lua script or use Redis.lock() / Redlock context manager.",
+                )
+
+    def _check_cg_019(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], local_nodes: list[ast.AST]
+    ) -> None:
+        """Rule CG-019: Detect request-scoped database session passed to BackgroundTasks.
+
+        FastAPI BackgroundTasks execute after the response has been sent and the dependency
+        context has closed the database session. Passing a request-scoped db session causes
+        connection pool errors and concurrent session use.
+        """
+        session_var_names = {"db", "session", "db_session", "session_factory", "async_session", "session_maker"}
+        for stmt in local_nodes:
+            if not isinstance(stmt, ast.Call):
+                continue
+            if not isinstance(stmt.func, ast.Attribute) or stmt.func.attr != "add_task":
+                continue
+
+            caller_name = _expr_name(stmt.func.value).lower()
+            if not any(k in caller_name for k in ("background", "tasks", "task")):
+                continue
+
+            passed_args = stmt.args[1:]
+            found = False
+            for arg in passed_args:
+                name = _expr_name(arg).lower()
+                if name in session_var_names or "session" in name or name == "db":
+                    self._add(
+                        "CG-019",
+                        stmt,
+                        node.name,
+                        "FastAPI BackgroundTasks session leak: request-scoped database session passed to background task outlives request lifecycle.",
+                        "Instantiate a new dedicated database session inside the background task function instead of passing the request-scoped session.",
+                    )
+                    found = True
+                    break
+
+            if not found:
+                for kw in stmt.keywords:
+                    kw_val = _expr_name(kw.value).lower()
+                    if kw.arg in session_var_names or kw_val in session_var_names or "session" in kw_val:
+                        self._add(
+                            "CG-019",
+                            stmt,
+                            node.name,
+                            "FastAPI BackgroundTasks session leak: request-scoped database session passed to background task outlives request lifecycle.",
+                            "Instantiate a new dedicated database session inside the background task function instead of passing the request-scoped session.",
+                        )
+                        break
+
+    def _check_cg_020(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], local_nodes: list[ast.AST]
+    ) -> None:
+        """Rule CG-020: Detect unbounded lock held across external network I/O.
+
+        Executing external HTTP or network calls while holding a synchronization lock
+        or active database transaction exhausts connection pools and causes high lock contention.
+        """
+        network_call_prefixes = (
+            "requests.get", "requests.post", "requests.put", "requests.delete", "requests.request", "requests.patch",
+            "httpx.get", "httpx.post", "httpx.put", "httpx.delete", "httpx.request", "httpx.patch",
+            "urllib.request.urlopen",
+            "client.get", "client.post", "client.put", "client.delete", "client.request",
+            "http_client.get", "http_client.post", "http_client.request",
+        )
+
+        def is_network_call(call_node: ast.Call) -> bool:
+            if not isinstance(call_node.func, (ast.Attribute, ast.Name)):
+                return False
+            if isinstance(call_node.func, ast.Attribute) and isinstance(call_node.func.value, ast.Call):
+                return False
+            name = _expr_name(call_node.func).lower()
+            return any(name == prefix or name.endswith("." + prefix) for prefix in network_call_prefixes)
+
+        for with_stmt in (n for n in local_nodes if isinstance(n, (ast.With, ast.AsyncWith))):
+            is_locked_context = False
+            for item in with_stmt.items:
+                ctx_name = _expr_name(item.context_expr).lower()
+                if "atomic" in ctx_name or "lock" in ctx_name or "semaphore" in ctx_name:
+                    is_locked_context = True
+                    break
+
+            if not is_locked_context:
+                continue
+
+            for child in ast.walk(with_stmt):
+                if isinstance(child, ast.Call) and is_network_call(child):
+                    self._add(
+                        "CG-020",
+                        child,
+                        node.name,
+                        "Unbounded lock held across network I/O: external HTTP/network request executed while holding lock or database transaction.",
+                        "Perform external network I/O before acquiring the lock or database transaction, or use a two-phase reservation pattern.",
+                    )
+
+    def _check_cg_021(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], local_nodes: list[ast.AST]
+    ) -> None:
+        """Rule CG-021: Detect generator/coroutine lock leak ('yield' inside locked context).
+
+        Yielding inside a lock context keeps the lock held across generator suspension points.
+        If the consumer slows down, blocks, or abandons the generator, the lock is held indefinitely.
+        """
+        for with_stmt in (n for n in local_nodes if isinstance(n, (ast.With, ast.AsyncWith))):
+            is_lock = False
+            for item in with_stmt.items:
+                if _is_lock_expr(item.context_expr):
+                    is_lock = True
+                    break
+
+            if not is_lock:
+                continue
+
+            for child in ast.walk(with_stmt):
+                if isinstance(child, (ast.Yield, ast.YieldFrom)):
+                    self._add(
+                        "CG-021",
+                        child,
+                        node.name,
+                        "Generator lock leak: 'yield' inside locked context keeps lock held across generator suspension points.",
+                        "Acquire the lock inside the loop per item, or consume items into a local list under lock before yielding.",
+                    )
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """Inspect sync function definitions for rule CG-005."""
         saved_aliases, saved_context = self.aliases, self.context_stack
@@ -1188,6 +1464,11 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             local_nodes = list(_walk_local_nodes(node))
             self._check_cg_005(node, local_nodes)
             self._check_cg_016(node, local_nodes)
+            self._check_cg_017(node, local_nodes)
+            self._check_cg_018(node, local_nodes)
+            self._check_cg_019(node, local_nodes)
+            self._check_cg_020(node, local_nodes)
+            self._check_cg_021(node, local_nodes)
             self._check_standard_library_rules(node, local_nodes)
             self.generic_visit(node)
         finally:
@@ -1205,6 +1486,11 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             self._check_cg_004(node, local_nodes)
             self._check_cg_005(node, local_nodes)
             self._check_cg_016(node, local_nodes)
+            self._check_cg_017(node, local_nodes)
+            self._check_cg_018(node, local_nodes)
+            self._check_cg_019(node, local_nodes)
+            self._check_cg_020(node, local_nodes)
+            self._check_cg_021(node, local_nodes)
             self._check_standard_library_rules(node, local_nodes)
 
             # Check for synchronous locks acquired inside async coroutine
@@ -1384,6 +1670,7 @@ def scan_directory(
     custom_rules: Optional[list[dict[str, Any]]] = None,
     cache_manager: Optional[Any] = None,
     suppression_filter: Optional[SuppressionFilter] = None,
+    workers: Optional[int] = None,
 ) -> list[ASTFinding]:
     """Scan a directory recursively, including cross-file call-chain analysis."""
     return scan_project(
@@ -1392,6 +1679,7 @@ def scan_directory(
         custom_rules=custom_rules,
         cache_manager=cache_manager,
         suppression_filter=suppression_filter,
+        workers=workers,
     )
 
 
@@ -1401,6 +1689,7 @@ def scan_project(
     custom_rules: Optional[list[dict[str, Any]]] = None,
     cache_manager: Optional[Any] = None,
     suppression_filter: Optional[SuppressionFilter] = None,
+    workers: Optional[int] = None,
 ) -> list[ASTFinding]:
     """Scan files and propagate shared-state hazards to transitive callers.
 
@@ -1411,15 +1700,33 @@ def scan_project(
     active_filter = suppression_filter or SuppressionFilter()
 
     findings: list[ASTFinding] = []
-    for file_path in file_paths:
-        findings.extend(
-            scan_file(
-                file_path,
-                custom_rules=custom_rules,
-                cache_manager=cache_manager,
-                suppression_filter=active_filter,
+    effective_workers = workers if workers and workers > 1 else (min(8, len(file_paths)) if len(file_paths) > 2 else 1)
+    if effective_workers > 1:
+        import concurrent.futures
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
+            future_to_file = {
+                executor.submit(
+                    scan_file,
+                    file_path,
+                    custom_rules=custom_rules,
+                    cache_manager=cache_manager,
+                    suppression_filter=active_filter,
+                ): file_path
+                for file_path in file_paths
+            }
+            for future in concurrent.futures.as_completed(future_to_file):
+                findings.extend(future.result())
+    else:
+        for file_path in file_paths:
+            findings.extend(
+                scan_file(
+                    file_path,
+                    custom_rules=custom_rules,
+                    cache_manager=cache_manager,
+                    suppression_filter=active_filter,
+                )
             )
-        )
     graph = build_call_graph(file_paths, roots=roots)
     taint_findings = find_tainted_shared_state_mutations(file_paths, graph)
     for finding in taint_findings:

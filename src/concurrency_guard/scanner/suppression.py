@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import io
 import re
+import threading
 import tokenize
 from collections import defaultdict
 from dataclasses import dataclass, field
@@ -58,6 +59,7 @@ class SuppressionFilter:
     def __init__(self) -> None:
         self.suppressed_count: int = 0
         self._file_records: dict[str, FileSuppressionRecord] = {}
+        self._lock = threading.RLock()
 
     def _normalize_path(self, filepath: Union[Path, str]) -> str:
         p = Path(filepath)
@@ -121,8 +123,9 @@ class SuppressionFilter:
 
         if filepath is not None:
             norm = self._normalize_path(filepath)
-            self._file_records[norm] = record
-            self._file_records[str(filepath)] = record
+            with self._lock:
+                self._file_records[norm] = record
+                self._file_records[str(filepath)] = record
 
         return record
 
@@ -137,9 +140,10 @@ class SuppressionFilter:
     def should_suppress(self, rule_id: str, filepath: Path, line_number: int) -> bool:
         """Check if finding for rule_id on filepath:line_number is suppressed."""
         norm_path = self._normalize_path(filepath)
-        record = self._file_records.get(norm_path)
-        if record is None:
-            record = self._file_records.get(str(filepath))
+        with self._lock:
+            record = self._file_records.get(norm_path)
+            if record is None:
+                record = self._file_records.get(str(filepath))
 
         if record is None:
             if filepath.is_file():
@@ -176,7 +180,8 @@ class SuppressionFilter:
         for finding in findings:
             target_path = file_path if file_path is not None else Path(finding.filename)
             if self.should_suppress(finding.rule_id, target_path, finding.lineno):
-                self.suppressed_count += 1
+                with self._lock:
+                    self.suppressed_count += 1
             else:
                 active.append(finding)
         return active

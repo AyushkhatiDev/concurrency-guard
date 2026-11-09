@@ -82,6 +82,12 @@ def scan(
         "--base-ref",
         help="Git base reference (e.g. origin/main, HEAD~1) to compare against for changed files.",
     ),
+    workers: Optional[int] = typer.Option(
+        None,
+        "--workers",
+        "-w",
+        help="Number of parallel worker threads for multi-file scanning (auto-detected if omitted).",
+    ),
 ) -> None:
     """Scan Python files or directories for concurrency vulnerabilities."""
     start_time = time.perf_counter()
@@ -115,6 +121,7 @@ def scan(
         custom_rules=custom_rules,
         cache_manager=cache_mgr,
         suppression_filter=suppression_filter,
+        workers=workers,
     )
     findings = [finding for finding in findings if finding.rule_id not in config.ignore]
 

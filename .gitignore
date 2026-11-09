@@ -8,7 +8,7 @@ __pycache__/
 dist/
 build/
 .DS_Store
-.concurrency_guard_cache.db
-*.db
+.concurrency_guard_cache.db*
+*.db*
 
 
