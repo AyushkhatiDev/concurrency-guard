@@ -41,6 +41,7 @@ class ASTFinding:
     function_name: str
     message: str
     suggested_fix_hint: str
+    confidence: str = "HIGH"
 
 
 @dataclass
@@ -95,7 +96,22 @@ def _expr_name(node: ast.AST) -> str:
 
 def _is_lock_expr(node: ast.AST) -> bool:
     name = _expr_name(node).lower()
-    return "lock" in name or "semaphore" in name
+    return any(k in name for k in ("lock", "semaphore", "mutex", "advisory_lock", "redis_lock", "redlock"))
+
+
+def _get_lock_spans(node: ast.AST) -> list[tuple[int, int]]:
+    """Return (start_line, end_line) spans for all with/async-with statements holding locks."""
+    spans: list[tuple[int, int]] = []
+    for child in ast.walk(node):
+        if isinstance(child, (ast.With, ast.AsyncWith)):
+            for item in child.items:
+                if _is_lock_expr(item.context_expr):
+                    start = child.lineno
+                    end = getattr(child, "end_lineno", None)
+                    if end is None:
+                        end = max([getattr(c, "lineno", start) for c in ast.walk(child)] + [start])
+                    spans.append((start, end))
+    return spans
 
 
 def _lock_names(node: ast.AST) -> list[str]:
@@ -593,8 +609,26 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                     self.thread_targets.add(target)
         self.generic_visit(node)
 
-    def _add(self, rule_id: str, node: ast.AST, function: str, message: str, hint: str) -> None:
-        self.findings.append(ASTFinding(rule_id, self.filename, getattr(node, "lineno", 0), function, message, hint))
+    def _add(
+        self,
+        rule_id: str,
+        node: ast.AST,
+        function: str,
+        message: str,
+        hint: str,
+        confidence: str = "HIGH",
+    ) -> None:
+        self.findings.append(
+            ASTFinding(
+                rule_id,
+                self.filename,
+                getattr(node, "lineno", 0),
+                function,
+                message,
+                hint,
+                confidence,
+            )
+        )
 
     def _check_standard_library_rules(
         self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], local_nodes: list[ast.AST]
@@ -740,6 +774,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                             "CG-008", statement, node.name,
                             "Read-Modify-Write race: state is read, transformed, and written back without a lock.",
                             "Use the appropriate async/thread/process lock or an atomic update primitive around the full RMW sequence.",
+                            confidence="MEDIUM",
                         )
                         break
 
@@ -757,6 +792,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                     "CG-010", call, node.name,
                     "Hard-coded temporary filename can collide between concurrent tasks.",
                     "Use tempfile.NamedTemporaryFile, TemporaryDirectory, or mkstemp instead.",
+                    confidence="MEDIUM",
                 )
 
         calls = [n for n in local_nodes if isinstance(n, ast.Call)]
@@ -846,43 +882,234 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
     def _check_cg_001(self, node: ast.AsyncFunctionDef, local_nodes: list[ast.AST]) -> None:
         """Rule CG-001: Unlocked Read-Modify-Write Race Condition."""
-        query_calls = [n for n in local_nodes if isinstance(n, ast.Call) and _is_query_call(n)]
-
-        has_mutation = False
-        for n in local_nodes:
-            if isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Attribute):
-                has_mutation = True
-                break
-            if isinstance(n, ast.Assign) and _is_matching_binop_mutation(n):
-                has_mutation = True
-                break
-
+        # 1. Fast check: must have a commit or flush call
         has_commit = any(
-            isinstance(n, ast.Attribute) and n.attr == "commit" for n in local_nodes
-        )
-
-        has_with_for_update = any(
-            isinstance(n, ast.Attribute) and n.attr == "with_for_update" for n in local_nodes
-        )
-
-        if query_calls and has_mutation and has_commit and not has_with_for_update:
-            first_query = query_calls[0]
-            self.findings.append(
-                ASTFinding(
-                    rule_id="CG-001",
-                    filename=self.filename,
-                    lineno=first_query.lineno,
-                    function_name=node.name,
-                    message=(
-                        "Unlocked Read-Modify-Write Race Condition: database state is read and "
-                        "mutated without '.with_for_update()' lock before commit."
-                    ),
-                    suggested_fix_hint=(
-                        "Add '.with_for_update()' to the select statement to acquire row locks "
-                        "and prevent concurrent lost updates."
-                    ),
-                )
+            _is_commit_call(n)
+            or (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr in ("commit", "flush")
             )
+            for n in local_nodes
+        )
+        if not has_commit:
+            return
+
+        # 2. Collect lock spans: statements inside locks are safe
+        lock_spans = _get_lock_spans(node)
+
+        def is_locked_line(lineno: int) -> bool:
+            return any(s <= lineno <= e for s, e in lock_spans)
+
+        # 3. Build symbol def-use maps for queries and entity variables
+        queries: dict[str, tuple[ast.AST, int, bool]] = {}
+        result_proxies: dict[str, tuple[ast.AST, int, bool]] = {}
+        entity_sources: dict[str, tuple[ast.AST, int, bool]] = {}
+
+        def _has_query_lock(expr: ast.AST) -> bool:
+            return any(
+                isinstance(c, ast.Attribute) and c.attr in ("with_for_update", "select_for_update")
+                for c in ast.walk(expr)
+            )
+
+        def _extract_names(target: ast.AST) -> list[str]:
+            if isinstance(target, ast.Name):
+                return [target.id]
+            if isinstance(target, (ast.Tuple, ast.List)):
+                res: list[str] = []
+                for elt in target.elts:
+                    res.extend(_extract_names(elt))
+                return res
+            return []
+
+        assign_stmts = sorted(
+            [n for n in local_nodes if isinstance(n, (ast.Assign, ast.AnnAssign))],
+            key=lambda x: getattr(x, "lineno", 0),
+        )
+
+        for stmt in assign_stmts:
+            targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
+            val = stmt.value
+            if val is None:
+                continue
+
+            unwrapped = val.value if isinstance(val, ast.Await) else val
+
+            # Check A: Assignment of a query, e.g. stmt = select(...)
+            if any(_is_select_call(c) for c in ast.walk(unwrapped)):
+                select_call = next(c for c in ast.walk(unwrapped) if _is_select_call(c))
+                is_locked = _has_query_lock(unwrapped) or is_locked_line(stmt.lineno)
+                for t in targets:
+                    for name in _extract_names(t):
+                        queries[name] = (select_call, select_call.lineno, is_locked)
+
+            # Check B: Database fetch calls: db.scalar(...), db.scalars(...), db.get(...), db.execute(...)
+            if isinstance(unwrapped, ast.Call) and isinstance(unwrapped.func, ast.Attribute):
+                attr = unwrapped.func.attr
+                is_db = _is_db_or_session(unwrapped.func.value)
+
+                if is_db and attr in ("scalar", "scalars"):
+                    q_node: ast.AST = unwrapped
+                    q_line = stmt.lineno
+                    q_locked = is_locked_line(stmt.lineno)
+
+                    if unwrapped.args:
+                        arg0 = unwrapped.args[0]
+                        if isinstance(arg0, ast.Name) and arg0.id in queries:
+                            q_node, q_line, q_locked = queries[arg0.id]
+                            q_locked = q_locked or is_locked_line(stmt.lineno)
+                        elif any(_is_select_call(c) for c in ast.walk(arg0)):
+                            sel = next(c for c in ast.walk(arg0) if _is_select_call(c))
+                            q_node = sel
+                            q_line = sel.lineno
+                            q_locked = _has_query_lock(arg0) or is_locked_line(stmt.lineno)
+
+                    for t in targets:
+                        for name in _extract_names(t):
+                            entity_sources[name] = (q_node, q_line, q_locked)
+
+                elif is_db and attr in ("get", "first", "one", "one_or_none"):
+                    q_locked = _has_query_lock(unwrapped) or is_locked_line(stmt.lineno)
+                    for t in targets:
+                        for name in _extract_names(t):
+                            entity_sources[name] = (unwrapped, stmt.lineno, q_locked)
+
+                elif is_db and attr == "execute":
+                    q_node = unwrapped
+                    q_line = stmt.lineno
+                    q_locked = is_locked_line(stmt.lineno)
+
+                    if unwrapped.args:
+                        arg0 = unwrapped.args[0]
+                        if isinstance(arg0, ast.Name) and arg0.id in queries:
+                            q_node, q_line, q_locked = queries[arg0.id]
+                            q_locked = q_locked or is_locked_line(stmt.lineno)
+                        elif any(_is_select_call(c) for c in ast.walk(arg0)):
+                            sel = next(c for c in ast.walk(arg0) if _is_select_call(c))
+                            q_node = sel
+                            q_line = sel.lineno
+                            q_locked = _has_query_lock(arg0) or is_locked_line(stmt.lineno)
+
+                    for t in targets:
+                        for name in _extract_names(t):
+                            result_proxies[name] = (q_node, q_line, q_locked)
+
+                elif attr in ("scalar", "scalars", "scalar_one", "scalar_one_or_none", "first", "one", "all"):
+                    root_name = _target_root_name(unwrapped.func.value)
+                    if root_name in result_proxies:
+                        q_node, q_line, q_locked = result_proxies[root_name]
+                        ent_locked = q_locked or is_locked_line(stmt.lineno)
+                        for t in targets:
+                            for name in _extract_names(t):
+                                entity_sources[name] = (q_node, q_line, ent_locked)
+
+            # Check C: Chained execute, e.g. user = (await session.execute(stmt)).scalar_one()
+            if (
+                isinstance(unwrapped, ast.Call)
+                and isinstance(unwrapped.func, ast.Attribute)
+                and unwrapped.func.attr in ("scalar", "scalars", "scalar_one", "scalar_one_or_none", "first", "one")
+            ):
+                inner = unwrapped.func.value
+                inner_unwrapped = inner.value if isinstance(inner, ast.Await) else inner
+                if (
+                    isinstance(inner_unwrapped, ast.Call)
+                    and isinstance(inner_unwrapped.func, ast.Attribute)
+                    and inner_unwrapped.func.attr == "execute"
+                    and _is_db_or_session(inner_unwrapped.func.value)
+                    and inner_unwrapped.args
+                ):
+                    arg0 = inner_unwrapped.args[0]
+                    if isinstance(arg0, ast.Name) and arg0.id in queries:
+                        q_node, q_line, q_locked = queries[arg0.id]
+                        q_locked = q_locked or is_locked_line(stmt.lineno)
+                    elif any(_is_select_call(c) for c in ast.walk(arg0)):
+                        sel = next(c for c in ast.walk(arg0) if _is_select_call(c))
+                        q_node = sel
+                        q_line = sel.lineno
+                        q_locked = _has_query_lock(arg0) or is_locked_line(stmt.lineno)
+                    else:
+                        q_node, q_line, q_locked = inner_unwrapped, stmt.lineno, is_locked_line(stmt.lineno)
+                    for t in targets:
+                        for name in _extract_names(t):
+                            entity_sources[name] = (q_node, q_line, q_locked)
+
+            # Check D: Aliasing, e.g. u = user
+            if isinstance(unwrapped, ast.Name) and unwrapped.id in entity_sources:
+                for t in targets:
+                    for name in _extract_names(t):
+                        entity_sources[name] = entity_sources[unwrapped.id]
+
+        if not entity_sources:
+            return
+
+        # 4. Strict Def-Use Verification: detect in-memory attribute mutations of fetched entities
+        reported_entities: set[tuple[str, int]] = set()
+
+        for stmt in local_nodes:
+            if is_locked_line(getattr(stmt, "lineno", 0)):
+                continue
+
+            # Case A: AugAssign, e.g. user.balance -= amount
+            if isinstance(stmt, ast.AugAssign):
+                root = _target_root_name(stmt.target)
+                if root in entity_sources:
+                    _, q_line, is_locked = entity_sources[root]
+                    if not is_locked:
+                        reported_entities.add((root, q_line))
+
+            # Case B: Assign, e.g. user.balance = user.balance - amount or user.status = "active"
+            elif isinstance(stmt, ast.Assign):
+                for target in stmt.targets:
+                    if isinstance(target, (ast.Attribute, ast.Subscript)):
+                        root = _target_root_name(target)
+                        if root in entity_sources:
+                            is_atomic_f = any(
+                                isinstance(c, ast.Call)
+                                and (
+                                    (isinstance(c.func, ast.Name) and c.func.id == "F")
+                                    or (isinstance(c.func, ast.Attribute) and c.func.attr == "F")
+                                )
+                                for c in ast.walk(stmt.value)
+                            )
+                            if not is_atomic_f:
+                                _, q_line, is_locked = entity_sources[root]
+                                if not is_locked:
+                                    reported_entities.add((root, q_line))
+
+            # Case C: Mutating method calls, e.g. user.tags.append(...)
+            elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
+                call = stmt.value
+                if isinstance(call.func, ast.Attribute) and call.func.attr in {
+                    "append", "extend", "update", "pop", "remove", "setdefault", "clear", "add"
+                }:
+                    root = _target_root_name(call.func.value)
+                    if root in entity_sources:
+                        _, q_line, is_locked = entity_sources[root]
+                        if not is_locked:
+                            reported_entities.add((root, q_line))
+
+        # 5. Emit findings with HIGH confidence
+        reported_lines: set[int] = set()
+        for _, q_line in sorted(reported_entities, key=lambda x: x[1]):
+            if q_line not in reported_lines:
+                reported_lines.add(q_line)
+                self.findings.append(
+                    ASTFinding(
+                        rule_id="CG-001",
+                        filename=self.filename,
+                        lineno=q_line,
+                        function_name=node.name,
+                        message=(
+                            "Unlocked Read-Modify-Write Race Condition: database state is read and "
+                            "mutated without '.with_for_update()' lock before commit."
+                        ),
+                        suggested_fix_hint=(
+                            "Add '.with_for_update()' to the select statement to acquire row locks "
+                            "and prevent concurrent lost updates."
+                        ),
+                        confidence="HIGH",
+                    )
+                )
 
     def _check_cg_002(self, node: ast.AsyncFunctionDef, local_nodes: list[ast.AST]) -> None:
         """Rule CG-002: Missing Idempotency Guard on POST Routes."""
@@ -944,7 +1171,10 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         if query_calls and add_calls and has_commit:
             first_query = query_calls[0]
             first_add = add_calls[0]
-            if first_query.lineno <= first_add.lineno and not _is_commit_protected(node):
+            lock_spans = _get_lock_spans(node)
+            is_locked = _has_lock_context(node) or any(s <= first_query.lineno <= e for s, e in lock_spans)
+
+            if first_query.lineno <= first_add.lineno and not _is_commit_protected(node) and not is_locked:
                 self.findings.append(
                     ASTFinding(
                         rule_id="CG-004",
@@ -959,6 +1189,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                             "Wrap database commit in a try/except block catching "
                             "sqlalchemy.exc.IntegrityError to handle concurrent unique constraint violations safely."
                         ),
+                        confidence="HIGH",
                     )
                 )
 

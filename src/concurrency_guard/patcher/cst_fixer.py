@@ -409,7 +409,7 @@ class WithForUpdateTransformer(cst.CSTTransformer):
             return updated_node
 
         # Do not append if already contains with_for_update anywhere in chain
-        if _chain_has_with_for_update(original_node):
+        if _chain_has_with_for_update(original_node) or _chain_has_with_for_update(updated_node):
             return updated_node
 
         # Append .with_for_update()
@@ -441,6 +441,19 @@ class IdempotencyHeaderTransformer(cst.CSTTransformer):
             and original_node.name.value not in self.target_functions
         ):
             return updated_node
+
+        # Idempotency check: prevent duplicate parameter injection if already present
+        all_params = (
+            list(updated_node.params.params)
+            + list(updated_node.params.kwonly_params)
+            + list(updated_node.params.posonly_params)
+        )
+        for param in all_params:
+            param_name = param.name.value.lower()
+            if "idempotency" in param_name:
+                return updated_node
+            if param.default and "idempotency" in str(param.default).lower():
+                return updated_node
 
         parsed_fn = cst.parse_statement(
             'def _(idempotency_key: str = Header(..., alias="Idempotency-Key")): pass'
@@ -484,6 +497,19 @@ class IntegrityErrorGuardTransformer(cst.CSTTransformer):
         super().__init__()
         self.target_functions = target_functions
         self._current_func: Optional[str] = None
+        self._inside_integrity_try: int = 0
+
+    def visit_Try(self, node: cst.Try) -> bool:
+        for handler in node.handlers:
+            if handler.type is not None and "IntegrityError" in cst.Module([]).code_for_node(handler.type):
+                self._inside_integrity_try += 1
+        return True
+
+    def leave_Try(self, original_node: cst.Try, updated_node: cst.Try) -> cst.Try:
+        for handler in original_node.handlers:
+            if handler.type is not None and "IntegrityError" in cst.Module([]).code_for_node(handler.type):
+                self._inside_integrity_try = max(0, self._inside_integrity_try - 1)
+        return updated_node
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
         """Inspect function entry."""
@@ -505,7 +531,7 @@ class IntegrityErrorGuardTransformer(cst.CSTTransformer):
         self, original_node: cst.SimpleStatementLine, updated_node: cst.SimpleStatementLine
     ) -> cst.BaseStatement:
         """Replace await session.commit() with try...except IntegrityError."""
-        if not self._current_func:
+        if not self._current_func or self._inside_integrity_try > 0:
             return updated_node
 
         session_name: Optional[str] = None
@@ -658,6 +684,54 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
     findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
     skipped: list[PatchSkip] = []
 
+    def _verify_gate(
+        candidate_code: str,
+        previous_code: str,
+        rule_id: str,
+        target_funcs: set[str],
+    ) -> str:
+        """In-memory Post-Patch Verification Gate.
+
+        Guarantees:
+        1. Valid Python syntax via ast.parse().
+        2. Valid CST tree via cst.parse_module().
+        3. AST scanner executes cleanly without crashing.
+        If verification fails, abort patching candidate and return previous_code.
+        """
+        if candidate_code == previous_code:
+            return candidate_code
+
+        try:
+            ast.parse(candidate_code)
+            cst.parse_module(candidate_code)
+        except Exception as exc:  # noqa: BLE001
+            for fn in target_funcs:
+                skipped.append(
+                    PatchSkip(
+                        rule_id,
+                        fn,
+                        0,
+                        f"Post-patch syntax verification gate failed: {exc}",
+                    )
+                )
+            return previous_code
+
+        try:
+            scan_source_code(candidate_code)
+        except Exception as exc:  # noqa: BLE001
+            for fn in target_funcs:
+                skipped.append(
+                    PatchSkip(
+                        rule_id,
+                        fn,
+                        0,
+                        f"Post-patch scanner verification gate failed: {exc}",
+                    )
+                )
+            return previous_code
+
+        return candidate_code
+
     def targets_for(rule_id: str) -> set[str]:
         matches = [finding for finding in findings if finding.rule_id == rule_id]
         targets, skipped_targets = _preflight_targets(current_code, rule_id, matches)
@@ -670,9 +744,10 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
         if cg001_targets:
             tree = cst.parse_module(current_code)
             wrapper = MetadataWrapper(tree)
-            current_code = wrapper.visit(
+            candidate = wrapper.visit(
                 WithForUpdateTransformer(target_functions=cg001_targets)
             ).code
+            current_code = _verify_gate(candidate, current_code, "CG-001", cg001_targets)
             suppressions.parse_source(current_code, filepath="<memory>")
             findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
 
@@ -683,7 +758,7 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
             tree = cst.parse_module(current_code)
             tree = tree.visit(IdempotencyHeaderTransformer(target_functions=cg002_targets))
             tree = _ensure_import(tree, "fastapi", "Header")
-            current_code = tree.code
+            current_code = _verify_gate(tree.code, current_code, "CG-002", cg002_targets)
             findings = scan_source_code(current_code)
 
     # 3. CG-004: IntegrityErrorGuardTransformer
@@ -694,7 +769,7 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
             tree = tree.visit(IntegrityErrorGuardTransformer(target_functions=cg004_targets))
             tree = _ensure_import(tree, "sqlalchemy.exc", "IntegrityError")
             tree = _ensure_import(tree, "fastapi", "HTTPException")
-            current_code = tree.code
+            current_code = _verify_gate(tree.code, current_code, "CG-004", cg004_targets)
 
     # 4. CG-006: protect async shared-state mutations.
     if "CG-006" in selected_rules:
@@ -706,7 +781,8 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
                 SharedStateLockTransformer(targets, asynchronous=True)
             )
             tree = _ensure_module_import(tree, "asyncio")
-            current_code = _ensure_module_lock(tree, asynchronous=True).code
+            candidate = _ensure_module_lock(tree, asynchronous=True).code
+            current_code = _verify_gate(candidate, current_code, "CG-006", targets)
 
     # 5. CG-007: protect threaded shared-state mutations.
     if "CG-007" in selected_rules:
@@ -718,7 +794,8 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
                 SharedStateLockTransformer(targets, asynchronous=False)
             )
             tree = _ensure_module_import(tree, "threading")
-            current_code = _ensure_module_lock(tree, asynchronous=False).code
+            candidate = _ensure_module_lock(tree, asynchronous=False).code
+            current_code = _verify_gate(candidate, current_code, "CG-007", targets)
 
     # 6. CG-009 is concurrent file overwrite. CG-008 is accepted for callers
     # that used the pre-release file-rule identifier.
@@ -728,7 +805,8 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
         targets = targets_for("CG-009")
         if targets:
             tree = cst.parse_module(current_code).visit(FileLockTransformer(targets))
-            current_code = _ensure_import(tree, "filelock", "FileLock").code
+            candidate = _ensure_import(tree, "filelock", "FileLock").code
+            current_code = _verify_gate(candidate, current_code, "CG-009", targets)
 
     # 7. CG-016: lock a Django ORM fetch before its read-modify-write sequence.
     if "CG-016" in selected_rules:
@@ -736,9 +814,10 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
         findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
         targets = targets_for("CG-016")
         if targets:
-            current_code = cst.parse_module(current_code).visit(
+            candidate = cst.parse_module(current_code).visit(
                 DjangoSelectForUpdateTransformer(targets)
             ).code
+            current_code = _verify_gate(candidate, current_code, "CG-016", targets)
 
     # 8. CG-017: replace in-memory Django arithmetic with atomic F() expression
     if "CG-017" in selected_rules:
@@ -747,7 +826,8 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
         targets = targets_for("CG-017")
         if targets:
             tree = cst.parse_module(current_code).visit(DjangoFExpressionTransformer(targets))
-            current_code = _ensure_import(tree, "django.db.models", "F").code
+            candidate = _ensure_import(tree, "django.db.models", "F").code
+            current_code = _verify_gate(candidate, current_code, "CG-017", targets)
 
     ast.parse(current_code)
     cst.parse_module(current_code)
