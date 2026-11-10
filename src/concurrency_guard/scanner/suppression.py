@@ -14,10 +14,11 @@ from typing import TYPE_CHECKING, Optional, Union
 if TYPE_CHECKING:
     from concurrency_guard.scanner.ast_rules import ASTFinding
 
-# Matches # cg:ignore, # cg:ignore[CG-001], # cg:ignore-start, # cg:ignore-end, # cg:ignore-file
+# Matches # cg:ignore, # cguard: ignore, # cg:ignore[CG-001], # cguard: ignore[CG-001, CG-002],
+# # cg:ignore-start, # cguard: ignore-start, # cg:ignore-file, # cguard: ignore-file
 # with optional rationale or comment suffix.
 DIRECTIVE_RE = re.compile(
-    r"^#\s*cg:(ignore-start|ignore-end|ignore-file|ignore)(?:\[([^\]]*)\])?(?:\s+.*)?$",
+    r"^#\s*(?:cg|cguard)\s*:\s*(ignore-start|ignore-end|ignore-file|ignore)(?:\[([^\]]*)\])?(?:\s+.*)?$",
     re.IGNORECASE,
 )
 
@@ -54,9 +55,10 @@ class FileSuppressionRecord:
 
 
 class SuppressionFilter:
-    """Detects and applies # cg:ignore suppression directives to scanner findings."""
+    """Detects and applies # cg:ignore or # cguard: ignore suppression directives to scanner findings."""
 
-    def __init__(self) -> None:
+    def __init__(self, ignore_pragma: bool = False) -> None:
+        self.ignore_pragma: bool = ignore_pragma
         self.suppressed_count: int = 0
         self._file_records: dict[str, FileSuppressionRecord] = {}
         self._lock = threading.RLock()
@@ -139,6 +141,9 @@ class SuppressionFilter:
 
     def should_suppress(self, rule_id: str, filepath: Path, line_number: int) -> bool:
         """Check if finding for rule_id on filepath:line_number is suppressed."""
+        if self.ignore_pragma:
+            return False
+
         norm_path = self._normalize_path(filepath)
         with self._lock:
             record = self._file_records.get(norm_path)
@@ -176,6 +181,9 @@ class SuppressionFilter:
         file_path: Optional[Path] = None,
     ) -> list[ASTFinding]:
         """Filter findings using suppression rules and update suppressed_count."""
+        if self.ignore_pragma:
+            return list(findings)
+
         active: list[ASTFinding] = []
         for finding in findings:
             target_path = file_path if file_path is not None else Path(finding.filename)

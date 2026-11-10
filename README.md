@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v2.6.1
+# ConcurrencyGuard (`cguard`) — v2.7.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-166%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-183%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -25,6 +25,28 @@ Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **Celery**, *
 Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
+
+## 🛡️ What's New in v2.7.0: Zero-Hallucination Hardening & Compiler Verification
+
+`cguard` v2.7.0 delivers zero-hallucination precision hardening, compiler-grade sanitizers, idempotent LibCST auto-patching, and confidence scoring:
+
+1. **Strict Def-Use Taint Chain Verification (`CG-001` & `CG-004`):**
+   - Eliminates false positives by verifying that the exact query-bound entity (e.g., `user`, `wallet`, or `coupon`) undergoes an in-memory attribute mutation (`wallet.balance -= amt` or `wallet.balance = ...`) before an `await db.commit()`.
+   - Pure read-only endpoints and endpoints that only mutate unrelated local variables or metrics produce **zero findings**.
+2. **Safe-Pattern & Lock Sanitizers:**
+   - Automatically sanitizes blocks guarded by `.with_for_update()`, Django `.select_for_update()`, atomic SQL expressions (SQLAlchemy `update().values()` or Django `F()`), and distributed/async lock context managers (`async with lock:`, `async with redis.lock(...)`, `async with advisory_lock(...)`).
+   - Recognizes `try ... except IntegrityError:` blocks wrapping `.add()` + `.commit()` for `CG-004`.
+3. **Inline Pragma Noise Suppression Engine:**
+   - Supports `# cguard: ignore` (all rules on that line), `# cguard: ignore[CG-001, CG-002]` (specific rules), `# cguard: ignore-file`, `# cguard: ignore-start`, and `# cguard: ignore-end`.
+   - Added `--ignore-pragma` CLI option to bypass pragma suppressions in audit mode.
+4. **Idempotent LibCST Auto-Patcher & Post-Patch Verification Gate:**
+   - Running `cguard fix` repeatedly is 100% idempotent (no duplicate `.with_for_update()` or duplicate `Idempotency-Key` parameters).
+   - In-memory **Post-Patch Verification Gate** validates code syntax with `ast.parse()` and re-runs the scanner in-memory before writing changes to disk, aborting safely if any patch introduces errors.
+5. **Confidence Scoring & Filtering:**
+   - Findings now include confidence ratings (`HIGH` for mathematically proven taint chains, `MEDIUM` for heuristic rules like `CG-008` and `CG-010`).
+   - Added `--confidence high` filter to `cguard scan` to display only high-certainty issues.
+
+---
 
 ## 🚀 What's New in v2.6.0
 

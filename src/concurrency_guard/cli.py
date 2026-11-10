@@ -88,6 +88,16 @@ def scan(
         "-w",
         help="Number of parallel worker threads for multi-file scanning (auto-detected if omitted).",
     ),
+    confidence: Optional[str] = typer.Option(
+        None,
+        "--confidence",
+        help="Filter findings by minimum confidence level: 'high', 'medium', or 'low'.",
+    ),
+    ignore_pragma: bool = typer.Option(
+        False,
+        "--ignore-pragma",
+        help="Bypass inline '# cguard: ignore' pragma comments and report all findings.",
+    ),
 ) -> None:
     """Scan Python files or directories for concurrency vulnerabilities."""
     start_time = time.perf_counter()
@@ -114,7 +124,7 @@ def scan(
             rules_hash=rules_hash,
         )
 
-    suppression_filter = SuppressionFilter()
+    suppression_filter = SuppressionFilter(ignore_pragma=ignore_pragma)
     findings = scan_project(
         py_files,
         roots=[path] if path.is_dir() else [path.parent],
@@ -124,6 +134,17 @@ def scan(
         workers=workers,
     )
     findings = [finding for finding in findings if finding.rule_id not in config.ignore]
+
+    if confidence is not None:
+        conf_level = confidence.upper()
+        if conf_level not in {"HIGH", "MEDIUM", "LOW"}:
+            raise typer.BadParameter("confidence must be one of: high, medium, low", param_hint="--confidence")
+        allowed_conf = (
+            {"HIGH"}
+            if conf_level == "HIGH"
+            else ({"HIGH", "MEDIUM"} if conf_level == "MEDIUM" else {"HIGH", "MEDIUM", "LOW"})
+        )
+        findings = [f for f in findings if f.confidence.upper() in allowed_conf]
 
     if changed_files is not None:
         findings = [f for f in findings if Path(f.filename).resolve() in changed_files]
@@ -150,6 +171,7 @@ def scan(
                     "function_name": f.function_name,
                     "message": f.message,
                     "suggested_fix_hint": f.suggested_fix_hint,
+                    "confidence": f.confidence,
                 }
                 for f in findings
             ],
@@ -171,6 +193,7 @@ def scan(
             header_style="bold red",
         )
         table.add_column("Rule ID", style="bold yellow")
+        table.add_column("Confidence", style="bold cyan")
         table.add_column("File:Line", style="cyan")
         table.add_column("Function", style="magenta")
         table.add_column("Vulnerability Description", style="white")
@@ -179,6 +202,7 @@ def scan(
         for f in findings:
             table.add_row(
                 f.rule_id,
+                f.confidence,
                 f"{f.filename}:{f.lineno}",
                 f.function_name,
                 f.message,
