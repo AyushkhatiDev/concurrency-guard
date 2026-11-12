@@ -494,27 +494,30 @@ class IdempotencyHeaderTransformer(cst.CSTTransformer):
                 new_params_obj = updated_node.params.with_changes(kwonly_params=new_kwonly)
             else:
                 star = updated_node.params.star_arg
-                if isinstance(star.comma, cst.Comma) and isinstance(
-                    star.comma.whitespace_after, cst.ParenthesizedWhitespace
-                ):
-                    pw = star.comma.whitespace_after
-                    updated_star_comma = cst.Comma(
-                        whitespace_after=cst.ParenthesizedWhitespace(
-                            first_line=pw.first_line,
-                            empty_lines=pw.empty_lines,
-                            indent=pw.indent,
-                            last_line=cst.SimpleWhitespace("    "),
+                if isinstance(star, (cst.Param, cst.ParamStar)):
+                    if isinstance(star.comma, cst.Comma) and isinstance(
+                        star.comma.whitespace_after, cst.ParenthesizedWhitespace
+                    ):
+                        pw = star.comma.whitespace_after
+                        updated_star_comma = cst.Comma(
+                            whitespace_after=cst.ParenthesizedWhitespace(
+                                first_line=pw.first_line,
+                                empty_lines=pw.empty_lines,
+                                indent=pw.indent,
+                                last_line=cst.SimpleWhitespace("    "),
+                            )
                         )
+                        updated_star = star.with_changes(comma=updated_star_comma)
+                        new_param = new_param.with_changes(comma=star.comma)
+                    else:
+                        updated_star = star.with_changes(
+                            comma=cst.Comma(whitespace_after=cst.SimpleWhitespace(" "))
+                        )
+                    new_params_obj = updated_node.params.with_changes(
+                        star_arg=updated_star, kwonly_params=(new_param,)
                     )
-                    updated_star = star.with_changes(comma=updated_star_comma)
-                    new_param = new_param.with_changes(comma=star.comma)
                 else:
-                    updated_star = star.with_changes(
-                        comma=cst.Comma(whitespace_after=cst.SimpleWhitespace(" "))
-                    )
-                new_params_obj = updated_node.params.with_changes(
-                    star_arg=updated_star, kwonly_params=(new_param,)
-                )
+                    new_params_obj = updated_node.params.with_changes(kwonly_params=(new_param,))
         else:
             old_params = list(updated_node.params.params)
             if old_params:

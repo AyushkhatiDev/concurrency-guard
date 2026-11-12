@@ -953,13 +953,13 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                     break
             return None
 
-        assignment_pairs: list[tuple[list[ast.AST], ast.AST, int, int]] = []
+        assignment_pairs: list[tuple[list[Any], ast.AST, int, int]] = []
         for n in local_nodes:
             lineno = getattr(n, "lineno", 0)
             end_lineno = getattr(n, "end_lineno", lineno)
             if isinstance(n, ast.Assign):
-                assignment_pairs.append((n.targets, n.value, lineno, end_lineno))
-            elif (isinstance(n, ast.AnnAssign) and n.value is not None) or isinstance(n, ast.NamedExpr):
+                assignment_pairs.append((list(n.targets), n.value, lineno, end_lineno))
+            elif isinstance(n, (ast.AnnAssign, ast.NamedExpr)) and n.value is not None:
                 assignment_pairs.append(([n.target], n.value, lineno, end_lineno))
 
         assignment_pairs.sort(key=lambda x: x[2])
