@@ -10,5 +10,6 @@ build/
 .DS_Store
 .concurrency_guard_cache.db*
 *.db*
+.cguard_cache/
 
 

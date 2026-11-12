@@ -39,6 +39,7 @@ EXCLUDED_DIRS: frozenset[str] = frozenset({
     ".pytest_cache",
     ".ruff_cache",
     ".eggs",
+    ".cguard_cache",
 })
 
 
@@ -54,6 +55,8 @@ class ASTFinding:
     suggested_fix_hint: str
     confidence: str = "HIGH"
     end_lineno: Optional[int] = None
+    col_offset: Optional[int] = None
+
 
 
 @dataclass
@@ -642,6 +645,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 hint,
                 confidence,
                 end_lineno=getattr(node, "end_lineno", getattr(node, "lineno", 0)),
+                col_offset=getattr(node, "col_offset", 0),
             )
         )
 
@@ -1914,14 +1918,20 @@ def scan_file(
 ) -> list[ASTFinding]:
     """Scan a Python file for concurrency vulnerabilities, skipping unparseable files."""
     if cache_manager is not None:
-        cached = cache_manager.get_cached_findings(file_path)
-        if cached is not None:
-            from concurrency_guard.cache.manager import dict_to_finding
+        cached: Optional[list[ASTFinding]] = None
+        if hasattr(cache_manager, "get"):
+            cached = cache_manager.get(file_path)
+        elif hasattr(cache_manager, "get_cached_findings"):
+            raw_cached = cache_manager.get_cached_findings(file_path)
+            if raw_cached is not None:
+                from concurrency_guard.cache.manager import dict_to_finding
 
-            findings = [dict_to_finding(d) for d in cached]
+                cached = [dict_to_finding(d) for d in raw_cached]
+
+        if cached is not None:
             if suppression_filter is not None:
-                return suppression_filter.filter_findings(findings, file_path=file_path)
-            return SuppressionFilter().filter_findings(findings, file_path=file_path)
+                return suppression_filter.filter_findings(cached, file_path=file_path)
+            return SuppressionFilter().filter_findings(cached, file_path=file_path)
 
     try:
         source_code = file_path.read_text(encoding="utf-8-sig")
@@ -1933,14 +1943,43 @@ def scan_file(
     except (SyntaxError, ValueError):
         findings = []
 
-    if cache_manager is not None:
-        from concurrency_guard.cache.manager import finding_to_dict
-
-        cache_manager.update_cache(file_path, [finding_to_dict(f) for f in findings])
-
     filter_obj = suppression_filter or SuppressionFilter()
     filter_obj.parse_source(source_code, filepath=file_path)
-    return filter_obj.filter_findings(findings, file_path=file_path)
+    final_findings = filter_obj.filter_findings(findings, file_path=file_path)
+
+    if cache_manager is not None:
+        if hasattr(cache_manager, "set"):
+            cache_manager.set(file_path, final_findings)
+        elif hasattr(cache_manager, "update_cache"):
+            from concurrency_guard.cache.manager import finding_to_dict
+
+            cache_manager.update_cache(file_path, [finding_to_dict(f) for f in findings])
+
+    return final_findings
+
+
+def sort_findings(findings: list[ASTFinding]) -> list[ASTFinding]:
+    """Sort findings deterministically by (filename, lineno, col_offset, rule_id)."""
+    return sorted(
+        dict.fromkeys(findings),
+        key=lambda f: (
+            str(f.filename),
+            f.lineno,
+            getattr(f, "col_offset", 0) or 0,
+            f.rule_id,
+        ),
+    )
+
+
+def _scan_worker_task(
+    file_path: Path,
+    custom_rules: Optional[list[dict[str, Any]]],
+    ignore_pragma: bool,
+) -> tuple[Path, list[ASTFinding]]:
+    """Isolated, picklable worker task for parallel ProcessPoolExecutor execution."""
+    suppression = SuppressionFilter(ignore_pragma=ignore_pragma)
+    findings = scan_file(file_path, custom_rules=custom_rules, suppression_filter=suppression)
+    return file_path, findings
 
 
 def scan_directory(
@@ -1949,6 +1988,7 @@ def scan_directory(
     cache_manager: Optional[Any] = None,
     suppression_filter: Optional[SuppressionFilter] = None,
     workers: Optional[int] = None,
+    jobs: Optional[int] = None,
 ) -> list[ASTFinding]:
     """Scan a directory recursively, including cross-file call-chain analysis."""
     return scan_project(
@@ -1958,6 +1998,7 @@ def scan_directory(
         cache_manager=cache_manager,
         suppression_filter=suppression_filter,
         workers=workers,
+        jobs=jobs,
     )
 
 
@@ -1968,6 +2009,7 @@ def scan_project(
     cache_manager: Optional[Any] = None,
     suppression_filter: Optional[SuppressionFilter] = None,
     workers: Optional[int] = None,
+    jobs: Optional[int] = None,
 ) -> list[ASTFinding]:
     """Scan files and propagate shared-state hazards to transitive callers.
 
@@ -1977,34 +2019,102 @@ def scan_project(
     """
     active_filter = suppression_filter or SuppressionFilter()
 
-    findings: list[ASTFinding] = []
-    effective_workers = workers if workers and workers > 1 else (min(8, len(file_paths)) if len(file_paths) > 2 else 1)
-    if effective_workers > 1:
-        import concurrent.futures
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=effective_workers) as executor:
-            future_to_file = {
-                executor.submit(
-                    scan_file,
-                    file_path,
-                    custom_rules=custom_rules,
-                    cache_manager=cache_manager,
-                    suppression_filter=active_filter,
-                ): file_path
-                for file_path in file_paths
-            }
-            for future in concurrent.futures.as_completed(future_to_file):
-                findings.extend(future.result())
+    # Determine effective worker count
+    num_jobs = jobs if jobs is not None else workers
+    if num_jobs is not None and num_jobs > 0:
+        effective_jobs = num_jobs
     else:
+        effective_jobs = os.cpu_count() or 4
+
+    findings: list[ASTFinding] = []
+    uncached_files: list[Path] = []
+
+    # First, check cache for immediate hits
+    if cache_manager is not None:
         for file_path in file_paths:
-            findings.extend(
-                scan_file(
-                    file_path,
-                    custom_rules=custom_rules,
-                    cache_manager=cache_manager,
-                    suppression_filter=active_filter,
+            cached: Optional[list[ASTFinding]] = None
+            if hasattr(cache_manager, "get"):
+                cached = cache_manager.get(file_path)
+            elif hasattr(cache_manager, "get_cached_findings"):
+                raw_cached = cache_manager.get_cached_findings(file_path)
+                if raw_cached is not None:
+                    from concurrency_guard.cache.manager import dict_to_finding
+
+                    cached = [dict_to_finding(d) for d in raw_cached]
+
+            if cached is not None:
+                findings.extend(active_filter.filter_findings(cached, file_path=file_path))
+            else:
+                uncached_files.append(file_path)
+    else:
+        uncached_files = list(file_paths)
+
+    # Scan uncached files
+    if uncached_files:
+        if len(uncached_files) > 8 and effective_jobs > 1:
+            import concurrent.futures
+
+            try:
+                with concurrent.futures.ProcessPoolExecutor(max_workers=effective_jobs) as executor:
+                    futures = {
+                        executor.submit(
+                            _scan_worker_task,
+                            fp,
+                            custom_rules,
+                            active_filter.ignore_pragma,
+                        ): fp
+                        for fp in uncached_files
+                    }
+                    for future in concurrent.futures.as_completed(futures):
+                        fp, file_findings = future.result()
+                        if cache_manager is not None:
+                            if hasattr(cache_manager, "set"):
+                                cache_manager.set(fp, file_findings)
+                            elif hasattr(cache_manager, "update_cache"):
+                                from concurrency_guard.cache.manager import finding_to_dict
+
+                                cache_manager.update_cache(
+                                    fp, [finding_to_dict(f) for f in file_findings]
+                                )
+                        findings.extend(file_findings)
+            except Exception:  # noqa: BLE001
+                # Graceful fallback to sequential scanning
+                for file_path in uncached_files:
+                    findings.extend(
+                        scan_file(
+                            file_path,
+                            custom_rules=custom_rules,
+                            cache_manager=cache_manager,
+                            suppression_filter=active_filter,
+                        )
+                    )
+        elif effective_jobs > 1 and len(uncached_files) > 2:
+            import concurrent.futures
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=effective_jobs) as executor:
+                futures_tp = {
+                    executor.submit(
+                        scan_file,
+                        file_path,
+                        custom_rules=custom_rules,
+                        cache_manager=cache_manager,
+                        suppression_filter=active_filter,
+                    ): file_path
+                    for file_path in uncached_files
+                }
+                for future_thread in concurrent.futures.as_completed(futures_tp):
+                    findings.extend(future_thread.result())
+        else:
+            for file_path in uncached_files:
+                findings.extend(
+                    scan_file(
+                        file_path,
+                        custom_rules=custom_rules,
+                        cache_manager=cache_manager,
+                        suppression_filter=active_filter,
+                    )
                 )
-            )
+
     graph = build_call_graph(file_paths, roots=roots)
     taint_findings = find_tainted_shared_state_mutations(file_paths, graph)
     for finding in taint_findings:
@@ -2059,4 +2169,4 @@ def scan_project(
             else:
                 active_filter.suppressed_count += 1
 
-    return list(dict.fromkeys(findings))
+    return sort_findings(findings)

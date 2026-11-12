@@ -60,6 +60,7 @@ def finding_to_dict(finding: Any) -> dict[str, Any]:
         "rule_id": getattr(finding, "rule_id", ""),
         "filename": getattr(finding, "filename", ""),
         "lineno": getattr(finding, "lineno", 0),
+        "col_offset": getattr(finding, "col_offset", None),
         "function_name": getattr(finding, "function_name", ""),
         "message": getattr(finding, "message", ""),
         "suggested_fix_hint": getattr(finding, "suggested_fix_hint", ""),
@@ -81,6 +82,7 @@ def dict_to_finding(data: dict[str, Any]) -> ASTFinding:
         suggested_fix_hint=str(data.get("suggested_fix_hint", "")),
         confidence=str(data.get("confidence", "HIGH")),
         end_lineno=data.get("end_lineno"),
+        col_offset=data.get("col_offset"),
     )
 
 

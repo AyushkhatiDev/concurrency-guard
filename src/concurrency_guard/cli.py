@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import importlib.util
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -17,8 +18,8 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from concurrency_guard import __version__
+from concurrency_guard.cache.file_cache import DEFAULT_CACHE_DIR, FileCache
 from concurrency_guard.cache.manager import (
-    DEFAULT_CACHE_FILE,
     CacheManager,
     compute_rules_hash,
 )
@@ -72,6 +73,16 @@ def scan(
         help="Path to SQLite cache database (defaults to .concurrency_guard_cache.db)",
     ),
     cache: bool = typer.Option(True, "--cache/--no-cache", help="Enable or bypass incremental cache reads and writes."),
+    clear_cache: bool = typer.Option(
+        False,
+        "--clear-cache",
+        help="Wipe the incremental scan cache before scanning.",
+    ),
+    cache_dir: Optional[Path] = typer.Option(
+        None,
+        "--cache-dir",
+        help="Directory storing incremental SHA-256 cache entries (defaults to .cguard_cache).",
+    ),
     changed_only: bool = typer.Option(
         False,
         "--changed-only",
@@ -82,11 +93,17 @@ def scan(
         "--base-ref",
         help="Git base reference (e.g. origin/main, HEAD~1) to compare against for changed files.",
     ),
+    jobs: Optional[int] = typer.Option(
+        None,
+        "--jobs",
+        "-j",
+        help="Number of worker processes for parallel scanning (0 or omitted = auto-detect CPU count, 1 = single-process deterministic).",
+    ),
     workers: Optional[int] = typer.Option(
         None,
         "--workers",
         "-w",
-        help="Number of parallel worker threads for multi-file scanning (auto-detected if omitted).",
+        help="Legacy alias for --jobs.",
     ),
     confidence: Optional[str] = typer.Option(
         None,
@@ -114,15 +131,40 @@ def scan(
         repo_dir = path if path.is_dir() else path.parent
         changed_files = get_changed_python_files(repo_dir, base_ref=base_ref)
 
-    cache_mgr: Optional[CacheManager] = None
+    cache_mgr: Optional[Any] = None
+    target_cache_dir = cache_dir or DEFAULT_CACHE_DIR
+    rules_hash = compute_rules_hash(rules_path=effective_rules, custom_rules=custom_rules)
+
+    if clear_cache:
+        FileCache(cache_dir=target_cache_dir, enabled=True).clear()
+        if cache_path is not None:
+            CacheManager(
+                cache_db_path=cache_path,
+                scanner_version=__version__,
+                rules_hash=rules_hash,
+            ).clear_cache()
+
     if cache and config.cache:
-        db_file = cache_path or DEFAULT_CACHE_FILE
-        rules_hash = compute_rules_hash(rules_path=effective_rules, custom_rules=custom_rules)
-        cache_mgr = CacheManager(
-            cache_db_path=db_file,
-            scanner_version=__version__,
-            rules_hash=rules_hash,
-        )
+        if cache_path is not None:
+            cache_mgr = CacheManager(
+                cache_db_path=cache_path,
+                scanner_version=__version__,
+                rules_hash=rules_hash,
+            )
+        else:
+            cache_mgr = FileCache(
+                cache_dir=target_cache_dir,
+                version=__version__,
+                ignore_pragma=ignore_pragma,
+                rules_hash=rules_hash,
+                enabled=True,
+            )
+
+    chosen_jobs = jobs if jobs is not None else workers
+    if chosen_jobs is None or chosen_jobs == 0:
+        effective_jobs = os.cpu_count() or 4
+    else:
+        effective_jobs = max(1, chosen_jobs)
 
     suppression_filter = SuppressionFilter(ignore_pragma=ignore_pragma)
     findings = scan_project(
@@ -132,6 +174,7 @@ def scan(
         cache_manager=cache_mgr,
         suppression_filter=suppression_filter,
         workers=workers,
+        jobs=effective_jobs,
     )
     findings = [finding for finding in findings if finding.rule_id not in config.ignore]
 
@@ -150,16 +193,28 @@ def scan(
         findings = [f for f in findings if Path(f.filename).resolve() in changed_files]
         py_files = [p for p in py_files if p.resolve() in changed_files]
 
-    if cache_mgr is not None and path.is_dir():
+    if cache_mgr is not None and path.is_dir() and hasattr(cache_mgr, "purge_stale_entries"):
         cache_mgr.purge_stale_entries(set(py_files))
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000
+    elapsed_s = elapsed_ms / 1000.0
     suppressed_count = suppression_filter.suppressed_count
     suppressed_text = f" ({suppressed_count} suppressed)" if suppressed_count > 0 else ""
+
+    cache_hits = getattr(cache_mgr, "hits", 0) if cache_mgr is not None else 0
+    cache_misses = max(0, len(py_files) - cache_hits)
+
+    telemetry_summary = (
+        f"Scanned {len(py_files)} file(s) ({cache_hits} cached, {cache_misses} parsed across {effective_jobs} worker(s)) "
+        f"in {elapsed_s:.2f}s | Found {len(findings)} issue(s){suppressed_text}"
+    )
 
     if format.lower() == "json":
         payload = {
             "scanned_files": len(py_files),
+            "cache_hits": cache_hits,
+            "cache_misses": cache_misses,
+            "workers": effective_jobs,
             "elapsed_ms": round(elapsed_ms, 2),
             "findings_count": len(findings),
             "suppressed_count": suppressed_count,
@@ -168,6 +223,7 @@ def scan(
                     "rule_id": f.rule_id,
                     "filename": f.filename,
                     "lineno": f.lineno,
+                    "col_offset": getattr(f, "col_offset", None),
                     "function_name": f.function_name,
                     "message": f.message,
                     "suggested_fix_hint": f.suggested_fix_hint,
@@ -213,7 +269,7 @@ def scan(
         console.print(
             Panel(
                 f"[bold red]Found {len(findings)} concurrency vulnerability issue(s){suppressed_text}.[/bold red]\n"
-                f"[dim]Scanned {len(py_files)} file(s) in {elapsed_ms:.1f} ms | Found {len(findings)} issue(s){suppressed_text}[/dim]",
+                f"[dim]{telemetry_summary}[/dim]",
                 border_style="red",
             )
         )
@@ -222,7 +278,7 @@ def scan(
     console.print(
         Panel(
             f"[bold green]All AST concurrency checks passed. No vulnerabilities found{suppressed_text}.[/bold green]\n"
-            f"[dim]Scanned {len(py_files)} file(s) in {elapsed_ms:.1f} ms | Found 0 issue(s){suppressed_text}[/dim]",
+            f"[dim]{telemetry_summary}[/dim]",
             border_style="green",
         )
     )
