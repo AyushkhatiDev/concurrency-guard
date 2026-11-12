@@ -17,8 +17,8 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from concurrency_guard import __version__
+from concurrency_guard.cache.file_cache import DEFAULT_CACHE_DIR, FileCache
 from concurrency_guard.cache.manager import (
-    DEFAULT_CACHE_FILE,
     CacheManager,
     compute_rules_hash,
 )
@@ -72,6 +72,16 @@ def scan(
         help="Path to SQLite cache database (defaults to .concurrency_guard_cache.db)",
     ),
     cache: bool = typer.Option(True, "--cache/--no-cache", help="Enable or bypass incremental cache reads and writes."),
+    clear_cache: bool = typer.Option(
+        False,
+        "--clear-cache",
+        help="Wipe the incremental scan cache before scanning.",
+    ),
+    cache_dir: Optional[Path] = typer.Option(
+        None,
+        "--cache-dir",
+        help="Directory storing incremental SHA-256 cache entries (defaults to .cguard_cache).",
+    ),
     changed_only: bool = typer.Option(
         False,
         "--changed-only",
@@ -114,15 +124,34 @@ def scan(
         repo_dir = path if path.is_dir() else path.parent
         changed_files = get_changed_python_files(repo_dir, base_ref=base_ref)
 
-    cache_mgr: Optional[CacheManager] = None
+    cache_mgr: Optional[Any] = None
+    target_cache_dir = cache_dir or DEFAULT_CACHE_DIR
+    rules_hash = compute_rules_hash(rules_path=effective_rules, custom_rules=custom_rules)
+
+    if clear_cache:
+        FileCache(cache_dir=target_cache_dir, enabled=True).clear()
+        if cache_path is not None:
+            CacheManager(
+                cache_db_path=cache_path,
+                scanner_version=__version__,
+                rules_hash=rules_hash,
+            ).clear_cache()
+
     if cache and config.cache:
-        db_file = cache_path or DEFAULT_CACHE_FILE
-        rules_hash = compute_rules_hash(rules_path=effective_rules, custom_rules=custom_rules)
-        cache_mgr = CacheManager(
-            cache_db_path=db_file,
-            scanner_version=__version__,
-            rules_hash=rules_hash,
-        )
+        if cache_path is not None:
+            cache_mgr = CacheManager(
+                cache_db_path=cache_path,
+                scanner_version=__version__,
+                rules_hash=rules_hash,
+            )
+        else:
+            cache_mgr = FileCache(
+                cache_dir=target_cache_dir,
+                version=__version__,
+                ignore_pragma=ignore_pragma,
+                rules_hash=rules_hash,
+                enabled=True,
+            )
 
     suppression_filter = SuppressionFilter(ignore_pragma=ignore_pragma)
     findings = scan_project(
@@ -150,7 +179,7 @@ def scan(
         findings = [f for f in findings if Path(f.filename).resolve() in changed_files]
         py_files = [p for p in py_files if p.resolve() in changed_files]
 
-    if cache_mgr is not None and path.is_dir():
+    if cache_mgr is not None and path.is_dir() and hasattr(cache_mgr, "purge_stale_entries"):
         cache_mgr.purge_stale_entries(set(py_files))
 
     elapsed_ms = (time.perf_counter() - start_time) * 1000

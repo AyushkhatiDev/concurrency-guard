@@ -39,6 +39,7 @@ EXCLUDED_DIRS: frozenset[str] = frozenset({
     ".pytest_cache",
     ".ruff_cache",
     ".eggs",
+    ".cguard_cache",
 })
 
 
@@ -54,6 +55,8 @@ class ASTFinding:
     suggested_fix_hint: str
     confidence: str = "HIGH"
     end_lineno: Optional[int] = None
+    col_offset: Optional[int] = None
+
 
 
 @dataclass
@@ -642,6 +645,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 hint,
                 confidence,
                 end_lineno=getattr(node, "end_lineno", getattr(node, "lineno", 0)),
+                col_offset=getattr(node, "col_offset", 0),
             )
         )
 
@@ -1914,14 +1918,20 @@ def scan_file(
 ) -> list[ASTFinding]:
     """Scan a Python file for concurrency vulnerabilities, skipping unparseable files."""
     if cache_manager is not None:
-        cached = cache_manager.get_cached_findings(file_path)
-        if cached is not None:
-            from concurrency_guard.cache.manager import dict_to_finding
+        cached: Optional[list[ASTFinding]] = None
+        if hasattr(cache_manager, "get"):
+            cached = cache_manager.get(file_path)
+        elif hasattr(cache_manager, "get_cached_findings"):
+            raw_cached = cache_manager.get_cached_findings(file_path)
+            if raw_cached is not None:
+                from concurrency_guard.cache.manager import dict_to_finding
 
-            findings = [dict_to_finding(d) for d in cached]
+                cached = [dict_to_finding(d) for d in raw_cached]
+
+        if cached is not None:
             if suppression_filter is not None:
-                return suppression_filter.filter_findings(findings, file_path=file_path)
-            return SuppressionFilter().filter_findings(findings, file_path=file_path)
+                return suppression_filter.filter_findings(cached, file_path=file_path)
+            return SuppressionFilter().filter_findings(cached, file_path=file_path)
 
     try:
         source_code = file_path.read_text(encoding="utf-8-sig")
@@ -1933,14 +1943,19 @@ def scan_file(
     except (SyntaxError, ValueError):
         findings = []
 
-    if cache_manager is not None:
-        from concurrency_guard.cache.manager import finding_to_dict
-
-        cache_manager.update_cache(file_path, [finding_to_dict(f) for f in findings])
-
     filter_obj = suppression_filter or SuppressionFilter()
     filter_obj.parse_source(source_code, filepath=file_path)
-    return filter_obj.filter_findings(findings, file_path=file_path)
+    final_findings = filter_obj.filter_findings(findings, file_path=file_path)
+
+    if cache_manager is not None:
+        if hasattr(cache_manager, "set"):
+            cache_manager.set(file_path, final_findings)
+        elif hasattr(cache_manager, "update_cache"):
+            from concurrency_guard.cache.manager import finding_to_dict
+
+            cache_manager.update_cache(file_path, [finding_to_dict(f) for f in findings])
+
+    return final_findings
 
 
 def scan_directory(
