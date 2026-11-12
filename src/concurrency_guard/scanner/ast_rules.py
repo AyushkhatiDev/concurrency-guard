@@ -22,12 +22,23 @@ from concurrency_guard.scanner.taint_tracker import (
 EXCLUDED_DIRS: frozenset[str] = frozenset({
     ".venv",
     "venv",
+    "env",
+    ".env",
     "__pycache__",
     "node_modules",
     "build",
     "dist",
     "migrations",
     "alembic",
+    ".git",
+    ".hg",
+    ".svn",
+    ".tox",
+    ".nox",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".eggs",
 })
 
 
@@ -42,6 +53,7 @@ class ASTFinding:
     message: str
     suggested_fix_hint: str
     confidence: str = "HIGH"
+    end_lineno: Optional[int] = None
 
 
 @dataclass
@@ -99,17 +111,29 @@ def _is_lock_expr(node: ast.AST) -> bool:
     return any(k in name for k in ("lock", "semaphore", "mutex", "advisory_lock", "redis_lock", "redlock"))
 
 
+_SCOPE_BOUNDARY_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Lambda)
+
+
+def _walk_local_nodes(node: ast.AST, include_self: bool = True) -> Iterator[ast.AST]:
+    """Walk node and child nodes without descending into nested function definitions, classes, or lambdas."""
+    if include_self:
+        yield node
+    for child in ast.iter_child_nodes(node):
+        if not isinstance(child, _SCOPE_BOUNDARY_TYPES):
+            yield from _walk_local_nodes(child, include_self=True)
+
+
 def _get_lock_spans(node: ast.AST) -> list[tuple[int, int]]:
     """Return (start_line, end_line) spans for all with/async-with statements holding locks."""
     spans: list[tuple[int, int]] = []
-    for child in ast.walk(node):
+    for child in _walk_local_nodes(node, include_self=isinstance(node, (ast.With, ast.AsyncWith))):
         if isinstance(child, (ast.With, ast.AsyncWith)):
             for item in child.items:
                 if _is_lock_expr(item.context_expr):
                     start = child.lineno
                     end = getattr(child, "end_lineno", None)
                     if end is None:
-                        end = max([getattr(c, "lineno", start) for c in ast.walk(child)] + [start])
+                        end = max([getattr(c, "lineno", start) for c in _walk_local_nodes(child, include_self=True)] + [start])
                     spans.append((start, end))
     return spans
 
@@ -117,7 +141,7 @@ def _get_lock_spans(node: ast.AST) -> list[tuple[int, int]]:
 def _lock_names(node: ast.AST) -> list[str]:
     """Find names held by with/async-with statements, preserving nesting order."""
     names: list[str] = []
-    for child in ast.walk(node):
+    for child in _walk_local_nodes(node, include_self=isinstance(node, (ast.With, ast.AsyncWith))):
         if isinstance(child, (ast.With, ast.AsyncWith)):
             for item in child.items:
                 if _is_lock_expr(item.context_expr):
@@ -138,7 +162,7 @@ def _assignment_target_name(node: ast.AST) -> str:
 
 def _mutated_targets(node: ast.AST) -> set[str]:
     targets: set[str] = set()
-    for child in ast.walk(node):
+    for child in _walk_local_nodes(node, include_self=True):
         if isinstance(child, ast.AugAssign):
             targets.add(_assignment_target_name(child.target))
         elif isinstance(child, ast.Assign):
@@ -207,14 +231,6 @@ def _literal_path(call: ast.Call) -> Optional[str]:
     if call.args and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str):
         return call.args[0].value
     return None
-
-
-def _walk_local_nodes(node: ast.AST) -> Iterator[ast.AST]:
-    """Walk child nodes without descending into nested function definitions."""
-    for child in ast.iter_child_nodes(node):
-        yield child
-        if not isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            yield from _walk_local_nodes(child)
 
 
 def _is_matching_binop_mutation(stmt: ast.Assign) -> bool:
@@ -336,7 +352,7 @@ def _find_loop_execute_calls(node: ast.AST, in_loop: bool = False) -> list[ast.C
     """Find db/session execute, scalar, scalars, or get calls directly within loop bodies."""
     calls: list[ast.Call] = []
     for child in ast.iter_child_nodes(node):
-        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        if isinstance(child, _SCOPE_BOUNDARY_TYPES):
             continue
 
         if (
@@ -374,12 +390,10 @@ def _catches_integrity_error(try_node: ast.Try) -> bool:
 
 def _is_commit_protected(node: ast.AsyncFunctionDef) -> bool:
     """Check if any commit call is wrapped in a try/except catching IntegrityError."""
-    for child in ast.walk(node):
-        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)) and child is not node:
-            continue
+    for child in _walk_local_nodes(node):
         if isinstance(child, ast.Try) and _catches_integrity_error(child):
             for stmt in child.body:
-                for sub in ast.walk(stmt):
+                for sub in _walk_local_nodes(stmt):
                     if _is_commit_call(sub):
                         return True
     return False
@@ -627,6 +641,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 message,
                 hint,
                 confidence,
+                end_lineno=getattr(node, "end_lineno", getattr(node, "lineno", 0)),
             )
         )
 
@@ -804,12 +819,12 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         if memcached_non_atomic and any(".get" in _expr_name(c.func).lower() for c in calls):
             self._add("CG-012", memcached_non_atomic[0], node.name, "Memcached get/set increment is non-atomic.", "Use Memcached incr/decr or a compare-and-swap workflow.")
 
-        for with_node in (n for n in ast.walk(node) if isinstance(n, (ast.With, ast.AsyncWith))):
+        for with_node in (n for n in _walk_local_nodes(node) if isinstance(n, (ast.With, ast.AsyncWith))):
             outer = [_expr_name(item.context_expr) for item in with_node.items if _is_lock_expr(item.context_expr)]
             for lname in outer:
                 if lname:
                     self.function_locks[node.name].add(lname)
-            for call_child in (n for n in ast.walk(with_node) if isinstance(n, ast.Call)):
+            for call_child in (n for n in _walk_local_nodes(with_node) if isinstance(n, ast.Call)):
                 callee_expr = _expr_name(call_child.func)
                 callee_base = callee_expr.split(".")[-1]
                 for olock in outer:
@@ -829,7 +844,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         )
                     seen_locks.add(l)
 
-            for nested in (n for n in ast.walk(with_node) if n is not with_node and isinstance(n, (ast.With, ast.AsyncWith))):
+            for nested in (n for n in _walk_local_nodes(with_node) if n is not with_node and isinstance(n, (ast.With, ast.AsyncWith))):
                 inner = [_expr_name(item.context_expr) for item in nested.items if _is_lock_expr(item.context_expr)]
                 for first in outer:
                     for second in inner:
@@ -902,9 +917,10 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             return any(s <= lineno <= e for s, e in lock_spans)
 
         # 3. Build symbol def-use maps for queries and entity variables
-        queries: dict[str, tuple[ast.AST, int, bool]] = {}
-        result_proxies: dict[str, tuple[ast.AST, int, bool]] = {}
-        entity_sources: dict[str, tuple[ast.AST, int, bool]] = {}
+        # Maps name -> (q_node, q_line, q_end_line, has_db_lock)
+        queries: dict[str, tuple[ast.AST, int, int, bool]] = {}
+        result_proxies: dict[str, tuple[ast.AST, int, int, bool]] = {}
+        entity_sources: dict[str, tuple[ast.AST, int, int, bool]] = {}
 
         def _has_query_lock(expr: ast.AST) -> bool:
             return any(
@@ -915,6 +931,8 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         def _extract_names(target: ast.AST) -> list[str]:
             if isinstance(target, ast.Name):
                 return [target.id]
+            if isinstance(target, ast.Starred):
+                return _extract_names(target.value)
             if isinstance(target, (ast.Tuple, ast.List)):
                 res: list[str] = []
                 for elt in target.elts:
@@ -922,14 +940,31 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 return res
             return []
 
-        assign_stmts = sorted(
-            [n for n in local_nodes if isinstance(n, (ast.Assign, ast.AnnAssign))],
-            key=lambda x: getattr(x, "lineno", 0),
-        )
+        def _extract_query_execute(call_node: ast.AST) -> Optional[ast.Call]:
+            """Unwind result proxy method chain (.scalars().all(), .scalar_one(), .first(), etc.) to the underlying db.execute() call."""
+            curr = call_node
+            while isinstance(curr, ast.Call) and isinstance(curr.func, ast.Attribute):
+                if curr.func.attr == "execute" and _is_db_or_session(curr.func.value):
+                    return curr
+                if curr.func.attr in ("scalar", "scalars", "scalar_one", "scalar_one_or_none", "first", "one", "all"):
+                    inner = curr.func.value
+                    curr = inner.value if isinstance(inner, ast.Await) else inner
+                else:
+                    break
+            return None
 
-        for stmt in assign_stmts:
-            targets = stmt.targets if isinstance(stmt, ast.Assign) else [stmt.target]
-            val = stmt.value
+        assignment_pairs: list[tuple[list[ast.AST], ast.AST, int, int]] = []
+        for n in local_nodes:
+            lineno = getattr(n, "lineno", 0)
+            end_lineno = getattr(n, "end_lineno", lineno)
+            if isinstance(n, ast.Assign):
+                assignment_pairs.append((n.targets, n.value, lineno, end_lineno))
+            elif (isinstance(n, ast.AnnAssign) and n.value is not None) or isinstance(n, ast.NamedExpr):
+                assignment_pairs.append(([n.target], n.value, lineno, end_lineno))
+
+        assignment_pairs.sort(key=lambda x: x[2])
+
+        for targets, val, stmt_lineno, stmt_end_lineno in assignment_pairs:
             if val is None:
                 continue
 
@@ -938,10 +973,12 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             # Check A: Assignment of a query, e.g. stmt = select(...)
             if any(_is_select_call(c) for c in ast.walk(unwrapped)):
                 select_call = next(c for c in ast.walk(unwrapped) if _is_select_call(c))
-                is_locked = _has_query_lock(unwrapped) or is_locked_line(stmt.lineno)
+                has_db_lock = _has_query_lock(unwrapped)
+                sel_line = getattr(select_call, "lineno", stmt_lineno)
+                sel_end = max(getattr(select_call, "end_lineno", sel_line), stmt_end_lineno)
                 for t in targets:
                     for name in _extract_names(t):
-                        queries[name] = (select_call, select_call.lineno, is_locked)
+                        queries[name] = (select_call, sel_line, sel_end, has_db_lock)
 
             # Check B: Database fetch calls: db.scalar(...), db.scalars(...), db.get(...), db.execute(...)
             if isinstance(unwrapped, ast.Call) and isinstance(unwrapped.func, ast.Attribute):
@@ -950,88 +987,85 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
                 if is_db and attr in ("scalar", "scalars"):
                     q_node: ast.AST = unwrapped
-                    q_line = stmt.lineno
-                    q_locked = is_locked_line(stmt.lineno)
+                    q_line = stmt_lineno
+                    q_end_line = max(getattr(unwrapped, "end_lineno", stmt_lineno), stmt_end_lineno)
+                    q_db_locked = False
 
                     if unwrapped.args:
                         arg0 = unwrapped.args[0]
                         if isinstance(arg0, ast.Name) and arg0.id in queries:
-                            q_node, q_line, q_locked = queries[arg0.id]
-                            q_locked = q_locked or is_locked_line(stmt.lineno)
+                            q_node, q_line, q_end_line, q_db_locked = queries[arg0.id]
+                            q_end_line = max(q_end_line, stmt_end_lineno)
                         elif any(_is_select_call(c) for c in ast.walk(arg0)):
                             sel = next(c for c in ast.walk(arg0) if _is_select_call(c))
                             q_node = sel
-                            q_line = sel.lineno
-                            q_locked = _has_query_lock(arg0) or is_locked_line(stmt.lineno)
+                            q_line = getattr(sel, "lineno", stmt_lineno)
+                            q_end_line = max(getattr(sel, "end_lineno", q_line), stmt_end_lineno)
+                            q_db_locked = _has_query_lock(arg0)
 
                     for t in targets:
                         for name in _extract_names(t):
-                            entity_sources[name] = (q_node, q_line, q_locked)
+                            entity_sources[name] = (q_node, q_line, q_end_line, q_db_locked)
 
                 elif is_db and attr in ("get", "first", "one", "one_or_none"):
-                    q_locked = _has_query_lock(unwrapped) or is_locked_line(stmt.lineno)
+                    q_db_locked = _has_query_lock(unwrapped)
+                    q_end = max(getattr(unwrapped, "end_lineno", stmt_lineno), stmt_end_lineno)
                     for t in targets:
                         for name in _extract_names(t):
-                            entity_sources[name] = (unwrapped, stmt.lineno, q_locked)
+                            entity_sources[name] = (unwrapped, stmt_lineno, q_end, q_db_locked)
 
                 elif is_db and attr == "execute":
                     q_node = unwrapped
-                    q_line = stmt.lineno
-                    q_locked = is_locked_line(stmt.lineno)
+                    q_line = stmt_lineno
+                    q_end_line = max(getattr(unwrapped, "end_lineno", stmt_lineno), stmt_end_lineno)
+                    q_db_locked = False
 
                     if unwrapped.args:
                         arg0 = unwrapped.args[0]
                         if isinstance(arg0, ast.Name) and arg0.id in queries:
-                            q_node, q_line, q_locked = queries[arg0.id]
-                            q_locked = q_locked or is_locked_line(stmt.lineno)
+                            q_node, q_line, q_end_line, q_db_locked = queries[arg0.id]
+                            q_end_line = max(q_end_line, stmt_end_lineno)
                         elif any(_is_select_call(c) for c in ast.walk(arg0)):
                             sel = next(c for c in ast.walk(arg0) if _is_select_call(c))
                             q_node = sel
-                            q_line = sel.lineno
-                            q_locked = _has_query_lock(arg0) or is_locked_line(stmt.lineno)
+                            q_line = getattr(sel, "lineno", stmt_lineno)
+                            q_end_line = max(getattr(sel, "end_lineno", q_line), stmt_end_lineno)
+                            q_db_locked = _has_query_lock(arg0)
 
                     for t in targets:
                         for name in _extract_names(t):
-                            result_proxies[name] = (q_node, q_line, q_locked)
+                            result_proxies[name] = (q_node, q_line, q_end_line, q_db_locked)
 
                 elif attr in ("scalar", "scalars", "scalar_one", "scalar_one_or_none", "first", "one", "all"):
                     root_name = _target_root_name(unwrapped.func.value)
                     if root_name in result_proxies:
-                        q_node, q_line, q_locked = result_proxies[root_name]
-                        ent_locked = q_locked or is_locked_line(stmt.lineno)
+                        q_node, q_line, q_end_line, q_db_locked = result_proxies[root_name]
+                        q_end_line = max(q_end_line, stmt_end_lineno)
                         for t in targets:
                             for name in _extract_names(t):
-                                entity_sources[name] = (q_node, q_line, ent_locked)
+                                entity_sources[name] = (q_node, q_line, q_end_line, q_db_locked)
 
-            # Check C: Chained execute, e.g. user = (await session.execute(stmt)).scalar_one()
-            if (
-                isinstance(unwrapped, ast.Call)
-                and isinstance(unwrapped.func, ast.Attribute)
-                and unwrapped.func.attr in ("scalar", "scalars", "scalar_one", "scalar_one_or_none", "first", "one")
-            ):
-                inner = unwrapped.func.value
-                inner_unwrapped = inner.value if isinstance(inner, ast.Await) else inner
-                if (
-                    isinstance(inner_unwrapped, ast.Call)
-                    and isinstance(inner_unwrapped.func, ast.Attribute)
-                    and inner_unwrapped.func.attr == "execute"
-                    and _is_db_or_session(inner_unwrapped.func.value)
-                    and inner_unwrapped.args
-                ):
-                    arg0 = inner_unwrapped.args[0]
-                    if isinstance(arg0, ast.Name) and arg0.id in queries:
-                        q_node, q_line, q_locked = queries[arg0.id]
-                        q_locked = q_locked or is_locked_line(stmt.lineno)
-                    elif any(_is_select_call(c) for c in ast.walk(arg0)):
-                        sel = next(c for c in ast.walk(arg0) if _is_select_call(c))
-                        q_node = sel
-                        q_line = sel.lineno
-                        q_locked = _has_query_lock(arg0) or is_locked_line(stmt.lineno)
-                    else:
-                        q_node, q_line, q_locked = inner_unwrapped, stmt.lineno, is_locked_line(stmt.lineno)
-                    for t in targets:
-                        for name in _extract_names(t):
-                            entity_sources[name] = (q_node, q_line, q_locked)
+            # Check C: Chained execute, e.g. user = (await session.execute(stmt)).scalar_one() or .scalars().all()
+            exec_call = _extract_query_execute(unwrapped)
+            if exec_call is not None and exec_call.args:
+                arg0 = exec_call.args[0]
+                if isinstance(arg0, ast.Name) and arg0.id in queries:
+                    q_node, q_line, q_end_line, q_db_locked = queries[arg0.id]
+                    q_end_line = max(q_end_line, stmt_end_lineno)
+                elif any(_is_select_call(c) for c in ast.walk(arg0)):
+                    sel = next(c for c in ast.walk(arg0) if _is_select_call(c))
+                    q_node = sel
+                    q_line = getattr(sel, "lineno", stmt_lineno)
+                    q_end_line = max(getattr(sel, "end_lineno", q_line), stmt_end_lineno)
+                    q_db_locked = _has_query_lock(arg0)
+                else:
+                    q_node = exec_call
+                    q_line = stmt_lineno
+                    q_end_line = stmt_end_lineno
+                    q_db_locked = False
+                for t in targets:
+                    for name in _extract_names(t):
+                        entity_sources[name] = (q_node, q_line, q_end_line, q_db_locked)
 
             # Check D: Aliasing, e.g. u = user
             if isinstance(unwrapped, ast.Name) and unwrapped.id in entity_sources:
@@ -1043,19 +1077,21 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             return
 
         # 4. Strict Def-Use Verification: detect in-memory attribute mutations of fetched entities
-        reported_entities: set[tuple[str, int]] = set()
+        # Each entry is (root_var, q_line, q_end_line)
+        reported_entities: set[tuple[str, int, int]] = set()
 
         for stmt in local_nodes:
-            if is_locked_line(getattr(stmt, "lineno", 0)):
+            stmt_line = getattr(stmt, "lineno", 0)
+            if is_locked_line(stmt_line):
                 continue
 
             # Case A: AugAssign, e.g. user.balance -= amount
             if isinstance(stmt, ast.AugAssign):
                 root = _target_root_name(stmt.target)
                 if root in entity_sources:
-                    _, q_line, is_locked = entity_sources[root]
-                    if not is_locked:
-                        reported_entities.add((root, q_line))
+                    _, q_line, q_end_line, q_db_locked = entity_sources[root]
+                    if not q_db_locked:
+                        reported_entities.add((root, q_line, q_end_line))
 
             # Case B: Assign, e.g. user.balance = user.balance - amount or user.status = "active"
             elif isinstance(stmt, ast.Assign):
@@ -1072,9 +1108,9 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                                 for c in ast.walk(stmt.value)
                             )
                             if not is_atomic_f:
-                                _, q_line, is_locked = entity_sources[root]
-                                if not is_locked:
-                                    reported_entities.add((root, q_line))
+                                _, q_line, q_end_line, q_db_locked = entity_sources[root]
+                                if not q_db_locked:
+                                    reported_entities.add((root, q_line, q_end_line))
 
             # Case C: Mutating method calls, e.g. user.tags.append(...)
             elif isinstance(stmt, ast.Expr) and isinstance(stmt.value, ast.Call):
@@ -1084,13 +1120,13 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 }:
                     root = _target_root_name(call.func.value)
                     if root in entity_sources:
-                        _, q_line, is_locked = entity_sources[root]
-                        if not is_locked:
-                            reported_entities.add((root, q_line))
+                        _, q_line, q_end_line, q_db_locked = entity_sources[root]
+                        if not q_db_locked:
+                            reported_entities.add((root, q_line, q_end_line))
 
         # 5. Emit findings with HIGH confidence
         reported_lines: set[int] = set()
-        for _, q_line in sorted(reported_entities, key=lambda x: x[1]):
+        for _, q_line, q_end_line in sorted(reported_entities, key=lambda x: x[1]):
             if q_line not in reported_lines:
                 reported_lines.add(q_line)
                 self.findings.append(
@@ -1108,6 +1144,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                             "and prevent concurrent lost updates."
                         ),
                         confidence="HIGH",
+                        end_lineno=q_end_line,
                     )
                 )
 
@@ -1141,6 +1178,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         "Require an 'Idempotency-Key' header in FastAPI request parameters "
                         "to prevent duplicate submissions on network retries."
                     ),
+                    end_lineno=getattr(node, "end_lineno", node.lineno),
                 )
             )
 
@@ -1159,6 +1197,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         "Move the query outside the loop or use joinedload/selectinload "
                         "to fetch related data in a single batch query."
                     ),
+                    end_lineno=getattr(call, "end_lineno", call.lineno),
                 )
             )
 
@@ -1166,32 +1205,39 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         """Rule CG-004: Check-Then-Act Uniqueness Race."""
         query_calls = [n for n in local_nodes if isinstance(n, ast.Call) and _is_query_call(n)]
         add_calls = [n for n in local_nodes if isinstance(n, ast.Call) and _is_add_call(n)]
-        has_commit = any(_is_commit_call(n) for n in local_nodes)
+        commit_calls = [n for n in local_nodes if isinstance(n, ast.Call) and _is_commit_call(n)]
 
-        if query_calls and add_calls and has_commit:
+        if query_calls and add_calls and commit_calls:
             first_query = query_calls[0]
             first_add = add_calls[0]
-            lock_spans = _get_lock_spans(node)
-            is_locked = _has_lock_context(node) or any(s <= first_query.lineno <= e for s, e in lock_spans)
+            last_commit = commit_calls[-1]
 
-            if first_query.lineno <= first_add.lineno and not _is_commit_protected(node) and not is_locked:
-                self.findings.append(
-                    ASTFinding(
-                        rule_id="CG-004",
-                        filename=self.filename,
-                        lineno=first_query.lineno,
-                        function_name=node.name,
-                        message=(
-                            "Check-Then-Act Uniqueness Race: select() existence check followed by "
-                            "add() and commit() without catching IntegrityError."
-                        ),
-                        suggested_fix_hint=(
-                            "Wrap database commit in a try/except block catching "
-                            "sqlalchemy.exc.IntegrityError to handle concurrent unique constraint violations safely."
-                        ),
-                        confidence="HIGH",
-                    )
+            if first_query.lineno <= first_add.lineno and not _is_commit_protected(node):
+                lock_spans = _get_lock_spans(node)
+                is_safely_locked = any(
+                    s <= first_query.lineno and last_commit.lineno <= e
+                    for s, e in lock_spans
                 )
+
+                if not is_safely_locked:
+                    self.findings.append(
+                        ASTFinding(
+                            rule_id="CG-004",
+                            filename=self.filename,
+                            lineno=first_query.lineno,
+                            function_name=node.name,
+                            message=(
+                                "Check-Then-Act Uniqueness Race: select() existence check followed by "
+                                "add() and commit() without catching IntegrityError."
+                            ),
+                            suggested_fix_hint=(
+                                "Wrap database commit in a try/except block catching "
+                                "sqlalchemy.exc.IntegrityError to handle concurrent unique constraint violations safely."
+                            ),
+                            confidence="HIGH",
+                            end_lineno=getattr(first_query, "end_lineno", first_query.lineno),
+                        )
+                    )
 
     def _check_cg_005(
         self,
@@ -1233,6 +1279,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         "Add 'acks_late=True' to the Celery task decorator and enforce an "
                         "idempotency lock before executing database commits or external POST calls on retry."
                     ),
+                    end_lineno=getattr(node, "end_lineno", node.lineno),
                 )
             )
 
@@ -1692,7 +1739,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         saved_aliases, saved_context = self.aliases, self.context_stack
         self.aliases, self.context_stack = {}, []
         try:
-            local_nodes = list(_walk_local_nodes(node))
+            local_nodes = list(_walk_local_nodes(node, include_self=False))
             self._check_cg_005(node, local_nodes)
             self._check_cg_016(node, local_nodes)
             self._check_cg_017(node, local_nodes)
@@ -1710,7 +1757,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         saved_aliases, saved_context = self.aliases, self.context_stack
         self.aliases, self.context_stack = {}, []
         try:
-            local_nodes = list(_walk_local_nodes(node))
+            local_nodes = list(_walk_local_nodes(node, include_self=False))
             self._check_cg_001(node, local_nodes)
             self._check_cg_002(node, local_nodes)
             self._check_cg_003(node)
@@ -1783,7 +1830,7 @@ def _custom_rule_findings(tree: ast.AST, filename: str, rules: list[dict[str, An
     """
     findings: list[ASTFinding] = []
     for function in (n for n in ast.walk(tree) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))):
-        nodes = list(_walk_local_nodes(function))
+        nodes = list(_walk_local_nodes(function, include_self=False))
         calls = {_expr_name(n.func) for n in nodes if isinstance(n, ast.Call)}
         modified = _mutated_targets(function)
         contexts = {_expr_name(item.context_expr) for n in ast.walk(function) if isinstance(n, (ast.With, ast.AsyncWith)) for item in n.items}
@@ -1877,13 +1924,13 @@ def scan_file(
             return SuppressionFilter().filter_findings(findings, file_path=file_path)
 
     try:
-        source_code = file_path.read_text(encoding="utf-8")
+        source_code = file_path.read_text(encoding="utf-8-sig")
     except (UnicodeDecodeError, OSError):
         return []
 
     try:
         findings = scan_source_code(source_code, filename=str(file_path), custom_rules=custom_rules)
-    except SyntaxError:
+    except (SyntaxError, ValueError):
         findings = []
 
     if cache_manager is not None:

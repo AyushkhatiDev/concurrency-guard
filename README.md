@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v2.7.0
+# ConcurrencyGuard (`cguard`) — v2.8.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-183%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-191%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -25,6 +25,28 @@ Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **Celery**, *
 Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
+
+## 🛡️ What's New in v2.8.0: Compiler Hardening & AST/CST Edge-Case Resilience
+
+`cguard` v2.8.0 delivers an exhaustive systems reliability and compiler hardening release:
+
+1. **LibCST Parameter Ordering & `**kwargs` Safety (`IdempotencyHeaderTransformer`):**
+   - Automatically injects header parameters before `**kwargs` (`star_kwarg`) and respects `params` vs. `kwonly_params` when positional-only `/`, keyword-only `*`, or `*args` are present.
+   - Guarantees `cguard fix` never triggers `SyntaxError: non-default argument follows default argument` or places parameters after `**kwargs`.
+2. **Multi-Finding Line-Number Drift Immunity:**
+   - Sequential transformer passes in `cguard fix` dynamically re-evaluate the source AST and suppression boundaries, eliminating coordinate drift when multi-line insertions alter line counts in single files.
+3. **Lexical Scope Boundary Isolation:**
+   - Replaced raw AST walks with boundary-aware scope iteration (`_walk_local_nodes`) that prevents traversal into nested `FunctionDef`, `AsyncFunctionDef`, `ClassDef`, and `Lambda` expressions. Inner helper locks and mutations cannot falsely sanitize or contaminate enclosing routes.
+4. **Walrus Operator (`:=`) & Starred Unpacking Support (`CG-001`):**
+   - Tracks assignments embedded within expressions (`if (coupon := await db.scalar(...)):`) and unpackings (`primary, *others = ...`) into the def-use taint graph.
+5. **Exact Span-Bounded Lock Sanitizers (`CG-001` & `CG-004`):**
+   - Enforces that critical operations must occur strictly within active lock spans `[start, end]`. Unrelated prior locks or queries outside locks are not falsely marked safe.
+6. **Multi-Line Span Pragma Suppression Engine:**
+   - Pragma comments placed on any continuation line or ending boundary of multi-line queries and statements correctly suppress findings across the entire span.
+7. **Directory & UTF-8 BOM Resilience:**
+   - Added exclusion filters for `.git`, `.tox`, `.nox`, `.mypy_cache`, `.pytest_cache`, `.eggs`, and `env`. Handles UTF-8 byte-order marks (`utf-8-sig`) transparently.
+
+---
 
 ## 🛡️ What's New in v2.7.0: Zero-Hallucination Hardening & Compiler Verification
 
