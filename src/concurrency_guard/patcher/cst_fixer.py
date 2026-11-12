@@ -461,33 +461,93 @@ class IdempotencyHeaderTransformer(cst.CSTTransformer):
         assert isinstance(parsed_fn, cst.FunctionDef)
         new_param = parsed_fn.params.params[0]
 
-        old_params = list(updated_node.params.params)
-        if old_params:
-            last = old_params[-1]
-            if isinstance(last.comma, cst.Comma) and isinstance(
-                last.comma.whitespace_after, cst.ParenthesizedWhitespace
-            ):
-                pw = last.comma.whitespace_after
-                updated_prev_comma = cst.Comma(
-                    whitespace_after=cst.ParenthesizedWhitespace(
-                        first_line=pw.first_line,
-                        empty_lines=pw.empty_lines,
-                        indent=pw.indent,
-                        last_line=cst.SimpleWhitespace("    "),
-                    )
-                )
-                old_params[-1] = last.with_changes(comma=updated_prev_comma)
-                new_param = new_param.with_changes(comma=last.comma)
-                new_params = tuple(old_params + [new_param])
-            else:
-                old_params[-1] = last.with_changes(
-                    comma=cst.Comma(whitespace_after=cst.SimpleWhitespace(" "))
-                )
-                new_params = tuple(old_params + [new_param])
-        else:
-            new_params = (new_param,)
+        has_star_arg = (
+            updated_node.params.star_arg is not None
+            and not isinstance(updated_node.params.star_arg, cst.MaybeSentinel)
+        )
+        has_kwonly = bool(updated_node.params.kwonly_params)
 
-        return updated_node.with_changes(params=updated_node.params.with_changes(params=new_params))
+        if has_star_arg or has_kwonly:
+            if updated_node.params.kwonly_params:
+                old_kwonly = list(updated_node.params.kwonly_params)
+                last = old_kwonly[-1]
+                if isinstance(last.comma, cst.Comma) and isinstance(
+                    last.comma.whitespace_after, cst.ParenthesizedWhitespace
+                ):
+                    pw = last.comma.whitespace_after
+                    updated_prev_comma = cst.Comma(
+                        whitespace_after=cst.ParenthesizedWhitespace(
+                            first_line=pw.first_line,
+                            empty_lines=pw.empty_lines,
+                            indent=pw.indent,
+                            last_line=cst.SimpleWhitespace("    "),
+                        )
+                    )
+                    old_kwonly[-1] = last.with_changes(comma=updated_prev_comma)
+                    new_param = new_param.with_changes(comma=last.comma)
+                    new_kwonly = tuple(old_kwonly + [new_param])
+                else:
+                    old_kwonly[-1] = last.with_changes(
+                        comma=cst.Comma(whitespace_after=cst.SimpleWhitespace(" "))
+                    )
+                    new_kwonly = tuple(old_kwonly + [new_param])
+                new_params_obj = updated_node.params.with_changes(kwonly_params=new_kwonly)
+            else:
+                star = updated_node.params.star_arg
+                if isinstance(star.comma, cst.Comma) and isinstance(
+                    star.comma.whitespace_after, cst.ParenthesizedWhitespace
+                ):
+                    pw = star.comma.whitespace_after
+                    updated_star_comma = cst.Comma(
+                        whitespace_after=cst.ParenthesizedWhitespace(
+                            first_line=pw.first_line,
+                            empty_lines=pw.empty_lines,
+                            indent=pw.indent,
+                            last_line=cst.SimpleWhitespace("    "),
+                        )
+                    )
+                    updated_star = star.with_changes(comma=updated_star_comma)
+                    new_param = new_param.with_changes(comma=star.comma)
+                else:
+                    updated_star = star.with_changes(
+                        comma=cst.Comma(whitespace_after=cst.SimpleWhitespace(" "))
+                    )
+                new_params_obj = updated_node.params.with_changes(
+                    star_arg=updated_star, kwonly_params=(new_param,)
+                )
+        else:
+            old_params = list(updated_node.params.params)
+            if old_params:
+                last = old_params[-1]
+                if isinstance(last.comma, cst.Comma) and isinstance(
+                    last.comma.whitespace_after, cst.ParenthesizedWhitespace
+                ):
+                    pw = last.comma.whitespace_after
+                    updated_prev_comma = cst.Comma(
+                        whitespace_after=cst.ParenthesizedWhitespace(
+                            first_line=pw.first_line,
+                            empty_lines=pw.empty_lines,
+                            indent=pw.indent,
+                            last_line=cst.SimpleWhitespace("    "),
+                        )
+                    )
+                    old_params[-1] = last.with_changes(comma=updated_prev_comma)
+                    new_param = new_param.with_changes(comma=last.comma)
+                    new_params = tuple(old_params + [new_param])
+                else:
+                    old_params[-1] = last.with_changes(
+                        comma=cst.Comma(whitespace_after=cst.SimpleWhitespace(" "))
+                    )
+                    new_params = tuple(old_params + [new_param])
+            else:
+                if updated_node.params.star_kwarg is not None:
+                    new_param = new_param.with_changes(
+                        comma=cst.Comma(whitespace_after=cst.SimpleWhitespace(" "))
+                    )
+                new_params = (new_param,)
+            new_params_obj = updated_node.params.with_changes(params=new_params)
+
+        return updated_node.with_changes(params=new_params_obj)
 
 
 class IntegrityErrorGuardTransformer(cst.CSTTransformer):
@@ -680,8 +740,6 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
     selected_rules = rules if rules is not None else {"CG-001", "CG-002", "CG-004", "CG-006", "CG-007", "CG-009", "CG-016", "CG-017"}
     current_code = source_code
     suppressions = SuppressionFilter()
-    suppressions.parse_source(current_code, filepath="<memory>")
-    findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
     skipped: list[PatchSkip] = []
 
     def _verify_gate(
@@ -733,7 +791,9 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
         return candidate_code
 
     def targets_for(rule_id: str) -> set[str]:
-        matches = [finding for finding in findings if finding.rule_id == rule_id]
+        suppressions.parse_source(current_code, filepath="<memory>")
+        current_findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
+        matches = [finding for finding in current_findings if finding.rule_id == rule_id]
         targets, skipped_targets = _preflight_targets(current_code, rule_id, matches)
         skipped.extend(skipped_targets)
         return targets
@@ -748,8 +808,6 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
                 WithForUpdateTransformer(target_functions=cg001_targets)
             ).code
             current_code = _verify_gate(candidate, current_code, "CG-001", cg001_targets)
-            suppressions.parse_source(current_code, filepath="<memory>")
-            findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
 
     # 2. CG-002: IdempotencyHeaderTransformer
     if "CG-002" in selected_rules:
@@ -759,7 +817,6 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
             tree = tree.visit(IdempotencyHeaderTransformer(target_functions=cg002_targets))
             tree = _ensure_import(tree, "fastapi", "Header")
             current_code = _verify_gate(tree.code, current_code, "CG-002", cg002_targets)
-            findings = scan_source_code(current_code)
 
     # 3. CG-004: IntegrityErrorGuardTransformer
     if "CG-004" in selected_rules:
@@ -773,8 +830,6 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
 
     # 4. CG-006: protect async shared-state mutations.
     if "CG-006" in selected_rules:
-        suppressions.parse_source(current_code, filepath="<memory>")
-        findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
         targets = targets_for("CG-006")
         if targets:
             tree = cst.parse_module(current_code).visit(
@@ -786,8 +841,6 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
 
     # 5. CG-007: protect threaded shared-state mutations.
     if "CG-007" in selected_rules:
-        suppressions.parse_source(current_code, filepath="<memory>")
-        findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
         targets = targets_for("CG-007")
         if targets:
             tree = cst.parse_module(current_code).visit(
@@ -800,8 +853,6 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
     # 6. CG-009 is concurrent file overwrite. CG-008 is accepted for callers
     # that used the pre-release file-rule identifier.
     if {"CG-008", "CG-009"}.intersection(selected_rules):
-        suppressions.parse_source(current_code, filepath="<memory>")
-        findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
         targets = targets_for("CG-009")
         if targets:
             tree = cst.parse_module(current_code).visit(FileLockTransformer(targets))
@@ -810,8 +861,6 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
 
     # 7. CG-016: lock a Django ORM fetch before its read-modify-write sequence.
     if "CG-016" in selected_rules:
-        suppressions.parse_source(current_code, filepath="<memory>")
-        findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
         targets = targets_for("CG-016")
         if targets:
             candidate = cst.parse_module(current_code).visit(
@@ -821,8 +870,6 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
 
     # 8. CG-017: replace in-memory Django arithmetic with atomic F() expression
     if "CG-017" in selected_rules:
-        suppressions.parse_source(current_code, filepath="<memory>")
-        findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
         targets = targets_for("CG-017")
         if targets:
             tree = cst.parse_module(current_code).visit(DjangoFExpressionTransformer(targets))

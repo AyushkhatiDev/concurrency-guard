@@ -139,8 +139,14 @@ class SuppressionFilter:
             source_code = ""
         return self.parse_source(source_code, filepath=filepath)
 
-    def should_suppress(self, rule_id: str, filepath: Path, line_number: int) -> bool:
-        """Check if finding for rule_id on filepath:line_number is suppressed."""
+    def should_suppress(
+        self,
+        rule_id: str,
+        filepath: Path,
+        line_number: int,
+        end_line_number: Optional[int] = None,
+    ) -> bool:
+        """Check if finding for rule_id on filepath:[line_number, end_line_number] is suppressed."""
         if self.ignore_pragma:
             return False
 
@@ -162,15 +168,18 @@ class SuppressionFilter:
         if "*" in record.file_rules or rule_upper in record.file_rules:
             return True
 
-        # 2. Line-level suppression
-        if line_number in record.line_rules:
-            target_rules = record.line_rules[line_number]
-            if "*" in target_rules or rule_upper in target_rules:
-                return True
+        end_line = end_line_number if end_line_number is not None and end_line_number >= line_number else line_number
 
-        # 3. Block-level suppression
+        # 2. Line-level suppression (checked across any line in the finding's span)
+        for ln in range(line_number, end_line + 1):
+            if ln in record.line_rules:
+                target_rules = record.line_rules[ln]
+                if "*" in target_rules or rule_upper in target_rules:
+                    return True
+
+        # 3. Block-level suppression (overlaps with [line_number, end_line])
         for start, end, block_rules in record.block_rules:
-            if start <= line_number <= end and ("*" in block_rules or rule_upper in block_rules):
+            if not (end < line_number or start > end_line) and ("*" in block_rules or rule_upper in block_rules):
                 return True
 
         return False
@@ -187,7 +196,8 @@ class SuppressionFilter:
         active: list[ASTFinding] = []
         for finding in findings:
             target_path = file_path if file_path is not None else Path(finding.filename)
-            if self.should_suppress(finding.rule_id, target_path, finding.lineno):
+            end_line = getattr(finding, "end_lineno", None)
+            if self.should_suppress(finding.rule_id, target_path, finding.lineno, end_line):
                 with self._lock:
                     self.suppressed_count += 1
             else:

@@ -428,7 +428,7 @@ def fix(
             continue
 
         try:
-            source_code = target.read_text(encoding="utf-8")
+            source_code = target.read_text(encoding="utf-8-sig")
         except (OSError, UnicodeDecodeError):
             continue
 

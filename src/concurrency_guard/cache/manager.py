@@ -64,6 +64,7 @@ def finding_to_dict(finding: Any) -> dict[str, Any]:
         "message": getattr(finding, "message", ""),
         "suggested_fix_hint": getattr(finding, "suggested_fix_hint", ""),
         "confidence": getattr(finding, "confidence", "HIGH"),
+        "end_lineno": getattr(finding, "end_lineno", None),
     }
 
 
@@ -79,6 +80,7 @@ def dict_to_finding(data: dict[str, Any]) -> ASTFinding:
         message=str(data.get("message", "")),
         suggested_fix_hint=str(data.get("suggested_fix_hint", "")),
         confidence=str(data.get("confidence", "HIGH")),
+        end_lineno=data.get("end_lineno"),
     )
 
 
