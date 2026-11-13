@@ -27,7 +27,6 @@ from concurrency_guard.config import load_project_config
 from concurrency_guard.patcher.cst_fixer import apply_all_fixes
 from concurrency_guard.patcher.diff_utils import DiffGenerator, colorize_diff
 from concurrency_guard.reporter.github_pr import generate_github_pr_markdown
-from concurrency_guard.reporter.sarif import findings_to_sarif
 from concurrency_guard.runner.barrier_engine import (
     BarrierResult,
     DynamicBarrierResult,
@@ -35,6 +34,7 @@ from concurrency_guard.runner.barrier_engine import (
     run_dynamic_barrier_verification,
 )
 from concurrency_guard.runner.runtime_verifier import verify_function
+from concurrency_guard.sarif import serialize_sarif
 from concurrency_guard.scanner.ast_rules import (
     discover_python_files,
     load_yaml_rules,
@@ -65,6 +65,12 @@ def scan(
         "table",
         "--format",
         help="Output format: 'table', 'json', or 'sarif'",
+    ),
+    output: Optional[Path] = typer.Option(
+        None,
+        "--output",
+        "-o",
+        help="Write scan report directly to an output file (e.g. results.sarif or report.json).",
     ),
     rules: Optional[Path] = typer.Option(None, "--rules", help="YAML file containing custom concurrency rules"),
     cache_path: Optional[Path] = typer.Option(
@@ -209,7 +215,19 @@ def scan(
         f"in {elapsed_s:.2f}s | Found {len(findings)} issue(s){suppressed_text}"
     )
 
-    if format.lower() == "json":
+    if format.lower() == "sarif" or (output is not None and output.suffix.lower() == ".sarif"):
+        sarif_text = serialize_sarif(
+            findings,
+            workspace_root=path if path.is_dir() else path.parent,
+        )
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(sarif_text, encoding="utf-8")
+        else:
+            typer.echo(sarif_text)
+        raise typer.Exit(code=1 if findings else 0)
+
+    if format.lower() == "json" or (output is not None and output.suffix.lower() == ".json"):
         payload = {
             "scanned_files": len(py_files),
             "cache_hits": cache_hits,
@@ -232,15 +250,24 @@ def scan(
                 for f in findings
             ],
         }
-        typer.echo(json.dumps(payload, indent=2))
-        raise typer.Exit(code=1 if findings else 0)
-
-    if format.lower() == "sarif":
-        typer.echo(json.dumps(findings_to_sarif(findings), indent=2))
+        json_text = json.dumps(payload, indent=2)
+        if output is not None:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json_text, encoding="utf-8")
+        else:
+            typer.echo(json_text)
         raise typer.Exit(code=1 if findings else 0)
 
     if format.lower() != "table":
         raise typer.BadParameter("format must be one of: table, json, sarif", param_hint="--format")
+
+    if output is not None:
+        output.parent.mkdir(parents=True, exist_ok=True)
+        summary_lines = [
+            f"[{f.rule_id}] {f.filename}:{f.lineno} {f.function_name}: {f.message} (Fix: {f.suggested_fix_hint})"
+            for f in findings
+        ]
+        output.write_text("\n".join(summary_lines) + ("\n" if summary_lines else ""), encoding="utf-8")
 
     if findings:
         table = Table(
