@@ -1,0 +1,39 @@
+name: ConcurrencyGuard Security Scan
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  schedule:
+    - cron: '30 2 * * 1'
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+  concurrency-guard:
+    name: Concurrency & Race Condition Scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install ConcurrencyGuard
+        run: pip install --upgrade concurrency-guard
+
+      - name: Run ConcurrencyGuard SARIF Scan
+        run: cguard scan . --format sarif --output cguard.sarif || true
+
+      - name: Upload SARIF to GitHub Code Scanning
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: cguard.sarif
+          category: concurrency-guard
