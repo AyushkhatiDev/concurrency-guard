@@ -200,3 +200,267 @@ def build_call_graph(files: list[Path], roots: Optional[list[Path]] = None) -> C
                             )
                         )
     return graph
+
+
+@dataclass
+class FunctionSummary:
+    """Pre-analysis summary for a module-level local function."""
+
+    name: str
+    is_async: bool
+    returns_unlocked_entity: bool = False
+    returns_locked_entity: bool = False
+    mutated_param_indices: set[int] = field(default_factory=set)
+    mutated_param_names: set[str] = field(default_factory=set)
+    performs_commit: bool = False
+    acquires_lock_context: bool = False
+
+
+def _is_ast_query_call(node: ast.AST) -> bool:
+    """Check if AST node represents an ORM read query."""
+    if not isinstance(node, ast.Call):
+        return False
+    name = _dotted_name(node.func)
+    if "select" in name:
+        return True
+    return bool(any(name.endswith(suffix) for suffix in (".get", ".scalar", ".scalars", ".first", ".one", ".one_or_none", ".all", ".execute")))
+
+
+def _has_ast_query_lock(node: ast.AST) -> bool:
+    """Check if AST node contains .with_for_update() or .select_for_update()."""
+    return any(
+        isinstance(c, ast.Attribute) and c.attr in ("with_for_update", "select_for_update")
+        for c in ast.walk(node)
+    )
+
+
+def _is_ast_commit_call(node: ast.AST) -> bool:
+    """Check if AST node represents a database commit or save."""
+    if not isinstance(node, ast.Call):
+        return False
+    if isinstance(node.func, ast.Attribute):
+        return node.func.attr in ("commit", "flush", "save", "asave")
+    return False
+
+
+def _has_ast_lock_context(with_node: Union[ast.With, ast.AsyncWith]) -> bool:
+    """Check if a with/async with block manages a concurrency lock or transaction."""
+    for item in with_node.items:
+        expr_str = _dotted_name(item.context_expr).lower()
+        if any(term in expr_str for term in ("lock", "advisory", "redis", "mutex", "atomic", "semaphore")):
+            return True
+        for child in ast.walk(item.context_expr):
+            if isinstance(child, ast.Name) and any(term in child.id.lower() for term in ("lock", "mutex")):
+                return True
+            if isinstance(child, ast.Attribute) and any(term in child.attr.lower() for term in ("lock", "atomic")):
+                return True
+    return False
+
+
+def _extract_target_root_name(target: ast.AST) -> str:
+    """Extract root identifier name from an assignment target (e.g. user.balance -> user)."""
+    curr = target
+    while isinstance(curr, (ast.Attribute, ast.Subscript)):
+        curr = curr.value
+    if isinstance(curr, ast.Name):
+        return curr.id
+    return ""
+
+
+def analyze_module_functions(tree: ast.Module) -> dict[str, FunctionSummary]:
+    """Perform a fast, cycle-safe module-level function summary pass over all functions."""
+    summaries: dict[str, FunctionSummary] = {}
+    function_nodes: dict[str, Union[ast.FunctionDef, ast.AsyncFunctionDef]] = {}
+    local_calls_by_func: dict[str, list[ast.Call]] = defaultdict(list)
+
+    # 1. Collect all local top-level and class methods
+    for item in tree.body:
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            function_nodes[item.name] = item
+        elif isinstance(item, ast.ClassDef):
+            for method in item.body:
+                if isinstance(method, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    function_nodes[method.name] = method
+
+    # 2. Compute base summary for each function
+    for func_name, func_node in function_nodes.items():
+        is_async = isinstance(func_node, ast.AsyncFunctionDef)
+        summary = FunctionSummary(name=func_name, is_async=is_async)
+
+        # Check decorators for @transaction.atomic or lock decorators
+        for dec in func_node.decorator_list:
+            dec_name = _dotted_name(dec).lower()
+            if "atomic" in dec_name or "lock" in dec_name:
+                summary.acquires_lock_context = True
+
+        # Map function parameters
+        param_names: list[str] = [arg.arg for arg in func_node.args.args]
+        param_to_idx: dict[str, int] = {arg.arg: idx for idx, arg in enumerate(func_node.args.args)}
+        for kw_arg in func_node.args.kwonlyargs:
+            param_names.append(kw_arg.arg)
+            param_to_idx[kw_arg.arg] = len(param_names) - 1
+
+        # Track parameter aliases inside function: alias -> param_name
+        param_aliases: dict[str, str] = {p: p for p in param_names}
+
+        # Track local variable query sources: var_name -> (is_query, is_locked)
+        var_query_sources: dict[str, tuple[bool, bool]] = {}
+
+        # Scan function body for statements
+        for node in ast.walk(func_node):
+            # Record local helper calls
+            if isinstance(node, ast.Call):
+                call_name = _dotted_name(node.func)
+                if call_name in function_nodes:
+                    local_calls_by_func[func_name].append(node)
+
+            # Check commits
+            if _is_ast_commit_call(node):
+                summary.performs_commit = True
+
+            # Check lock contexts
+            if isinstance(node, (ast.With, ast.AsyncWith)) and _has_ast_lock_context(node):
+                summary.acquires_lock_context = True
+
+            # Track variable assignments
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        val = node.value.value if isinstance(node.value, ast.Await) else node.value
+                        if isinstance(val, ast.Name) and val.id in param_aliases:
+                            param_aliases[target.id] = param_aliases[val.id]
+                        if _is_ast_query_call(val):
+                            has_lock = _has_ast_query_lock(val)
+                            var_query_sources[target.id] = (True, has_lock)
+            elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None and isinstance(node.target, ast.Name):
+                val = node.value.value if isinstance(node.value, ast.Await) else node.value
+                if isinstance(val, ast.Name) and val.id in param_aliases:
+                    param_aliases[node.target.id] = param_aliases[val.id]
+                if _is_ast_query_call(val):
+                    has_lock = _has_ast_query_lock(val)
+                    var_query_sources[node.target.id] = (True, has_lock)
+
+            # Check parameter mutations (AugAssign: user.balance -= 50)
+            if isinstance(node, ast.AugAssign):
+                root = _extract_target_root_name(node.target)
+                if root in param_aliases:
+                    param = param_aliases[root]
+                    summary.mutated_param_names.add(param)
+                    if param in param_to_idx:
+                        summary.mutated_param_indices.add(param_to_idx[param])
+
+            # Check parameter mutations (Assign: user.balance = ..., user.status = ...)
+            elif isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, (ast.Attribute, ast.Subscript)):
+                        root = _extract_target_root_name(target)
+                        if root in param_aliases:
+                            param = param_aliases[root]
+                            summary.mutated_param_names.add(param)
+                            if param in param_to_idx:
+                                summary.mutated_param_indices.add(param_to_idx[param])
+
+            # Check mutating method calls: user.tags.append(...)
+            elif isinstance(node, ast.Expr) and isinstance(node.value, ast.Call):
+                call = node.value
+                if isinstance(call.func, ast.Attribute) and call.func.attr in {
+                    "append", "extend", "update", "pop", "remove", "clear", "setdefault", "add"
+                }:
+                    root = _extract_target_root_name(call.func.value)
+                    if root in param_aliases:
+                        param = param_aliases[root]
+                        summary.mutated_param_names.add(param)
+                        if param in param_to_idx:
+                            summary.mutated_param_indices.add(param_to_idx[param])
+
+            # Check return statements
+            if isinstance(node, ast.Return) and node.value is not None:
+                ret_val = node.value.value if isinstance(node.value, ast.Await) else node.value
+                if _is_ast_query_call(ret_val):
+                    if _has_ast_query_lock(ret_val):
+                        summary.returns_locked_entity = True
+                    else:
+                        summary.returns_unlocked_entity = True
+                elif isinstance(ret_val, ast.Name) and ret_val.id in var_query_sources:
+                    is_q, has_lock = var_query_sources[ret_val.id]
+                    if is_q:
+                        if has_lock:
+                            summary.returns_locked_entity = True
+                        else:
+                            summary.returns_unlocked_entity = True
+
+        summaries[func_name] = summary
+
+    # 3. Transitive Fixed-Point Propagation (max 3 iterations, cycle-safe)
+    for _ in range(3):
+        changed = False
+        for func_name, summary in summaries.items():
+            func_node = function_nodes[func_name]
+            param_to_idx = {arg.arg: idx for idx, arg in enumerate(func_node.args.args)}
+
+            for call in local_calls_by_func.get(func_name, []):
+                callee_name = _dotted_name(call.func)
+                callee_summary = summaries.get(callee_name)
+                if callee_summary is None:
+                    continue
+
+                # Propagate commit delegation
+                if callee_summary.performs_commit and not summary.performs_commit:
+                    summary.performs_commit = True
+                    changed = True
+
+                # Propagate lock context
+                if callee_summary.acquires_lock_context and not summary.acquires_lock_context:
+                    summary.acquires_lock_context = True
+                    changed = True
+
+                # Propagate parameter mutation through helper argument passing
+                for arg_idx, arg in enumerate(call.args):
+                    if isinstance(arg, ast.Name) and arg.id in param_to_idx and arg_idx in callee_summary.mutated_param_indices:
+                        caller_idx = param_to_idx[arg.id]
+                        if caller_idx not in summary.mutated_param_indices:
+                            summary.mutated_param_indices.add(caller_idx)
+                            summary.mutated_param_names.add(arg.id)
+                            changed = True
+
+                # Check keyword arguments for parameter mutation
+                for kw in call.keywords:
+                    if kw.arg and isinstance(kw.value, ast.Name) and kw.value.id in param_to_idx and kw.arg in callee_summary.mutated_param_names:
+                        caller_idx = param_to_idx[kw.value.id]
+                        if caller_idx not in summary.mutated_param_indices:
+                            summary.mutated_param_indices.add(caller_idx)
+                            summary.mutated_param_names.add(kw.value.id)
+                            changed = True
+
+            # Propagate return values if returning local helper call
+            for ret_node in (n for n in ast.walk(func_node) if isinstance(n, ast.Return)):
+                if ret_node.value is not None:
+                    val = ret_node.value.value if isinstance(ret_node.value, ast.Await) else ret_node.value
+                    if isinstance(val, ast.Call):
+                        callee = _dotted_name(val.func)
+                        if callee in summaries:
+                            callee_sum = summaries[callee]
+                            if callee_sum.returns_locked_entity and not summary.returns_locked_entity:
+                                summary.returns_locked_entity = True
+                                changed = True
+                            if callee_sum.returns_unlocked_entity and not summary.returns_unlocked_entity:
+                                summary.returns_unlocked_entity = True
+                                changed = True
+
+        if not changed:
+            break
+
+    return summaries
+
+
+def build_module_function_summaries(source_code_or_tree: Union[str, ast.Module]) -> dict[str, FunctionSummary]:
+    """Helper to parse source code or use existing AST to generate function summaries."""
+    if isinstance(source_code_or_tree, str):
+        try:
+            tree = ast.parse(source_code_or_tree)
+        except (SyntaxError, ValueError):
+            return {}
+    else:
+        tree = source_code_or_tree
+    return analyze_module_functions(tree)
+

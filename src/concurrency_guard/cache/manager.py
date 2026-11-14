@@ -48,7 +48,7 @@ def compute_rules_hash(
             return hasher.hexdigest()
         except (TypeError, ValueError):
             pass
-    hasher.update(b"builtin_rules_default")
+    hasher.update(b"builtin_rules_default_call_graph_v2.12")
     return hasher.hexdigest()
 
 
