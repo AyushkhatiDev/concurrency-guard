@@ -102,6 +102,16 @@ def _preflight_targets(source_code: str, rule_id: str, findings: list[ASTFinding
             skipped.append(PatchSkip(rule_id, function_name, lineno, "select_for_update() must be added inside transaction.atomic() manually."))
         else:
             safe.add(function_name)
+            if rule_id == "CG-001":
+                for n in ast.walk(function):
+                    if getattr(n, "lineno", 0) == lineno and isinstance(n, ast.Call):
+                        callee = ""
+                        if isinstance(n.func, ast.Name):
+                            callee = n.func.id
+                        elif isinstance(n.func, ast.Attribute):
+                            callee = n.func.attr
+                        if callee and callee in functions:
+                            safe.add(callee)
 
     skipped_names = {item.function_name for item in skipped}
     return safe - skipped_names, skipped
