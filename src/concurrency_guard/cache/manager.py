@@ -33,8 +33,9 @@ def compute_cache_key(file_bytes: bytes, scanner_version: str, rules_hash: str) 
 def compute_rules_hash(
     rules_path: Optional[Path] = None,
     custom_rules: Optional[list[dict[str, Any]]] = None,
+    config: Optional[Any] = None,
 ) -> str:
-    """Compute deterministic hash for rule configuration."""
+    """Compute deterministic hash for rule and config configuration."""
     hasher = hashlib.sha256()
     if rules_path is not None and rules_path.is_file():
         try:
@@ -48,7 +49,15 @@ def compute_rules_hash(
             return hasher.hexdigest()
         except (TypeError, ValueError):
             pass
-    hasher.update(b"builtin_rules_default_call_graph_v2.12")
+    if config is not None:
+        if hasattr(config, "deterministic_hash"):
+            hasher.update(config.deterministic_hash().encode("utf-8"))
+        elif isinstance(config, dict):
+            try:
+                hasher.update(json.dumps(config, sort_keys=True).encode("utf-8"))
+            except (TypeError, ValueError):
+                pass
+    hasher.update(b"builtin_rules_default_config_v2.13")
     return hasher.hexdigest()
 
 
