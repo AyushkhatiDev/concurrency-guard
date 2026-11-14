@@ -113,8 +113,21 @@ def _expr_name(node: ast.AST) -> str:
     return ""
 
 
-def _is_lock_expr(node: ast.AST) -> bool:
+def _is_lock_expr(
+    node: ast.AST,
+    custom_lock_names: Optional[Union[list[str], set[str]]] = None,
+) -> bool:
     name = _expr_name(node).lower()
+    if custom_lock_names:
+        for cname in custom_lock_names:
+            c_low = cname.lower()
+            if c_low in name:
+                return True
+            for child in ast.walk(node):
+                if isinstance(child, ast.Name) and c_low in child.id.lower():
+                    return True
+                if isinstance(child, ast.Attribute) and c_low in child.attr.lower():
+                    return True
     return any(k in name for k in ("lock", "semaphore", "mutex", "advisory_lock", "redis_lock", "redlock"))
 
 
@@ -130,13 +143,16 @@ def _walk_local_nodes(node: ast.AST, include_self: bool = True) -> Iterator[ast.
             yield from _walk_local_nodes(child, include_self=True)
 
 
-def _get_lock_spans(node: ast.AST) -> list[tuple[int, int]]:
+def _get_lock_spans(
+    node: ast.AST,
+    custom_lock_names: Optional[Union[list[str], set[str]]] = None,
+) -> list[tuple[int, int]]:
     """Return (start_line, end_line) spans for all with/async-with statements holding locks."""
     spans: list[tuple[int, int]] = []
     for child in _walk_local_nodes(node, include_self=isinstance(node, (ast.With, ast.AsyncWith))):
         if isinstance(child, (ast.With, ast.AsyncWith)):
             for item in child.items:
-                if _is_lock_expr(item.context_expr):
+                if _is_lock_expr(item.context_expr, custom_lock_names=custom_lock_names):
                     start = child.lineno
                     end = getattr(child, "end_lineno", None)
                     if end is None:
@@ -145,20 +161,26 @@ def _get_lock_spans(node: ast.AST) -> list[tuple[int, int]]:
     return spans
 
 
-def _lock_names(node: ast.AST) -> list[str]:
+def _lock_names(
+    node: ast.AST,
+    custom_lock_names: Optional[Union[list[str], set[str]]] = None,
+) -> list[str]:
     """Find names held by with/async-with statements, preserving nesting order."""
     names: list[str] = []
     for child in _walk_local_nodes(node, include_self=isinstance(node, (ast.With, ast.AsyncWith))):
         if isinstance(child, (ast.With, ast.AsyncWith)):
             for item in child.items:
-                if _is_lock_expr(item.context_expr):
+                if _is_lock_expr(item.context_expr, custom_lock_names=custom_lock_names):
                     name = _expr_name(item.context_expr)
                     names.append(name or "<lock>")
     return names
 
 
-def _has_lock_context(node: ast.AST) -> bool:
-    return bool(_lock_names(node))
+def _has_lock_context(
+    node: ast.AST,
+    custom_lock_names: Optional[Union[list[str], set[str]]] = None,
+) -> bool:
+    return bool(_lock_names(node, custom_lock_names=custom_lock_names))
 
 
 def _assignment_target_name(node: ast.AST) -> str:
@@ -511,8 +533,18 @@ def _helper_name(func_expr: ast.AST) -> str:
 class ConcurrencyASTVisitor(ast.NodeVisitor):
     """AST visitor detecting concurrency race conditions and idempotency issues."""
 
-    def __init__(self, filename: str = "<memory>", tree: Optional[ast.AST] = None) -> None:
+    def __init__(
+        self,
+        filename: str = "<memory>",
+        tree: Optional[ast.AST] = None,
+        config: Optional[Any] = None,
+        custom_lock_names: Optional[Union[list[str], set[str]]] = None,
+    ) -> None:
         self.filename = filename
+        self.config = config
+        self.custom_lock_names: set[str] = set(custom_lock_names or [])
+        if config is not None and hasattr(config, "custom_lock_names"):
+            self.custom_lock_names.update(config.custom_lock_names)
         self.findings: list[ASTFinding] = []
         self.shared_names: set[str] = set()
         self.thread_targets: set[str] = set()
@@ -523,7 +555,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         self.function_locks: dict[str, set[str]] = defaultdict(set)
         self.calls_under_lock: list[tuple[str, str, str, int]] = []
         self.function_summaries: dict[str, FunctionSummary] = (
-            analyze_module_functions(tree) if isinstance(tree, ast.Module) else {}
+            analyze_module_functions(tree, custom_lock_names=self.custom_lock_names) if isinstance(tree, ast.Module) else {}
         )
 
     def _is_reentrant(self, name: str) -> bool:
@@ -552,14 +584,16 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
     def is_in_async_lock(self) -> bool:
         """Return True if currently inside an active async with lock/semaphore block."""
         return any(
-            isinstance(ctx, ast.AsyncWith) and any(_is_lock_expr(item.context_expr) for item in ctx.items)
+            isinstance(ctx, ast.AsyncWith)
+            and any(_is_lock_expr(item.context_expr, self.custom_lock_names) for item in ctx.items)
             for ctx in self.context_stack
         )
 
     def is_in_sync_lock(self) -> bool:
         """Return True if currently inside an active with lock/semaphore block."""
         return any(
-            isinstance(ctx, ast.With) and any(_is_lock_expr(item.context_expr) for item in ctx.items)
+            isinstance(ctx, ast.With)
+            and any(_is_lock_expr(item.context_expr, self.custom_lock_names) for item in ctx.items)
             for ctx in self.context_stack
         )
 
@@ -619,7 +653,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
     def visit_Module(self, node: ast.Module) -> None:
         """Collect module shared state and thread entry points before functions."""
         if not self.function_summaries:
-            self.function_summaries = analyze_module_functions(node)
+            self.function_summaries = analyze_module_functions(node, custom_lock_names=self.custom_lock_names)
         for statement in node.body:
             if isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 value = statement.value
@@ -938,7 +972,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             return
 
         # 2. Collect lock spans: statements inside locks are safe
-        lock_spans = _get_lock_spans(node)
+        lock_spans = _get_lock_spans(node, custom_lock_names=self.custom_lock_names)
 
         def is_locked_line(lineno: int) -> bool:
             return any(s <= lineno <= e for s, e in lock_spans)
@@ -1300,7 +1334,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             last_commit = commit_calls[-1]
 
             if first_query.lineno <= first_add.lineno and not _is_commit_protected(node):
-                lock_spans = _get_lock_spans(node)
+                lock_spans = _get_lock_spans(node, custom_lock_names=self.custom_lock_names)
                 is_safely_locked = any(
                     s <= first_query.lineno and last_commit.lineno <= e
                     for s, e in lock_spans
@@ -1955,11 +1989,20 @@ def load_yaml_rules(rule_file: Path) -> list[dict[str, Any]]:
 
 
 def scan_source_code(
-    source_code: str, filename: str = "<memory>", custom_rules: Optional[list[dict[str, Any]]] = None
+    source_code: str,
+    filename: str = "<memory>",
+    custom_rules: Optional[list[dict[str, Any]]] = None,
+    config: Optional[Any] = None,
+    custom_lock_names: Optional[Union[list[str], set[str]]] = None,
 ) -> list[ASTFinding]:
     """Scan Python source code string for concurrency vulnerabilities."""
     tree = ast.parse(source_code, filename=filename)
-    visitor = ConcurrencyASTVisitor(filename=filename, tree=tree)
+    visitor = ConcurrencyASTVisitor(
+        filename=filename,
+        tree=tree,
+        config=config,
+        custom_lock_names=custom_lock_names,
+    )
     visitor.visit(tree)
     visitor._check_deadlocks()
     taint_findings = [
@@ -1979,20 +2022,33 @@ def scan_source_code(
         )
         for finding in find_tainted_shared_state_mutations_in_source(source_code, filename)
     ]
-    return visitor.findings + taint_findings + (_custom_rule_findings(tree, filename, custom_rules) if custom_rules else [])
+    raw_findings = visitor.findings + taint_findings + (_custom_rule_findings(tree, filename, custom_rules) if custom_rules else [])
+    if config is not None and hasattr(config, "is_rule_enabled"):
+        return [f for f in raw_findings if config.is_rule_enabled(f.rule_id, file_path=filename)]
+    return raw_findings
 
 
-def discover_python_files(path: Path) -> list[Path]:
+def discover_python_files(path: Path, config: Optional[Any] = None) -> list[Path]:
     """Discover Python files in a directory or file, skipping hidden and excluded folders."""
     if not path.is_dir():
+        if config is not None and hasattr(config, "is_path_excluded") and config.is_path_excluded(path):
+            return []
         return [path]
 
     py_files: list[Path] = []
     for root, dirs, files in os.walk(path):
-        dirs[:] = [d for d in dirs if not d.startswith(".") and d not in EXCLUDED_DIRS]
+        dirs[:] = [
+            d for d in dirs
+            if not d.startswith(".")
+            and d not in EXCLUDED_DIRS
+            and not (config is not None and hasattr(config, "is_path_excluded") and config.is_path_excluded(Path(root) / d, root_dir=path))
+        ]
         for f in sorted(files):
             if f.endswith(".py"):
-                py_files.append(Path(root) / f)
+                fpath = Path(root) / f
+                if config is not None and hasattr(config, "is_path_excluded") and config.is_path_excluded(fpath, root_dir=path):
+                    continue
+                py_files.append(fpath)
     return sorted(py_files)
 
 
@@ -2001,6 +2057,7 @@ def scan_file(
     custom_rules: Optional[list[dict[str, Any]]] = None,
     cache_manager: Optional[Any] = None,
     suppression_filter: Optional[SuppressionFilter] = None,
+    config: Optional[Any] = None,
 ) -> list[ASTFinding]:
     """Scan a Python file for concurrency vulnerabilities, skipping unparseable files."""
     if cache_manager is not None:
@@ -2015,9 +2072,10 @@ def scan_file(
                 cached = [dict_to_finding(d) for d in raw_cached]
 
         if cached is not None:
-            if suppression_filter is not None:
-                return suppression_filter.filter_findings(cached, file_path=file_path)
-            return SuppressionFilter().filter_findings(cached, file_path=file_path)
+            filtered = suppression_filter.filter_findings(cached, file_path=file_path) if suppression_filter is not None else SuppressionFilter().filter_findings(cached, file_path=file_path)
+            if config is not None and hasattr(config, "is_rule_enabled"):
+                return [f for f in filtered if config.is_rule_enabled(f.rule_id, file_path=file_path)]
+            return filtered
 
     try:
         source_code = file_path.read_text(encoding="utf-8-sig")
@@ -2025,13 +2083,20 @@ def scan_file(
         return []
 
     try:
-        findings = scan_source_code(source_code, filename=str(file_path), custom_rules=custom_rules)
+        findings = scan_source_code(
+            source_code,
+            filename=str(file_path),
+            custom_rules=custom_rules,
+            config=config,
+        )
     except (SyntaxError, ValueError):
         findings = []
 
     filter_obj = suppression_filter or SuppressionFilter()
     filter_obj.parse_source(source_code, filepath=file_path)
     final_findings = filter_obj.filter_findings(findings, file_path=file_path)
+    if config is not None and hasattr(config, "is_rule_enabled"):
+        final_findings = [f for f in final_findings if config.is_rule_enabled(f.rule_id, file_path=file_path)]
 
     if cache_manager is not None:
         if hasattr(cache_manager, "set"):
@@ -2061,10 +2126,16 @@ def _scan_worker_task(
     file_path: Path,
     custom_rules: Optional[list[dict[str, Any]]],
     ignore_pragma: bool,
+    config: Optional[Any] = None,
 ) -> tuple[Path, list[ASTFinding]]:
     """Isolated, picklable worker task for parallel ProcessPoolExecutor execution."""
     suppression = SuppressionFilter(ignore_pragma=ignore_pragma)
-    findings = scan_file(file_path, custom_rules=custom_rules, suppression_filter=suppression)
+    findings = scan_file(
+        file_path,
+        custom_rules=custom_rules,
+        suppression_filter=suppression,
+        config=config,
+    )
     return file_path, findings
 
 
@@ -2075,16 +2146,18 @@ def scan_directory(
     suppression_filter: Optional[SuppressionFilter] = None,
     workers: Optional[int] = None,
     jobs: Optional[int] = None,
+    config: Optional[Any] = None,
 ) -> list[ASTFinding]:
     """Scan a directory recursively, including cross-file call-chain analysis."""
     return scan_project(
-        discover_python_files(dir_path),
+        discover_python_files(dir_path, config=config),
         roots=[dir_path],
         custom_rules=custom_rules,
         cache_manager=cache_manager,
         suppression_filter=suppression_filter,
         workers=workers,
         jobs=jobs,
+        config=config,
     )
 
 
@@ -2096,6 +2169,7 @@ def scan_project(
     suppression_filter: Optional[SuppressionFilter] = None,
     workers: Optional[int] = None,
     jobs: Optional[int] = None,
+    config: Optional[Any] = None,
 ) -> list[ASTFinding]:
     """Scan files and propagate shared-state hazards to transitive callers.
 
@@ -2148,6 +2222,7 @@ def scan_project(
                             fp,
                             custom_rules,
                             active_filter.ignore_pragma,
+                            config,
                         ): fp
                         for fp in uncached_files
                     }
@@ -2172,6 +2247,7 @@ def scan_project(
                             custom_rules=custom_rules,
                             cache_manager=cache_manager,
                             suppression_filter=active_filter,
+                            config=config,
                         )
                     )
         elif effective_jobs > 1 and len(uncached_files) > 2:
@@ -2185,6 +2261,7 @@ def scan_project(
                         custom_rules=custom_rules,
                         cache_manager=cache_manager,
                         suppression_filter=active_filter,
+                        config=config,
                     ): file_path
                     for file_path in uncached_files
                 }
@@ -2198,6 +2275,7 @@ def scan_project(
                         custom_rules=custom_rules,
                         cache_manager=cache_manager,
                         suppression_filter=active_filter,
+                        config=config,
                     )
                 )
 
@@ -2254,5 +2332,8 @@ def scan_project(
                 )
             else:
                 active_filter.suppressed_count += 1
+
+    if config is not None and hasattr(config, "is_rule_enabled"):
+        findings = [f for f in findings if config.is_rule_enabled(f.rule_id, file_path=f.filename)]
 
     return sort_findings(findings)

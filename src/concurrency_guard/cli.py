@@ -23,7 +23,7 @@ from concurrency_guard.cache.manager import (
     CacheManager,
     compute_rules_hash,
 )
-from concurrency_guard.config import load_project_config
+from concurrency_guard.config import load_cguard_config
 from concurrency_guard.patcher.cst_fixer import apply_all_fixes
 from concurrency_guard.patcher.diff_utils import DiffGenerator, colorize_diff
 from concurrency_guard.reporter.github_pr import generate_github_pr_markdown
@@ -52,6 +52,19 @@ console = Console()
 @app.callback()
 def main() -> None:
     """Deterministic AST + Runtime Concurrency & Idempotency Verifier."""
+
+
+def _parse_cli_rules(raw_rules: Optional[list[str]]) -> list[str]:
+    """Parse comma-separated or multi-flag rule strings into normalized rule IDs."""
+    if not raw_rules:
+        return []
+    result: list[str] = []
+    for item in raw_rules:
+        for r in item.split(","):
+            cleaned = r.strip().upper()
+            if cleaned:
+                result.append(cleaned)
+    return result
 
 
 @app.command()
@@ -121,11 +134,51 @@ def scan(
         "--ignore-pragma",
         help="Bypass inline '# cguard: ignore' pragma comments and report all findings.",
     ),
+    config_file: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to dedicated configuration file (.cguard.toml, cguard.toml, or pyproject.toml).",
+    ),
+    select_rules: Optional[list[str]] = typer.Option(
+        None,
+        "--select-rule",
+        "-s",
+        help="Whitelist specific rule IDs (e.g. -s CG-001 -s CG-002, or comma-separated).",
+    ),
+    ignore_rules: Optional[list[str]] = typer.Option(
+        None,
+        "--ignore-rule",
+        "-i",
+        help="Ignore specific rule IDs (e.g. -i CG-003, or comma-separated).",
+    ),
 ) -> None:
     """Scan Python files or directories for concurrency vulnerabilities."""
     start_time = time.perf_counter()
-    config = load_project_config(path)
-    py_files = [item for item in discover_python_files(path) if not any(pattern in item.parts or str(item).endswith(pattern) for pattern in config.exclude)]
+    try:
+        config = load_cguard_config(start_path=path, config_path=config_file)
+    except (FileNotFoundError, ValueError) as err:
+        raise typer.BadParameter(str(err), param_hint="--config") from err
+
+    # CLI flag precedence overrides config file settings
+    cli_selected = _parse_cli_rules(select_rules)
+    if cli_selected:
+        config.select = cli_selected
+        config.ignore = [r for r in config.ignore if r not in cli_selected]
+
+    cli_ignored = _parse_cli_rules(ignore_rules)
+    if cli_ignored:
+        config.ignore = list(dict.fromkeys(config.ignore + cli_ignored))
+
+    if confidence is not None:
+        config.confidence = confidence.lower()
+
+    if jobs is not None:
+        config.jobs = jobs
+    elif workers is not None:
+        config.jobs = workers
+
+    py_files = discover_python_files(path, config=config)
     effective_rules = rules or (path.parent / config.rules_file if config.rules_file and path.is_file() else path / config.rules_file if config.rules_file else None)
     try:
         custom_rules = load_yaml_rules(effective_rules) if effective_rules else None
@@ -136,10 +189,12 @@ def scan(
     if changed_only or base_ref:
         repo_dir = path if path.is_dir() else path.parent
         changed_files = get_changed_python_files(repo_dir, base_ref=base_ref)
+        if changed_files is not None:
+            py_files = [f for f in py_files if f in changed_files or f.resolve() in changed_files]
 
     cache_mgr: Optional[Any] = None
     target_cache_dir = cache_dir or DEFAULT_CACHE_DIR
-    rules_hash = compute_rules_hash(rules_path=effective_rules, custom_rules=custom_rules)
+    rules_hash = compute_rules_hash(rules_path=effective_rules, custom_rules=custom_rules, config=config)
 
     if clear_cache:
         FileCache(cache_dir=target_cache_dir, enabled=True).clear()
@@ -181,19 +236,22 @@ def scan(
         suppression_filter=suppression_filter,
         workers=workers,
         jobs=effective_jobs,
+        config=config,
     )
-    findings = [finding for finding in findings if finding.rule_id not in config.ignore]
+    if config.select:
+        findings = [finding for finding in findings if finding.rule_id in config.select]
+    elif config.ignore:
+        findings = [finding for finding in findings if finding.rule_id not in config.ignore]
 
-    if confidence is not None:
-        conf_level = confidence.upper()
-        if conf_level not in {"HIGH", "MEDIUM", "LOW"}:
-            raise typer.BadParameter("confidence must be one of: high, medium, low", param_hint="--confidence")
-        allowed_conf = (
-            {"HIGH"}
-            if conf_level == "HIGH"
-            else ({"HIGH", "MEDIUM"} if conf_level == "MEDIUM" else {"HIGH", "MEDIUM", "LOW"})
-        )
-        findings = [f for f in findings if f.confidence.upper() in allowed_conf]
+    eff_conf = (confidence or config.confidence or "low").upper()
+    if eff_conf not in {"HIGH", "MEDIUM", "LOW"}:
+        raise typer.BadParameter("confidence must be one of: high, medium, low", param_hint="--confidence")
+    allowed_conf = (
+        {"HIGH"}
+        if eff_conf == "HIGH"
+        else ({"HIGH", "MEDIUM"} if eff_conf == "MEDIUM" else {"HIGH", "MEDIUM", "LOW"})
+    )
+    findings = [f for f in findings if (f.confidence or "HIGH").upper() in allowed_conf]
 
     if changed_files is not None:
         findings = [f for f in findings if Path(f.filename).resolve() in changed_files]
@@ -471,16 +529,23 @@ def fix(
         "--base-ref",
         help="Git base reference (e.g. origin/main, main) to check for changes.",
     ),
+    config_file: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to dedicated configuration file (.cguard.toml, cguard.toml, or pyproject.toml).",
+    ),
 ) -> None:
     """Auto-patch concurrency race conditions and idempotency bugs using LibCST."""
-    config = load_project_config(file_path)
+    try:
+        config = load_cguard_config(start_path=file_path, config_path=config_file)
+    except (FileNotFoundError, ValueError) as err:
+        raise typer.BadParameter(str(err), param_hint="--config") from err
+
     if file_path.is_dir():
-        target_files = [
-            f for f in discover_python_files(file_path)
-            if not any(pattern in f.parts or str(f).endswith(pattern) for pattern in config.exclude)
-        ]
+        target_files = discover_python_files(file_path, config=config)
     else:
-        target_files = [file_path]
+        target_files = [] if config.is_path_excluded(file_path) else [file_path]
 
     changed_files: Optional[set[Path]] = None
     if changed_only or base_ref:
