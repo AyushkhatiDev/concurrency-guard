@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v2.12.0
+# ConcurrencyGuard (`cguard`) — v2.13.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-217%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-225%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -25,6 +25,28 @@ Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **Celery**, *
 Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
+
+## 🛡️ What's New in v2.13.0: Unified pyproject.toml & .cguard.toml Configuration Engine
+
+`cguard` v2.13.0 introduces a zero-dependency, hierarchical configuration engine supporting `pyproject.toml` (`[tool.cguard]`), `.cguard.toml`, and `cguard.toml`:
+
+1. **Hierarchical Configuration Discovery (`config.py`):**
+   - Automatically walks upward from target scan paths or accepts an explicit `--config <path>` flag.
+   - Priority hierarchy: `.cguard.toml` > `cguard.toml` > `pyproject.toml` (`[tool.cguard]`).
+   - Standard library `tomllib` (Python 3.11+) with graceful `tomli` fallback (Python 3.10).
+2. **Rule Selection & Suppression (`select`, `ignore`, `per_file_ignores`):**
+   - `select`: Whitelist specific rules (e.g. `["CG-001", "CG-002"]`).
+   - `ignore`: Globally disable noisy rules (e.g. `["CG-003", "CG-010"]`).
+   - `per_file_ignores`: Path-based fnmatch glob suppressions (e.g. `{"tests/*" = ["CG-002"], "scripts/*" = ["*"]}`).
+3. **Custom Lock & Sanitizer Registration (`custom_lock_names`):**
+   - Register proprietary distributed lock managers, mutexes, or transaction decorators (e.g. `custom_lock_names = ["tenant_lock", "cluster_guard", "distributed_barrier"]`).
+   - Automatically treated as AST and inter-procedural sanitizers for `CG-001` and `CG-004`.
+4. **Path Exclusions (`exclude`):**
+   - Directory and file glob exclusion patterns merged with default ignorable directories.
+5. **Config-Aware Incremental SHA-256 Cache Invalidation:**
+   - Incorporates `config.deterministic_hash()` into the cache fingerprint, ensuring instant cache invalidation upon configuration adjustments.
+6. **CLI Precedence:**
+   - CLI flags (`--select-rule`/`-s`, `--ignore-rule`/`-i`, `--config`) take absolute precedence over configuration files.
 
 ## 🛡️ What's New in v2.12.0: Module-Level Inter-Procedural Call-Graph Taint & Sanitizer Summaries
 
