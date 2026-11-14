@@ -12,7 +12,11 @@ from typing import Any, Optional, Union
 
 import yaml  # type: ignore[import-untyped]
 
-from concurrency_guard.scanner.call_graph import build_call_graph
+from concurrency_guard.scanner.call_graph import (
+    FunctionSummary,
+    analyze_module_functions,
+    build_call_graph,
+)
 from concurrency_guard.scanner.suppression import SuppressionFilter
 from concurrency_guard.scanner.taint_tracker import (
     find_tainted_shared_state_mutations,
@@ -495,10 +499,19 @@ def _target_root_name(node: ast.AST) -> str:
     return node.id if isinstance(node, ast.Name) else ""
 
 
+def _helper_name(func_expr: ast.AST) -> str:
+    """Return the function or method identifier name for a call."""
+    if isinstance(func_expr, ast.Name):
+        return func_expr.id
+    if isinstance(func_expr, ast.Attribute):
+        return func_expr.attr
+    return ""
+
+
 class ConcurrencyASTVisitor(ast.NodeVisitor):
     """AST visitor detecting concurrency race conditions and idempotency issues."""
 
-    def __init__(self, filename: str = "<memory>") -> None:
+    def __init__(self, filename: str = "<memory>", tree: Optional[ast.AST] = None) -> None:
         self.filename = filename
         self.findings: list[ASTFinding] = []
         self.shared_names: set[str] = set()
@@ -509,6 +522,9 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         self.reentrant_locks: set[str] = set()
         self.function_locks: dict[str, set[str]] = defaultdict(set)
         self.calls_under_lock: list[tuple[str, str, str, int]] = []
+        self.function_summaries: dict[str, FunctionSummary] = (
+            analyze_module_functions(tree) if isinstance(tree, ast.Module) else {}
+        )
 
     def _is_reentrant(self, name: str) -> bool:
         low = name.lower()
@@ -602,6 +618,8 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
     def visit_Module(self, node: ast.Module) -> None:
         """Collect module shared state and thread entry points before functions."""
+        if not self.function_summaries:
+            self.function_summaries = analyze_module_functions(node)
         for statement in node.body:
             if isinstance(statement, (ast.Assign, ast.AnnAssign)):
                 value = statement.value
@@ -909,6 +927,11 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 and isinstance(n.func, ast.Attribute)
                 and n.func.attr in ("commit", "flush")
             )
+            or (
+                isinstance(n, ast.Call)
+                and _helper_name(n.func) in self.function_summaries
+                and self.function_summaries[_helper_name(n.func)].performs_commit
+            )
             for n in local_nodes
         )
         if not has_commit:
@@ -973,6 +996,22 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 continue
 
             unwrapped = val.value if isinstance(val, ast.Await) else val
+
+            # Check A0: Local helper function returning locked or unlocked entity
+            if isinstance(unwrapped, ast.Call):
+                callee_name = _helper_name(unwrapped.func)
+                if callee_name in self.function_summaries:
+                    callee_sum = self.function_summaries[callee_name]
+                    call_line = getattr(unwrapped, "lineno", stmt_lineno)
+                    call_end = max(getattr(unwrapped, "end_lineno", call_line), stmt_end_lineno)
+                    if callee_sum.returns_locked_entity:
+                        for t in targets:
+                            for name in _extract_names(t):
+                                entity_sources[name] = (unwrapped, call_line, call_end, True)
+                    elif callee_sum.returns_unlocked_entity:
+                        for t in targets:
+                            for name in _extract_names(t):
+                                entity_sources[name] = (unwrapped, call_line, call_end, False)
 
             # Check A: Assignment of a query, e.g. stmt = select(...)
             if any(_is_select_call(c) for c in ast.walk(unwrapped)):
@@ -1128,6 +1167,36 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         if not q_db_locked:
                             reported_entities.add((root, q_line, q_end_line))
 
+            # Case D: Mutating helper calls, e.g. debit_account(user, 50) or await debit_account(user, 50)
+            call_obj: Optional[ast.Call] = None
+            if isinstance(stmt, ast.Expr):
+                expr_val = stmt.value.value if isinstance(stmt.value, ast.Await) else stmt.value
+                if isinstance(expr_val, ast.Call):
+                    call_obj = expr_val
+            elif isinstance(stmt, ast.Call):
+                call_obj = stmt
+            elif isinstance(stmt, ast.Await) and isinstance(stmt.value, ast.Call):
+                call_obj = stmt.value
+
+            if call_obj is not None:
+                callee_name = _helper_name(call_obj.func)
+                if callee_name in self.function_summaries:
+                    callee_sum = self.function_summaries[callee_name]
+                    if not callee_sum.acquires_lock_context:
+                        for arg_idx, arg in enumerate(call_obj.args):
+                            root = _target_root_name(arg)
+                            if root in entity_sources and arg_idx in callee_sum.mutated_param_indices:
+                                _, q_line, q_end_line, q_db_locked = entity_sources[root]
+                                if not q_db_locked:
+                                    reported_entities.add((root, q_line, q_end_line))
+                        for kw in call_obj.keywords:
+                            if kw.arg:
+                                root = _target_root_name(kw.value)
+                                if root in entity_sources and kw.arg in callee_sum.mutated_param_names:
+                                    _, q_line, q_end_line, q_db_locked = entity_sources[root]
+                                    if not q_db_locked:
+                                        reported_entities.add((root, q_line, q_end_line))
+
         # 5. Emit findings with HIGH confidence
         reported_lines: set[int] = set()
         for _, q_line, q_end_line in sorted(reported_entities, key=lambda x: x[1]):
@@ -1210,6 +1279,20 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         query_calls = [n for n in local_nodes if isinstance(n, ast.Call) and _is_query_call(n)]
         add_calls = [n for n in local_nodes if isinstance(n, ast.Call) and _is_add_call(n)]
         commit_calls = [n for n in local_nodes if isinstance(n, ast.Call) and _is_commit_call(n)]
+
+        for n in local_nodes:
+            if isinstance(n, ast.Call):
+                hname = _helper_name(n.func)
+                if hname in self.function_summaries:
+                    sumry = self.function_summaries[hname]
+                    if sumry.returns_unlocked_entity or sumry.returns_locked_entity:
+                        query_calls.append(n)
+                    if sumry.performs_commit:
+                        commit_calls.append(n)
+
+        query_calls.sort(key=lambda x: getattr(x, "lineno", 0))
+        add_calls.sort(key=lambda x: getattr(x, "lineno", 0))
+        commit_calls.sort(key=lambda x: getattr(x, "lineno", 0))
 
         if query_calls and add_calls and commit_calls:
             first_query = query_calls[0]
@@ -1824,6 +1907,9 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             self.aliases, self.context_stack = saved_aliases, saved_context
 
 
+ASTRuleVisitor = ConcurrencyASTVisitor
+
+
 def _custom_rule_findings(tree: ast.AST, filename: str, rules: list[dict[str, Any]]) -> list[ASTFinding]:
     """Evaluate compact YAML rules against functions without executing YAML content.
 
@@ -1873,7 +1959,7 @@ def scan_source_code(
 ) -> list[ASTFinding]:
     """Scan Python source code string for concurrency vulnerabilities."""
     tree = ast.parse(source_code, filename=filename)
-    visitor = ConcurrencyASTVisitor(filename=filename)
+    visitor = ConcurrencyASTVisitor(filename=filename, tree=tree)
     visitor.visit(tree)
     visitor._check_deadlocks()
     taint_findings = [

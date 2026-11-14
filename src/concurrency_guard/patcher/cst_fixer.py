@@ -376,21 +376,20 @@ class WithForUpdateTransformer(cst.CSTTransformer):
         self._func_needs_fix: bool = False
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
-        """Inspect async function entry."""
-        if node.asynchronous is not None:
-            if self.target_functions is None:
-                self._current_async_func = node
-                self._func_needs_fix = not _func_has_with_for_update(node)
-            elif node.name.value in self.target_functions:
-                self._current_async_func = node
-                self._func_needs_fix = True
+        """Inspect function entry."""
+        if self.target_functions is None:
+            self._current_async_func = node
+            self._func_needs_fix = not _func_has_with_for_update(node)
+        elif node.name.value in self.target_functions:
+            self._current_async_func = node
+            self._func_needs_fix = True
         return True
 
     def leave_FunctionDef(
         self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef
     ) -> cst.FunctionDef:
-        """Clear state on async function exit."""
-        if original_node.asynchronous is not None and self._current_async_func is original_node:
+        """Clear state on function exit."""
+        if self._current_async_func is original_node:
             self._current_async_func = None
             self._func_needs_fix = False
         return updated_node
