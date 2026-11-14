@@ -164,6 +164,7 @@ def scan(
     cli_selected = _parse_cli_rules(select_rules)
     if cli_selected:
         config.select = cli_selected
+        config.ignore = [r for r in config.ignore if r not in cli_selected]
 
     cli_ignored = _parse_cli_rules(ignore_rules)
     if cli_ignored:
@@ -239,7 +240,7 @@ def scan(
     )
     if config.select:
         findings = [finding for finding in findings if finding.rule_id in config.select]
-    if config.ignore:
+    elif config.ignore:
         findings = [finding for finding in findings if finding.rule_id not in config.ignore]
 
     eff_conf = (confidence or config.confidence or "low").upper()

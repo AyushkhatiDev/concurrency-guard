@@ -94,7 +94,7 @@ class CGuardConfig:
                 return False
 
         # 2. Global blacklist check (ignore)
-        if self.ignore:
+        elif self.ignore:
             ignored_set = {i.upper() for i in self.ignore}
             if rid in ignored_set:
                 return False
