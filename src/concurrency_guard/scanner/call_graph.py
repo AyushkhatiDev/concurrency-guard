@@ -243,17 +243,30 @@ def _is_ast_commit_call(node: ast.AST) -> bool:
     return False
 
 
-def _has_ast_lock_context(with_node: Union[ast.With, ast.AsyncWith]) -> bool:
+def _has_ast_lock_context(
+    with_node: Union[ast.With, ast.AsyncWith],
+    custom_lock_names: Optional[Union[list[str], set[str]]] = None,
+) -> bool:
     """Check if a with/async with block manages a concurrency lock or transaction."""
     for item in with_node.items:
         expr_str = _dotted_name(item.context_expr).lower()
+        if custom_lock_names and any(cl.lower() in expr_str for cl in custom_lock_names):
+            return True
         if any(term in expr_str for term in ("lock", "advisory", "redis", "mutex", "atomic", "semaphore")):
             return True
         for child in ast.walk(item.context_expr):
-            if isinstance(child, ast.Name) and any(term in child.id.lower() for term in ("lock", "mutex")):
-                return True
-            if isinstance(child, ast.Attribute) and any(term in child.attr.lower() for term in ("lock", "atomic")):
-                return True
+            if isinstance(child, ast.Name):
+                cid = child.id.lower()
+                if custom_lock_names and any(cl.lower() in cid for cl in custom_lock_names):
+                    return True
+                if any(term in cid for term in ("lock", "mutex")):
+                    return True
+            if isinstance(child, ast.Attribute):
+                cattr = child.attr.lower()
+                if custom_lock_names and any(cl.lower() in cattr for cl in custom_lock_names):
+                    return True
+                if any(term in cattr for term in ("lock", "atomic")):
+                    return True
     return False
 
 
@@ -267,7 +280,10 @@ def _extract_target_root_name(target: ast.AST) -> str:
     return ""
 
 
-def analyze_module_functions(tree: ast.Module) -> dict[str, FunctionSummary]:
+def analyze_module_functions(
+    tree: ast.Module,
+    custom_lock_names: Optional[Union[list[str], set[str]]] = None,
+) -> dict[str, FunctionSummary]:
     """Perform a fast, cycle-safe module-level function summary pass over all functions."""
     summaries: dict[str, FunctionSummary] = {}
     function_nodes: dict[str, Union[ast.FunctionDef, ast.AsyncFunctionDef]] = {}
@@ -290,6 +306,8 @@ def analyze_module_functions(tree: ast.Module) -> dict[str, FunctionSummary]:
         # Check decorators for @transaction.atomic or lock decorators
         for dec in func_node.decorator_list:
             dec_name = _dotted_name(dec).lower()
+            if custom_lock_names and any(cl.lower() in dec_name for cl in custom_lock_names):
+                summary.acquires_lock_context = True
             if "atomic" in dec_name or "lock" in dec_name:
                 summary.acquires_lock_context = True
 
@@ -319,7 +337,7 @@ def analyze_module_functions(tree: ast.Module) -> dict[str, FunctionSummary]:
                 summary.performs_commit = True
 
             # Check lock contexts
-            if isinstance(node, (ast.With, ast.AsyncWith)) and _has_ast_lock_context(node):
+            if isinstance(node, (ast.With, ast.AsyncWith)) and _has_ast_lock_context(node, custom_lock_names=custom_lock_names):
                 summary.acquires_lock_context = True
 
             # Track variable assignments
@@ -453,7 +471,10 @@ def analyze_module_functions(tree: ast.Module) -> dict[str, FunctionSummary]:
     return summaries
 
 
-def build_module_function_summaries(source_code_or_tree: Union[str, ast.Module]) -> dict[str, FunctionSummary]:
+def build_module_function_summaries(
+    source_code_or_tree: Union[str, ast.Module],
+    custom_lock_names: Optional[Union[list[str], set[str]]] = None,
+) -> dict[str, FunctionSummary]:
     """Helper to parse source code or use existing AST to generate function summaries."""
     if isinstance(source_code_or_tree, str):
         try:
@@ -462,5 +483,5 @@ def build_module_function_summaries(source_code_or_tree: Union[str, ast.Module])
             return {}
     else:
         tree = source_code_or_tree
-    return analyze_module_functions(tree)
+    return analyze_module_functions(tree, custom_lock_names=custom_lock_names)
 
