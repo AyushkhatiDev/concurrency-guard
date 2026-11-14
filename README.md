@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v2.10.0
+# ConcurrencyGuard (`cguard`) — v2.12.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-208%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-217%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -25,6 +25,26 @@ Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **Celery**, *
 Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
+
+## 🛡️ What's New in v2.12.0: Module-Level Inter-Procedural Call-Graph Taint & Sanitizer Summaries
+
+`cguard` v2.12.0 introduces a cycle-safe, module-level inter-procedural function summary analysis pass (`call_graph.py`) that propagates query taint, parameter mutations, and row-level locking sanitizers across local helper functions:
+
+1. **Cycle-Safe Module-Level Function Summaries (`FunctionSummary`):**
+   - Automatically builds pre-analysis summaries across module-level `FunctionDef` and `AsyncFunctionDef` definitions.
+   - Fixed-point iterative propagation (up to 3 hops) tracks `returns_unlocked_entity`, `returns_locked_entity`, `mutated_param_indices`, `mutated_param_names`, `performs_commit`, and `acquires_lock_context`.
+   - Guaranteed immunity against direct and mutual recursion (`f() -> g() -> f()`) with sub-millisecond execution.
+2. **Cross-Helper Query Taint Propagation (`CG-001` & `CG-004`):**
+   - Endpoints calling unlocked ORM helper functions (e.g. `user = await get_account(db, user_id)`) properly inherit query taint, accurately flagging unlocked mutations.
+   - Helper functions that acquire row locks (`.with_for_update()`) act as verifiable sanitizers with 0 false positives.
+3. **Helper Parameter Mutation Taint Tracking:**
+   - Detects when fetched entity objects are passed into local helper functions that mutate their attributes (e.g. `apply_penalty(user, 100)`), propagating def-use mutation chains before commit.
+4. **Helper Commit Delegation:**
+   - Recognizes when transaction commits are encapsulated within helper routines (e.g. `await save_and_commit(db)`), enforcing locking guarantees across split procedures.
+5. **Lossless LibCST Helper Patching:**
+   - Automatically identifies and patches synchronous and asynchronous helper functions with `.with_for_update()` during `cguard fix`.
+
+---
 
 ## 🛡️ What's New in v2.10.0: OASIS SARIF v2.1.0 & Native GitHub Code Scanning Integration
 

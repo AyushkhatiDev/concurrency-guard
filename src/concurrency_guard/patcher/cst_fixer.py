@@ -102,6 +102,16 @@ def _preflight_targets(source_code: str, rule_id: str, findings: list[ASTFinding
             skipped.append(PatchSkip(rule_id, function_name, lineno, "select_for_update() must be added inside transaction.atomic() manually."))
         else:
             safe.add(function_name)
+            if rule_id == "CG-001":
+                for n in ast.walk(function):
+                    if getattr(n, "lineno", 0) == lineno and isinstance(n, ast.Call):
+                        callee = ""
+                        if isinstance(n.func, ast.Name):
+                            callee = n.func.id
+                        elif isinstance(n.func, ast.Attribute):
+                            callee = n.func.attr
+                        if callee and callee in functions:
+                            safe.add(callee)
 
     skipped_names = {item.function_name for item in skipped}
     return safe - skipped_names, skipped
@@ -376,21 +386,20 @@ class WithForUpdateTransformer(cst.CSTTransformer):
         self._func_needs_fix: bool = False
 
     def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
-        """Inspect async function entry."""
-        if node.asynchronous is not None:
-            if self.target_functions is None:
-                self._current_async_func = node
-                self._func_needs_fix = not _func_has_with_for_update(node)
-            elif node.name.value in self.target_functions:
-                self._current_async_func = node
-                self._func_needs_fix = True
+        """Inspect function entry."""
+        if self.target_functions is None:
+            self._current_async_func = node
+            self._func_needs_fix = not _func_has_with_for_update(node)
+        elif node.name.value in self.target_functions:
+            self._current_async_func = node
+            self._func_needs_fix = True
         return True
 
     def leave_FunctionDef(
         self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef
     ) -> cst.FunctionDef:
-        """Clear state on async function exit."""
-        if original_node.asynchronous is not None and self._current_async_func is original_node:
+        """Clear state on function exit."""
+        if self._current_async_func is original_node:
             self._current_async_func = None
             self._func_needs_fix = False
         return updated_node
