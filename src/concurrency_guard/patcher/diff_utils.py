@@ -35,8 +35,17 @@ def generate_unified_diff(
 ) -> str:
     """Generate standard unified diff between original and patched code in memory."""
     file_str = str(filepath)
-    from_header = fromfile or f"a/{file_str}"
-    to_header = tofile or f"b/{file_str}"
+    try:
+        p = Path(file_str)
+        try:
+            rel_str = str(p.relative_to(Path.cwd()))
+        except ValueError:
+            rel_str = str(p).lstrip("/")
+    except (ValueError, TypeError, OSError):
+        rel_str = file_str.lstrip("/")
+
+    from_header = fromfile or f"a/{rel_str}"
+    to_header = tofile or f"b/{rel_str}"
 
     diff_lines = list(
         difflib.unified_diff(
@@ -117,7 +126,7 @@ class DiffGenerator:
             else:
                 from concurrency_guard.patcher.cst_fixer import apply_all_fixes_with_report
 
-                patch_result = apply_all_fixes_with_report(source_code, rules=self.rules)
+                patch_result = apply_all_fixes_with_report(source_code, rules=self.rules, dry_run=True)
                 patched_code = patch_result.code
                 skipped = patch_result.skipped
         except (SyntaxError, ValueError) as exc:

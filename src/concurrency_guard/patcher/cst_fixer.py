@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Union
 
 import libcst as cst
@@ -29,6 +30,9 @@ class PatchResult:
 
     code: str
     skipped: tuple[PatchSkip, ...] = ()
+    unified_diff: str = ""
+    modified: bool = False
+    filepath: Optional[str] = None
 
 
 _DYNAMIC_DISPATCH_NAMES = frozenset({"eval", "exec", "getattr", "globals", "locals", "__import__"})
@@ -747,9 +751,30 @@ class DjangoFExpressionTransformer(cst.CSTTransformer):
         return updated_node
 
 
-def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = None) -> PatchResult:
+def apply_all_fixes_with_report(
+    source_code: str,
+    rules: Optional[set[str]] = None,
+    selected_rules: Optional[set[str]] = None,
+    filepath: Optional[Union[Path, str]] = None,
+    dry_run: bool = False,
+    write_to_disk: bool = True,
+) -> PatchResult:
     """Apply only statically validated fixes and report skipped targets."""
-    selected_rules = rules if rules is not None else {"CG-001", "CG-002", "CG-004", "CG-006", "CG-007", "CG-009", "CG-016", "CG-017"}
+    if selected_rules is not None:
+        effective_rules = {r.upper() for r in selected_rules}
+    elif rules is not None:
+        effective_rules = {r.upper() for r in rules}
+    else:
+        effective_rules = {
+            "CG-001",
+            "CG-002",
+            "CG-004",
+            "CG-006",
+            "CG-007",
+            "CG-009",
+            "CG-016",
+            "CG-017",
+        }
     current_code = source_code
     suppressions = SuppressionFilter()
     skipped: list[PatchSkip] = []
@@ -811,7 +836,7 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
         return targets
 
     # 1. CG-001: WithForUpdateTransformer
-    if "CG-001" in selected_rules:
+    if "CG-001" in effective_rules:
         cg001_targets = targets_for("CG-001")
         if cg001_targets:
             tree = cst.parse_module(current_code)
@@ -822,7 +847,7 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
             current_code = _verify_gate(candidate, current_code, "CG-001", cg001_targets)
 
     # 2. CG-002: IdempotencyHeaderTransformer
-    if "CG-002" in selected_rules:
+    if "CG-002" in effective_rules:
         cg002_targets = targets_for("CG-002")
         if cg002_targets:
             tree = cst.parse_module(current_code)
@@ -831,7 +856,7 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
             current_code = _verify_gate(tree.code, current_code, "CG-002", cg002_targets)
 
     # 3. CG-004: IntegrityErrorGuardTransformer
-    if "CG-004" in selected_rules:
+    if "CG-004" in effective_rules:
         cg004_targets = targets_for("CG-004")
         if cg004_targets:
             tree = cst.parse_module(current_code)
@@ -841,7 +866,7 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
             current_code = _verify_gate(tree.code, current_code, "CG-004", cg004_targets)
 
     # 4. CG-006: protect async shared-state mutations.
-    if "CG-006" in selected_rules:
+    if "CG-006" in effective_rules:
         targets = targets_for("CG-006")
         if targets:
             tree = cst.parse_module(current_code).visit(
@@ -852,7 +877,7 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
             current_code = _verify_gate(candidate, current_code, "CG-006", targets)
 
     # 5. CG-007: protect threaded shared-state mutations.
-    if "CG-007" in selected_rules:
+    if "CG-007" in effective_rules:
         targets = targets_for("CG-007")
         if targets:
             tree = cst.parse_module(current_code).visit(
@@ -864,7 +889,7 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
 
     # 6. CG-009 is concurrent file overwrite. CG-008 is accepted for callers
     # that used the pre-release file-rule identifier.
-    if {"CG-008", "CG-009"}.intersection(selected_rules):
+    if {"CG-008", "CG-009"}.intersection(effective_rules):
         targets = targets_for("CG-009")
         if targets:
             tree = cst.parse_module(current_code).visit(FileLockTransformer(targets))
@@ -872,7 +897,7 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
             current_code = _verify_gate(candidate, current_code, "CG-009", targets)
 
     # 7. CG-016: lock a Django ORM fetch before its read-modify-write sequence.
-    if "CG-016" in selected_rules:
+    if "CG-016" in effective_rules:
         targets = targets_for("CG-016")
         if targets:
             candidate = cst.parse_module(current_code).visit(
@@ -881,7 +906,7 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
             current_code = _verify_gate(candidate, current_code, "CG-016", targets)
 
     # 8. CG-017: replace in-memory Django arithmetic with atomic F() expression
-    if "CG-017" in selected_rules:
+    if "CG-017" in effective_rules:
         targets = targets_for("CG-017")
         if targets:
             tree = cst.parse_module(current_code).visit(DjangoFExpressionTransformer(targets))
@@ -890,12 +915,71 @@ def apply_all_fixes_with_report(source_code: str, rules: Optional[set[str]] = No
 
     ast.parse(current_code)
     cst.parse_module(current_code)
-    return PatchResult(code=current_code, skipped=tuple(skipped))
+
+    modified = (current_code != source_code)
+    diff = ""
+    if modified:
+        file_str = str(filepath) if filepath is not None else "file.py"
+        try:
+            p = Path(file_str)
+            try:
+                rel_str = str(p.relative_to(Path.cwd()))
+            except ValueError:
+                rel_str = str(p).lstrip("/")
+        except (ValueError, TypeError, OSError):
+            rel_str = file_str.lstrip("/")
+        diff = generate_unified_diff(
+            source_code,
+            current_code,
+            filepath=file_str,
+            fromfile=f"a/{rel_str}",
+            tofile=f"b/{rel_str}",
+        )
+
+    if modified and filepath is not None and not dry_run and write_to_disk:
+        Path(filepath).write_text(current_code, encoding="utf-8")
+
+    return PatchResult(
+        code=current_code,
+        skipped=tuple(skipped),
+        unified_diff=diff,
+        modified=modified,
+        filepath=str(filepath) if filepath is not None else None,
+    )
 
 
-def apply_all_fixes(source_code: str, rules: Optional[set[str]] = None) -> str:
+def apply_all_fixes(
+    source_code: str,
+    rules: Optional[set[str]] = None,
+    selected_rules: Optional[set[str]] = None,
+) -> str:
     """Compatibility wrapper returning only the safely patched source code."""
-    return apply_all_fixes_with_report(source_code, rules).code
+    return apply_all_fixes_with_report(
+        source_code,
+        rules=rules,
+        selected_rules=selected_rules,
+        dry_run=True,
+    ).code
+
+
+def fix_file(
+    file_path: Union[Path, str],
+    rules: Optional[set[str]] = None,
+    selected_rules: Optional[set[str]] = None,
+    dry_run: bool = False,
+    write_to_disk: bool = True,
+) -> PatchResult:
+    """Read file, apply fixes in-memory, generate diff, and optionally write back to disk."""
+    path = Path(file_path)
+    source_code = path.read_text(encoding="utf-8-sig")
+    return apply_all_fixes_with_report(
+        source_code=source_code,
+        rules=rules,
+        selected_rules=selected_rules,
+        filepath=path,
+        dry_run=dry_run,
+        write_to_disk=write_to_disk,
+    )
 
 
 def apply_with_for_update_fix(source_code: str) -> str:
@@ -926,6 +1010,7 @@ __all__ = [
     "apply_all_fixes_with_report",
     "apply_with_for_update_fix",
     "colorize_diff",
+    "fix_file",
     "generate_unified_diff",
     "validate_patch_syntax",
 ]
