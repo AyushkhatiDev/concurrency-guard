@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v2.14.0
+# ConcurrencyGuard (`cguard`) — v3.0.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-234%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-249%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -20,11 +20,17 @@
 <br/>
 
 **Deterministic AST static analysis, inter-procedural taint propagation, microsecond barrier verification, and compiler-grade LibCST code repair for Python backends.**  
-Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **Celery**, **Redis / Memcached**, `asyncio.TaskGroup`, `anyio`, and multi-threaded architectures.
+Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **SQLModel**, **Tortoise ORM**, **Celery**, **Redis / Memcached**, `asyncio.TaskGroup`, `anyio`, and multi-threaded architectures.
 
 Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
+
+## 🛡️ What's New in v3.0.0: Multi-ORM Ecosystem Expansion (SQLModel & Tortoise ORM)
+
+- **SQLModel Support**: Full static analysis and AST taint tracking for `session.exec(select(...))` and `session.get(...)`. Auto-remediation automatically injects `.with_for_update()` into inner `select()` statements.
+- **Tortoise ORM Support**: Native async ORM race condition detection for `await Model.get(...)` and `await Model.filter(...).first()`. Auto-remediation transforms vulnerable fetch calls into `.select_for_update().first()` or `Model.select_for_update().get(...)`.
+- **Sanitizer & Transaction Recognition**: Full immunity for `in_transaction()` blocks and atomic `F()` expressions.
 
 ## 🛡️ What's New in v2.14.0: Unified Diff Preview (`--diff`), CI Check Mode (`--check`), and Selective Rule Patching (`--rule`)
 
