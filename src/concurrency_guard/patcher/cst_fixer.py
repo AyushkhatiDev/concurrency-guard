@@ -61,7 +61,11 @@ def _contains_dynamic_or_unpacking(node: ast.AST) -> bool:
     for child in ast.walk(node):
         if not isinstance(child, ast.Call):
             continue
-        if _dotted_name(child.func).split(".")[-1] in _DYNAMIC_DISPATCH_NAMES:
+        func_node = child.func
+        if isinstance(func_node, ast.Name) and func_node.id in _DYNAMIC_DISPATCH_NAMES:
+            return True
+        dotted = _dotted_name(func_node)
+        if dotted in {f"builtins.{name}" for name in _DYNAMIC_DISPATCH_NAMES}:
             return True
         if any(keyword.arg is None for keyword in child.keywords):
             return True

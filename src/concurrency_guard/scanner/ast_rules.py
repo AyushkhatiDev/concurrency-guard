@@ -437,16 +437,26 @@ def _find_loop_execute_calls(node: ast.AST, in_loop: bool = False) -> list[ast.C
             continue
 
         if in_loop and isinstance(child, ast.Call):
+            matched = False
             if (
                 isinstance(child.func, ast.Attribute)
                 and child.func.attr in ("execute", "exec", "scalar", "scalars", "get")
                 and _is_db_or_session(child.func.value)
             ):
                 calls.append(child)
+                matched = True
             else:
                 is_tort, _ = _is_tortoise_query(child)
                 if is_tort:
                     calls.append(child)
+                    matched = True
+
+            if matched:
+                for arg in child.args:
+                    calls.extend(_find_loop_execute_calls(arg, in_loop=True))
+                for kw in child.keywords:
+                    calls.extend(_find_loop_execute_calls(kw.value, in_loop=True))
+                continue
 
         if isinstance(child, (ast.For, ast.AsyncFor)):
             for b in child.body:
