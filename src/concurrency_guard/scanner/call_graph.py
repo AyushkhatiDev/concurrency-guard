@@ -223,7 +223,24 @@ def _is_ast_query_call(node: ast.AST) -> bool:
     name = _dotted_name(node.func)
     if "select" in name:
         return True
-    return bool(any(name.endswith(suffix) for suffix in (".get", ".scalar", ".scalars", ".first", ".one", ".one_or_none", ".all", ".execute")))
+    return bool(
+        any(
+            name.endswith(suffix)
+            for suffix in (
+                ".get",
+                ".get_or_none",
+                ".scalar",
+                ".scalars",
+                ".first",
+                ".one",
+                ".one_or_none",
+                ".all",
+                ".execute",
+                ".exec",
+                ".filter",
+            )
+        )
+    )
 
 
 def _has_ast_query_lock(node: ast.AST) -> bool:

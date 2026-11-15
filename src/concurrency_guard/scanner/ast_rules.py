@@ -300,19 +300,71 @@ def _is_db_or_session(val: ast.AST) -> bool:
     return False
 
 
+def _is_tortoise_query(node: ast.AST) -> tuple[bool, bool]:
+    """Check if node is a Tortoise ORM model query (e.g. Model.get, Model.filter(...).first()).
+
+    Returns (is_tortoise, has_lock).
+    """
+    curr = node.value if isinstance(node, ast.Await) else node
+    if not isinstance(curr, ast.Call):
+        return False, False
+
+    methods: list[str] = []
+    has_lock = False
+    model_name: Optional[str] = None
+
+    scan_curr: ast.AST = curr
+    while True:
+        if isinstance(scan_curr, ast.Await):
+            scan_curr = scan_curr.value
+        elif isinstance(scan_curr, ast.Call):
+            if isinstance(scan_curr.func, ast.Attribute):
+                attr = scan_curr.func.attr
+                methods.append(attr)
+                if attr in ("select_for_update", "with_for_update"):
+                    has_lock = True
+                scan_curr = scan_curr.func.value
+            else:
+                break
+        elif isinstance(scan_curr, ast.Attribute):
+            attr = scan_curr.attr
+            if attr[0].isupper() and model_name is None:
+                model_name = attr
+            methods.append(attr)
+            scan_curr = scan_curr.value
+        elif isinstance(scan_curr, ast.Name):
+            if scan_curr.id[0].isupper() and model_name is None:
+                model_name = scan_curr.id
+            break
+        else:
+            break
+
+    if model_name is not None:
+        tortoise_query_methods = {"get", "get_or_none", "filter", "all", "first", "one", "one_or_none"}
+        if any(m in tortoise_query_methods for m in methods) and "objects" not in methods:
+            return True, has_lock
+
+    return False, False
+
+
 def _is_query_call(node: ast.AST) -> bool:
-    """Check if node is a select(...) call or SQLAlchemy query."""
+    """Check if node is a select(...) call or SQLAlchemy/SQLModel/Tortoise query."""
     if _is_select_call(node):
+        return True
+    is_tort, _ = _is_tortoise_query(node)
+    if is_tort:
         return True
     if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)):
         return False
-    if node.func.attr in ("scalar", "scalars", "get", "all", "first", "one", "one_or_none"):
+    if node.func.attr in ("scalar", "scalars", "get", "get_or_none", "all", "first", "one", "one_or_none"):
         return _is_db_or_session(node.func.value)
     return bool(
-        node.func.attr == "execute"
+        node.func.attr in ("execute", "exec")
         and _is_db_or_session(node.func.value)
-        and node.args
-        and any(_is_select_call(arg) or any(_is_select_call(c) for c in ast.walk(arg)) for arg in node.args)
+        and (
+            not node.args
+            or any(_is_select_call(arg) or any(_is_select_call(c) for c in ast.walk(arg)) for arg in node.args)
+        )
     )
 
 
@@ -324,11 +376,11 @@ def _is_add_call(node: ast.AST) -> bool:
 
 
 def _is_commit_call(node: ast.AST) -> bool:
-    """Check if node is a .commit() call."""
+    """Check if node is a .commit() or .save() call."""
     return (
         isinstance(node, ast.Call)
         and isinstance(node.func, ast.Attribute)
-        and node.func.attr == "commit"
+        and node.func.attr in ("commit", "save")
     )
 
 
@@ -378,20 +430,33 @@ def _has_idempotency_param(node: ast.AsyncFunctionDef) -> bool:
 
 
 def _find_loop_execute_calls(node: ast.AST, in_loop: bool = False) -> list[ast.Call]:
-    """Find db/session execute, scalar, scalars, or get calls directly within loop bodies."""
+    """Find db/session execute, exec, scalar, scalars, get, or Tortoise ORM query calls directly within loop bodies."""
     calls: list[ast.Call] = []
     for child in ast.iter_child_nodes(node):
         if isinstance(child, _SCOPE_BOUNDARY_TYPES):
             continue
 
-        if (
-            in_loop
-            and isinstance(child, ast.Call)
-            and isinstance(child.func, ast.Attribute)
-            and child.func.attr in ("execute", "scalar", "scalars", "get")
-            and _is_db_or_session(child.func.value)
-        ):
-            calls.append(child)
+        if in_loop and isinstance(child, ast.Call):
+            matched = False
+            if (
+                isinstance(child.func, ast.Attribute)
+                and child.func.attr in ("execute", "exec", "scalar", "scalars", "get")
+                and _is_db_or_session(child.func.value)
+            ):
+                calls.append(child)
+                matched = True
+            else:
+                is_tort, _ = _is_tortoise_query(child)
+                if is_tort:
+                    calls.append(child)
+                    matched = True
+
+            if matched:
+                for arg in child.args:
+                    calls.extend(_find_loop_execute_calls(arg, in_loop=True))
+                for kw in child.keywords:
+                    calls.extend(_find_loop_execute_calls(kw.value, in_loop=True))
+                continue
 
         if isinstance(child, (ast.For, ast.AsyncFor)):
             for b in child.body:
@@ -953,13 +1018,13 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
     def _check_cg_001(self, node: ast.AsyncFunctionDef, local_nodes: list[ast.AST]) -> None:
         """Rule CG-001: Unlocked Read-Modify-Write Race Condition."""
-        # 1. Fast check: must have a commit or flush call
+        # 1. Fast check: must have a commit, flush, or save call
         has_commit = any(
             _is_commit_call(n)
             or (
                 isinstance(n, ast.Call)
                 and isinstance(n.func, ast.Attribute)
-                and n.func.attr in ("commit", "flush")
+                and n.func.attr in ("commit", "flush", "save")
             )
             or (
                 isinstance(n, ast.Call)
@@ -1002,12 +1067,12 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             return []
 
         def _extract_query_execute(call_node: ast.AST) -> Optional[ast.Call]:
-            """Unwind result proxy method chain (.scalars().all(), .scalar_one(), .first(), etc.) to the underlying db.execute() call."""
+            """Unwind result proxy method chain (.scalars().all(), .scalar_one(), .first(), etc.) to the underlying db.execute() or session.exec() call."""
             curr = call_node
             while isinstance(curr, ast.Call) and isinstance(curr.func, ast.Attribute):
-                if curr.func.attr == "execute" and _is_db_or_session(curr.func.value):
+                if curr.func.attr in ("execute", "exec") and _is_db_or_session(curr.func.value):
                     return curr
-                if curr.func.attr in ("scalar", "scalars", "scalar_one", "scalar_one_or_none", "first", "one", "all"):
+                if curr.func.attr in ("scalar", "scalars", "scalar_one", "scalar_one_or_none", "first", "one", "one_or_none", "all"):
                     inner = curr.func.value
                     curr = inner.value if isinstance(inner, ast.Await) else inner
                 else:
@@ -1030,6 +1095,15 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 continue
 
             unwrapped = val.value if isinstance(val, ast.Await) else val
+
+            # Check Tortoise ORM model queries (e.g. Model.get, Model.filter(...).first())
+            is_tort, tort_locked = _is_tortoise_query(unwrapped)
+            if is_tort:
+                q_line = getattr(unwrapped, "lineno", stmt_lineno)
+                q_end = max(getattr(unwrapped, "end_lineno", q_line), stmt_end_lineno)
+                for t in targets:
+                    for name in _extract_names(t):
+                        entity_sources[name] = (unwrapped, q_line, q_end, tort_locked)
 
             # Check A0: Local helper function returning locked or unlocked entity
             if isinstance(unwrapped, ast.Call):
@@ -1091,7 +1165,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         for name in _extract_names(t):
                             entity_sources[name] = (unwrapped, stmt_lineno, q_end, q_db_locked)
 
-                elif is_db and attr == "execute":
+                elif is_db and attr in ("execute", "exec"):
                     q_node = unwrapped
                     q_line = stmt_lineno
                     q_end_line = max(getattr(unwrapped, "end_lineno", stmt_lineno), stmt_end_lineno)
@@ -1113,7 +1187,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         for name in _extract_names(t):
                             result_proxies[name] = (q_node, q_line, q_end_line, q_db_locked)
 
-                elif attr in ("scalar", "scalars", "scalar_one", "scalar_one_or_none", "first", "one", "all"):
+                elif attr in ("scalar", "scalars", "scalar_one", "scalar_one_or_none", "first", "one", "one_or_none", "all"):
                     root_name = _target_root_name(unwrapped.func.value)
                     if root_name in result_proxies:
                         q_node, q_line, q_end_line, q_db_locked = result_proxies[root_name]
