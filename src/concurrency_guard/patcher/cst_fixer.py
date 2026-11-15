@@ -136,17 +136,28 @@ def _is_select_chain(node: cst.CSTNode) -> bool:
 
 
 def _chain_has_with_for_update(node: cst.CSTNode) -> bool:
-    """Check if with_for_update is called anywhere in the call chain."""
+    """Check if with_for_update or select_for_update is called anywhere in the call chain."""
     curr: Optional[cst.CSTNode] = node
     while curr is not None:
         if isinstance(curr, cst.Call):
-            if isinstance(curr.func, cst.Attribute) and curr.func.attr.value == "with_for_update":
+            if isinstance(curr.func, cst.Attribute) and curr.func.attr.value in ("with_for_update", "select_for_update"):
                 return True
             curr = curr.func
         elif isinstance(curr, cst.Attribute):
+            if curr.attr.value in ("with_for_update", "select_for_update"):
+                return True
             curr = curr.value
         else:
             break
+    return False
+
+
+def _is_capitalized_name_or_attr(node: cst.CSTNode) -> bool:
+    """Check if CST node represents a capitalized class/model name or attribute."""
+    if isinstance(node, cst.Name):
+        return bool(node.value and node.value[0].isupper())
+    if isinstance(node, cst.Attribute):
+        return bool(node.attr.value and node.attr.value[0].isupper())
     return False
 
 
@@ -165,19 +176,19 @@ def _get_module_name(node: Optional[cst.CSTNode]) -> str:
 
 
 class _WithForUpdateChecker(cst.CSTVisitor):
-    """Visitor to detect whether a function contains .with_for_update()."""
+    """Visitor to detect whether a function contains .with_for_update() or .select_for_update()."""
 
     def __init__(self) -> None:
         super().__init__()
         self.has_with_for_update = False
 
     def visit_Name(self, node: cst.Name) -> None:
-        if node.value == "with_for_update":
+        if node.value in ("with_for_update", "select_for_update"):
             self.has_with_for_update = True
 
 
 def _func_has_with_for_update(fn: cst.FunctionDef) -> bool:
-    """Check if function definition already contains .with_for_update()."""
+    """Check if function definition already contains .with_for_update() or .select_for_update()."""
     checker = _WithForUpdateChecker()
     fn.visit(checker)
     return checker.has_with_for_update
@@ -409,30 +420,85 @@ class WithForUpdateTransformer(cst.CSTTransformer):
         return updated_node
 
     def leave_Call(self, original_node: cst.Call, updated_node: cst.Call) -> cst.Call:
-        """Append .with_for_update() to the outermost select(...) call chain."""
+        """Append .with_for_update() to select(...) chains or .select_for_update() to Tortoise ORM queries."""
         if not (self._current_async_func and self._func_needs_fix):
             return updated_node
 
-        if not _is_select_chain(original_node):
-            return updated_node
+        # 1. SQLAlchemy / SQLModel select(...) chain
+        if _is_select_chain(original_node):
+            parent = self.get_metadata(ParentNodeProvider, original_node)
+            if isinstance(parent, cst.Attribute) and parent.value is original_node:
+                return updated_node
+            if _chain_has_with_for_update(original_node) or _chain_has_with_for_update(updated_node):
+                return updated_node
+            return cst.Call(
+                func=cst.Attribute(
+                    value=updated_node,
+                    attr=cst.Name("with_for_update"),
+                ),
+                args=[],
+            )
 
-        # Ensure we only patch the outermost Call in a method chain
-        parent = self.get_metadata(ParentNodeProvider, original_node)
-        if isinstance(parent, cst.Attribute) and parent.value is original_node:
-            return updated_node
-
-        # Do not append if already contains with_for_update anywhere in chain
+        # 2. Tortoise ORM model queries
         if _chain_has_with_for_update(original_node) or _chain_has_with_for_update(updated_node):
             return updated_node
 
-        # Append .with_for_update()
-        return cst.Call(
-            func=cst.Attribute(
-                value=updated_node,
-                attr=cst.Name("with_for_update"),
-            ),
-            args=[],
-        )
+        func = updated_node.func
+        if isinstance(func, cst.Attribute):
+            attr_name = func.attr.value
+            tortoise_fetch_methods = ("first", "one", "all", "one_or_none", "get", "get_or_none")
+            tortoise_qs_methods = (
+                "filter",
+                "all",
+                "exclude",
+                "order_by",
+                "limit",
+                "offset",
+                "distinct",
+                "select_related",
+                "prefetch_related",
+            )
+
+            # Case 2A: Model.get(...) or Model.get_or_none(...) -> Model.select_for_update().get(...)
+            if attr_name in ("get", "get_or_none") and _is_capitalized_name_or_attr(func.value):
+                locked_model = cst.Call(
+                    func=cst.Attribute(value=func.value, attr=cst.Name("select_for_update")),
+                    args=[],
+                )
+                return updated_node.with_changes(func=func.with_changes(value=locked_model))
+
+            # Case 2B: Model.filter(...).first() or .all() -> Model.filter(...).select_for_update().first()
+            if attr_name in tortoise_fetch_methods:
+                inner_call = func.value
+                if (
+                    isinstance(inner_call, cst.Call)
+                    and isinstance(inner_call.func, cst.Attribute)
+                    and inner_call.func.attr.value in tortoise_qs_methods
+                ):
+                    root: Optional[cst.CSTNode] = inner_call.func.value
+                    while isinstance(root, cst.Call) and isinstance(root.func, cst.Attribute):
+                        root = root.func.value
+                    if root is not None and _is_capitalized_name_or_attr(root):
+                        locked_inner = cst.Call(
+                            func=cst.Attribute(value=inner_call, attr=cst.Name("select_for_update")),
+                            args=[],
+                        )
+                        return updated_node.with_changes(func=func.with_changes(value=locked_inner))
+
+            # Case 2C: Standalone Model.filter(...) without chaining
+            if attr_name in tortoise_qs_methods:
+                parent = self.get_metadata(ParentNodeProvider, original_node)
+                if not (isinstance(parent, cst.Attribute) and parent.value is original_node):
+                    root_c: Optional[cst.CSTNode] = func.value
+                    while isinstance(root_c, cst.Call) and isinstance(root_c.func, cst.Attribute):
+                        root_c = root_c.func.value
+                    if root_c is not None and _is_capitalized_name_or_attr(root_c):
+                        return cst.Call(
+                            func=cst.Attribute(value=updated_node, attr=cst.Name("select_for_update")),
+                            args=[],
+                        )
+
+        return updated_node
 
 
 class IdempotencyHeaderTransformer(cst.CSTTransformer):
