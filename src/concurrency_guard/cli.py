@@ -502,22 +502,37 @@ def fix(
         exists=True,
         help="Target Python file or directory to auto-patch with concurrency fixes",
     ),
-    rule: Optional[str] = typer.Option(
+    rule: Optional[list[str]] = typer.Option(
         None,
         "--rule",
         "-r",
-        help="Specific rule to fix (e.g. CG-001, CG-006, CG-007, CG-009, CG-016, CG-017). Defaults to all supported rules.",
+        help="Specific rule(s) to fix (e.g. CG-001, CG-006). Repeatable or comma-separated.",
     ),
     write: bool = typer.Option(
         False,
         "--write",
         help="Write the patched code back to disk",
     ),
+    diff: bool = typer.Option(
+        False,
+        "--diff",
+        help="Print unified diff of changes without modifying files on disk unless --write is set",
+    ),
+    check: bool = typer.Option(
+        False,
+        "--check",
+        help="Dry-run check mode. Exit 1 if files would be modified, 0 otherwise.",
+    ),
     dry_run: bool = typer.Option(
         False,
         "--dry-run",
-        "--diff",
         help="Print unified diff of changes without modifying files on disk",
+    ),
+    format: str = typer.Option(
+        "text",
+        "--format",
+        "-f",
+        help="Output format: 'text' or 'json'",
     ),
     changed_only: bool = typer.Option(
         False,
@@ -537,6 +552,10 @@ def fix(
     ),
 ) -> None:
     """Auto-patch concurrency race conditions and idempotency bugs using LibCST."""
+    format_clean = format.lower()
+    if format_clean not in ("text", "json"):
+        raise typer.BadParameter("format must be one of: text, json", param_hint="--format")
+
     try:
         config = load_cguard_config(start_path=file_path, config_path=config_file)
     except (FileNotFoundError, ValueError) as err:
@@ -552,11 +571,28 @@ def fix(
         repo_dir = file_path if file_path.is_dir() else file_path.parent
         changed_files = get_changed_python_files(repo_dir, base_ref=base_ref)
 
-    rules_filter = {rule.upper()} if rule else None
+    rules_filter: Optional[set[str]] = None
+    if rule:
+        rules_filter = set()
+        items = [rule] if isinstance(rule, str) else rule
+        for item in items:
+            for r in item.split(","):
+                cleaned = r.strip().upper()
+                if cleaned:
+                    rules_filter.add(cleaned)
+
     diff_gen = DiffGenerator(rules=rules_filter)
 
+    show_diff = diff or dry_run
+    # --check guarantees zero disk modification
+    # --diff without --write is also dry-run preview by default
+    should_write = write and not check and not dry_run
+    is_dry_run = not should_write
+
     total_patched_files = 0
+    would_modify_count = 0
     any_preflight_failed = False
+    json_files: list[dict[str, Any]] = []
 
     rule_descriptions = {
         "CG-001": "Appended .with_for_update() row lock to query",
@@ -571,7 +607,7 @@ def fix(
 
     for target in target_files:
         if changed_files is not None and target.resolve() not in changed_files:
-            if len(target_files) == 1:
+            if len(target_files) == 1 and format_clean != "json":
                 console.print(f"[dim]Skipping {target}: not changed in git.[/dim]")
             continue
 
@@ -582,34 +618,90 @@ def fix(
 
         initial_findings = scan_file(target)
 
+        try:
+            rel_path = str(target.relative_to(Path.cwd()))
+        except (ValueError, TypeError, OSError):
+            rel_path = str(target).lstrip("/")
+
+        fromfile = f"a/{rel_path}"
+        tofile = f"b/{rel_path}"
+
         diff_result = diff_gen.generate_diff(
             source_code,
             filepath=target,
-            fromfile=str(target),
-            tofile=f"{target} (patched)",
+            fromfile=fromfile,
+            tofile=tofile,
         )
 
         if not diff_result.is_valid:
-            console.print(
-                Panel(
-                    f"[bold red]❌ Preflight syntax validation failed for {target}:[/bold red]\n"
-                    f"[red]{diff_result.error_message}[/red]\n"
-                    "[yellow]Patch discarded. File was not modified.[/yellow]",
-                    title="[bold red]Patch Rejected[/bold red]",
-                    border_style="red",
-                )
-            )
             any_preflight_failed = True
+            if format_clean == "json":
+                json_files.append({
+                    "file": str(target),
+                    "modified": False,
+                    "diff": "",
+                    "fixed_rules": [],
+                    "skipped": [],
+                    "is_valid": False,
+                    "error_message": diff_result.error_message,
+                })
+            else:
+                console.print(
+                    Panel(
+                        f"[bold red]❌ Preflight syntax validation failed for {target}:[/bold red]\n"
+                        f"[red]{diff_result.error_message}[/red]\n"
+                        "[yellow]Patch discarded. File was not modified.[/yellow]",
+                        title="[bold red]Patch Rejected[/bold red]",
+                        border_style="red",
+                    )
+                )
             continue
 
         patched_code = diff_result.patched_code
+        is_modified = (source_code != patched_code)
+        if is_modified:
+            would_modify_count += 1
 
-        if dry_run:
+        # Determine which rules were fixed
+        remaining_findings = scan_source_code(patched_code, filename=str(target))
+        remaining_ids = {f.rule_id for f in remaining_findings}
+        fixed_findings = [f for f in initial_findings if f.rule_id not in remaining_ids]
+
+        if format_clean == "json":
+            json_files.append({
+                "file": str(target),
+                "modified": is_modified,
+                "diff": diff_result.diff if is_modified else "",
+                "fixed_rules": [f.rule_id for f in fixed_findings],
+                "skipped": [
+                    {
+                        "rule_id": s.rule_id,
+                        "function": s.function_name,
+                        "lineno": s.lineno,
+                        "reason": s.reason,
+                    }
+                    for s in diff_result.skipped
+                ],
+                "is_valid": True,
+                "error_message": None,
+            })
+            if is_modified and should_write:
+                target.write_text(patched_code, encoding="utf-8")
+            continue
+
+        if show_diff:
             if diff_result.diff:
                 colored = colorize_diff(diff_result.diff, is_tty=sys.stdout.isatty())
                 sys.stdout.write(colored)
                 if not colored.endswith("\n"):
                     sys.stdout.write("\n")
+            if is_modified and should_write:
+                target.write_text(patched_code, encoding="utf-8")
+            continue
+
+        if check and not show_diff:
+            if is_modified:
+                console.print(f"[bold red]{target}[/bold red] would be modified by cguard fix.")
             continue
 
         if diff_result.skipped:
@@ -626,7 +718,7 @@ def fix(
                 skipped_table.add_row(skipped.rule_id, skipped.function_name, str(skipped.lineno), skipped.reason)
             console.print(skipped_table)
 
-        if source_code == patched_code:
+        if not is_modified:
             if len(target_files) == 1:
                 console.print(
                     Panel(
@@ -637,11 +729,6 @@ def fix(
             continue
 
         total_patched_files += 1
-
-        # Determine which rules were fixed
-        remaining_findings = scan_source_code(patched_code, filename=str(target))
-        remaining_ids = {f.rule_id for f in remaining_findings}
-        fixed_findings = [f for f in initial_findings if f.rule_id not in remaining_ids]
 
         # Render summary table of patched rules
         summary_table = Table(
@@ -666,8 +753,8 @@ def fix(
 
         console.print(summary_table)
 
-        diff = diff_result.diff
-        diff_syntax = Syntax(diff, "diff", theme="monokai", line_numbers=True)
+        diff_str = diff_result.diff
+        diff_syntax = Syntax(diff_str, "diff", theme="monokai", line_numbers=True)
         console.print(
             Panel(
                 diff_syntax,
@@ -676,7 +763,7 @@ def fix(
             )
         )
 
-        if write:
+        if should_write:
             target.write_text(patched_code, encoding="utf-8")
             console.print(
                 Panel(
@@ -685,23 +772,49 @@ def fix(
                 )
             )
 
-    if dry_run:
+    if format_clean == "json":
+        all_diff = "".join(f["diff"] for f in json_files if f["diff"])
+        json_output = {
+            "dry_run": is_dry_run,
+            "would_modify_count": would_modify_count,
+            "total_files": len(target_files),
+            "diff": all_diff,
+            "files": json_files,
+            "preflight_failed": any_preflight_failed,
+        }
+        sys.stdout.write(json.dumps(json_output, indent=2) + "\n")
+        if check:
+            raise typer.Exit(code=1 if (would_modify_count > 0 or any_preflight_failed) else 0)
         raise typer.Exit(code=1 if any_preflight_failed else 0)
 
-    if total_patched_files == 0 and len(target_files) > 1:
-        console.print(
-            Panel(
-                "[bold green]No concurrency fixes needed across scanned files.[/bold green]",
-                border_style="green",
+    if check and not show_diff:
+        if would_modify_count > 0:
+            console.print(
+                f"[bold red]{would_modify_count} file{'s' if would_modify_count != 1 else ''} would be modified.[/bold red]"
             )
-        )
-    elif not write and total_patched_files > 0:
-        console.print(
-            Panel(
-                "[dim]Dry-run mode: Pass [bold]--write[/bold] to apply the patch directly to disk.[/dim]",
-                border_style="yellow",
+        else:
+            console.print(
+                "[bold green]No concurrency fixes needed. All files match desired state.[/bold green]"
             )
-        )
+
+    if not show_diff and not check:
+        if total_patched_files == 0 and len(target_files) > 1:
+            console.print(
+                Panel(
+                    "[bold green]No concurrency fixes needed across scanned files.[/bold green]",
+                    border_style="green",
+                )
+            )
+        elif not should_write and total_patched_files > 0:
+            console.print(
+                Panel(
+                    "[dim]Dry-run mode: Pass [bold]--write[/bold] to apply the patch directly to disk.[/dim]",
+                    border_style="yellow",
+                )
+            )
+
+    if check:
+        raise typer.Exit(code=1 if (would_modify_count > 0 or any_preflight_failed) else 0)
 
     raise typer.Exit(code=1 if any_preflight_failed else 0)
 

@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v2.13.0
+# ConcurrencyGuard (`cguard`) — v2.14.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-225%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-234%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -25,6 +25,26 @@ Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **Celery**, *
 Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
+
+## 🛡️ What's New in v2.14.0: Unified Diff Preview (`--diff`), CI Check Mode (`--check`), and Selective Rule Patching (`--rule`)
+
+`cguard` v2.14.0 introduces standard compiler-grade auto-patching workflows with dry-run diffs, strict CI verification gates, and targeted rule remediation:
+
+1. **Unified Diff Preview (`cguard fix --diff`):**
+   - Renders standard Git-style unified diffs (`--- a/...`, `+++ b/...`) directly to `stdout`.
+   - Automatic ANSI green (`+`) / red (`-`) syntax highlighting in interactive TTY sessions and clean, pipe-friendly plain text when redirected or scripted.
+   - Guaranteed zero disk mutation by default (standard `ruff`/`black` `--diff` semantics); combine with `--write` to simultaneously inspect and apply patches.
+2. **Strict CI Check Mode (`cguard fix --check`):**
+   - Non-destructive CI gate that exits with code `1` if any file *would* be modified by `cguard fix`, or code `0` if all files match desired concurrency safety standards.
+   - Can be combined with `--diff` (`cguard fix . --check --diff`) to both display proposed diffs in CI job logs and enforce gating.
+3. **Selective Rule Remediation (`--rule` / `-r`):**
+   - Filter auto-patching to specific rule IDs using repeatable or comma-separated options (e.g. `cguard fix . --rule CG-001` or `cguard fix . -r CG-001 -r CG-002` or `cguard fix . --rule CG-001,CG-002`).
+   - Leave other findings untouched while surgically fixing selected concurrency patterns.
+4. **Machine-Readable JSON Diff Format (`--format json`):**
+   - `cguard fix --diff --format json` produces structured JSON containing `dry_run: true`, `would_modify_count`, and per-file unified diff payloads for seamless integration with GitHub Actions, PR bot commentators, and IDE extensions.
+5. **In-Memory LibCST Engine Hardening (`fix_file` & `PatchResult`):**
+   - `cst_fixer.py` executes AST round-trip and scanner validation gates strictly in memory.
+   - New `fix_file()` API and enriched `PatchResult` with `unified_diff` and `modified` properties.
 
 ## 🛡️ What's New in v2.13.0: Unified pyproject.toml & .cguard.toml Configuration Engine
 
