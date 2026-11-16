@@ -58,6 +58,7 @@ class CGuardConfig:
     per_file_ignores: dict[str, list[str]] = field(default_factory=dict)
     rules_file: Optional[str] = None
     cache: bool = True
+    baseline: Optional[str] = None
     config_source: Optional[Path] = None
 
     def deterministic_hash(self) -> str:
@@ -75,6 +76,7 @@ class CGuardConfig:
             },
             "rules_file": self.rules_file,
             "cache": self.cache,
+            "baseline": self.baseline,
         }
         raw_bytes = json.dumps(normalized, sort_keys=True).encode("utf-8")
         return hashlib.sha256(raw_bytes).hexdigest()
@@ -261,6 +263,7 @@ def parse_toml_config(file_path: Path) -> CGuardConfig:
 
     rules_file = str(raw["rules_file"]) if raw.get("rules_file") else None
     cache = bool(raw.get("cache", True))
+    baseline = str(raw["baseline"]) if raw.get("baseline") else None
 
     return CGuardConfig(
         select=select_list,
@@ -272,6 +275,7 @@ def parse_toml_config(file_path: Path) -> CGuardConfig:
         per_file_ignores=per_file_ignores,
         rules_file=rules_file,
         cache=cache,
+        baseline=baseline,
         config_source=file_path,
     )
 
