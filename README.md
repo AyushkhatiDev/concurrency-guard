@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v3.0.0
+# ConcurrencyGuard (`cguard`) — v3.1.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-249%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-256%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -25,6 +25,23 @@ Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **SQLModel**,
 Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
+
+## 🛡️ What's New in v3.1.0: Enterprise Baseline & Technical Debt Ratcheting Engine (.cguard-baseline.json)
+
+In large production codebases with tens of thousands of lines of legacy code, fixing all existing concurrency debt on Day 1 is impractical. `cguard` v3.1.0 introduces a line-shift-resilient technical debt snapshot and ratcheting engine:
+
+1. **Line-Shift-Resilient Fingerprint Snapshots (`cguard baseline create`):**
+   - Generates a deterministic `.cguard-baseline.json` snapshot of all existing findings.
+   - Fingerprinting combines `rule_id`, POSIX relative path, function qualified name, and normalized source snippet hash—guaranteeing 100% line-drift immunity when imports, comments, or docstrings are added above existing code.
+2. **Zero-Friction CI Ratcheting (`cguard scan --baseline .cguard-baseline.json`):**
+   - Suppresses baselined legacy debt and fails CI ONLY when *new* concurrency bugs are introduced.
+   - Outputs a standardized summary footer: `Baselined: X suppressed | New: Y active | Resolved: Z fixed`.
+3. **Strict Downward Debt Ratcheting (`--update-baseline`):**
+   - Automatically prunes resolved findings from `.cguard-baseline.json` as developers remediate bugs, permanently locking in code quality gains without ever silently masking new bugs.
+4. **Strict CI Hygiene Gate (`--fail-on-stale-baseline`):**
+   - Exits with code `1` if the baseline contains resolved bugs that have not been cleaned up, keeping `.cguard-baseline.json` lean and accurate.
+5. **Unified Configuration (`pyproject.toml` & `.cguard.toml`):**
+   - Support `baseline = ".cguard-baseline.json"` under `[tool.cguard]` to enable baseline filtering automatically without CLI flags.
 
 ## 🛡️ What's New in v3.0.0: Multi-ORM Ecosystem Expansion (SQLModel & Tortoise ORM)
 
