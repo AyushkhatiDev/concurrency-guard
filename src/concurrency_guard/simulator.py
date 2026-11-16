@@ -242,57 +242,70 @@ def simulate_finding(
     timeline: list[TimelineEvent] = []
     anomaly: AnomalyProof
 
+    workers = max(2, workers)
+    worker_names = [f"Coroutine {chr(65 + i) if i < 26 else f'W{i+1}'}" for i in range(workers)]
+
+    t_clock = 0
+
     if finding.rule_id == "CG-004":
         timeline.append(
             TimelineEvent(
-                time_ms=0,
-                worker="[Coroutine A]",
+                time_ms=t_clock,
+                worker=f"[{worker_names[0]}]",
                 action=f"CHECK (line {read_line})",
                 code=read_snip,
                 state_description="Executes SELECT check -> finds entity does not exist (None). Suspends on await I/O.",
             )
         )
-        timeline.append(
-            TimelineEvent(
-                time_ms=1,
-                worker="[Event Loop]",
-                action="CONTEXT SWITCH",
-                code="event_loop.switch_task(task_A -> task_B)",
-                state_description="Coroutine A suspended on I/O. Event loop schedules Coroutine B.",
+        for w in worker_names[1:]:
+            t_clock += 1
+            timeline.append(
+                TimelineEvent(
+                    time_ms=t_clock,
+                    worker="[Event Loop]",
+                    action="CONTEXT SWITCH",
+                    code=f"event_loop.switch_task({worker_names[0]} -> {w})",
+                    state_description=f"{worker_names[0]} suspended on I/O. Event loop schedules {w}.",
+                )
             )
-        )
-        timeline.append(
-            TimelineEvent(
-                time_ms=2,
-                worker="[Coroutine B]",
-                action=f"CHECK (line {read_line})",
-                code=read_snip,
-                state_description="ALSO checks entity existence -> finds None because Coroutine A has not committed.",
+            t_clock += 1
+            timeline.append(
+                TimelineEvent(
+                    time_ms=t_clock,
+                    worker=f"[{w}]",
+                    action=f"CHECK (line {read_line})",
+                    code=read_snip,
+                    state_description=f"ALSO checks entity existence -> finds None because {worker_names[0]} has not committed.",
+                )
             )
-        )
+
+        t_clock += 1
         timeline.append(
             TimelineEvent(
-                time_ms=3,
-                worker="[Coroutine A]",
+                time_ms=t_clock,
+                worker=f"[{worker_names[0]}]",
                 action=f"ACT & COMMIT (lines {mutate_line}, {commit_line})",
                 code=f"{mutate_snip} ; {commit_snip}",
                 state_description="Resumes: inserts entity and commits to database.",
             )
         )
-        timeline.append(
-            TimelineEvent(
-                time_ms=4,
-                worker="[Coroutine B]",
-                action=f"ACT & COMMIT (lines {mutate_line}, {commit_line})",
-                code=f"{mutate_snip} ; {commit_snip}",
-                state_description="Resumes: ALSO inserts duplicate entity and commits (COLLISION / INTEGRITY CRASH!).",
+        for w in worker_names[1:]:
+            t_clock += 1
+            timeline.append(
+                TimelineEvent(
+                    time_ms=t_clock,
+                    worker=f"[{w}]",
+                    action=f"ACT & COMMIT (lines {mutate_line}, {commit_line})",
+                    code=f"{mutate_snip} ; {commit_snip}",
+                    state_description="Resumes: ALSO inserts duplicate entity and commits (COLLISION / INTEGRITY CRASH!).",
+                )
             )
-        )
+
         anomaly = AnomalyProof(
             anomaly_type="Check-Then-Act Uniqueness Collision",
             initial_state="Entity count = 0 (entity does not exist)",
-            expected_state="Entity count = 1 (1 created, 2nd rejected as duplicate)",
-            actual_state="Entity count = 2 (or IntegrityError crash during commit)",
+            expected_state=f"Entity count = 1 (1 created, {workers - 1} rejected as duplicate)",
+            actual_state=f"Entity count = {workers} (or IntegrityError crash during commit)",
             root_cause=(
                 "Time-of-check to time-of-use (TOCTOU) gap between SELECT check and INSERT commit "
                 "without a mutex/table lock or try/except IntegrityError handler."
@@ -301,107 +314,123 @@ def simulate_finding(
     elif finding.rule_id == "CG-002":
         timeline.append(
             TimelineEvent(
-                time_ms=0,
-                worker="[Coroutine A]",
+                time_ms=t_clock,
+                worker=f"[{worker_names[0]}]",
                 action=f"POST REQUEST (line {read_line})",
                 code=read_snip,
                 state_description="Receives client POST request without Idempotency-Key. Initiates processing.",
             )
         )
-        timeline.append(
-            TimelineEvent(
-                time_ms=1,
-                worker="[Event Loop]",
-                action="NETWORK RETRY",
-                code="client.retry_post_request()",
-                state_description="Client timeout or network jitter triggers identical retry request to Coroutine B.",
+        for w in worker_names[1:]:
+            t_clock += 1
+            timeline.append(
+                TimelineEvent(
+                    time_ms=t_clock,
+                    worker="[Event Loop]",
+                    action="NETWORK RETRY",
+                    code="client.retry_post_request()",
+                    state_description=f"Client timeout or network jitter triggers identical retry request to {w}.",
+                )
             )
-        )
-        timeline.append(
-            TimelineEvent(
-                time_ms=2,
-                worker="[Coroutine B]",
-                action=f"POST REQUEST (line {read_line})",
-                code=read_snip,
-                state_description="Executes without idempotency verification. Duplicates side-effect processing.",
+            t_clock += 1
+            timeline.append(
+                TimelineEvent(
+                    time_ms=t_clock,
+                    worker=f"[{w}]",
+                    action=f"POST REQUEST (line {read_line})",
+                    code=read_snip,
+                    state_description="Executes without idempotency verification. Duplicates side-effect processing.",
+                )
             )
-        )
+
+        t_clock += 1
         timeline.append(
             TimelineEvent(
-                time_ms=3,
-                worker="[Coroutine A]",
+                time_ms=t_clock,
+                worker=f"[{worker_names[0]}]",
                 action=f"COMMIT (line {commit_line})",
                 code=commit_snip,
                 state_description="Commits request 1 state mutation to database.",
             )
         )
-        timeline.append(
-            TimelineEvent(
-                time_ms=4,
-                worker="[Coroutine B]",
-                action=f"COMMIT (line {commit_line})",
-                code=commit_snip,
-                state_description="Commits duplicate request 2 state mutation (DUPLICATE CHARGE / ACTION!).",
+        for w in worker_names[1:]:
+            t_clock += 1
+            timeline.append(
+                TimelineEvent(
+                    time_ms=t_clock,
+                    worker=f"[{w}]",
+                    action=f"COMMIT (line {commit_line})",
+                    code=commit_snip,
+                    state_description="Commits duplicate request state mutation (DUPLICATE CHARGE / ACTION!).",
+                )
             )
-        )
+
         anomaly = AnomalyProof(
             anomaly_type="Non-Idempotent Duplicate Execution",
             initial_state="1 intended operation",
-            expected_state="1 operation executed; network retry returns cached response",
-            actual_state="2 duplicate operations executed concurrently",
+            expected_state=f"1 operation executed; {workers - 1} retries return cached response",
+            actual_state=f"{workers} duplicate operations executed concurrently",
             root_cause="Missing 'Idempotency-Key' request header enables concurrent duplicate submissions.",
         )
     else:  # CG-001 Unlocked Read-Modify-Write
         timeline.append(
             TimelineEvent(
-                time_ms=0,
-                worker="[Coroutine A]",
+                time_ms=t_clock,
+                worker=f"[{worker_names[0]}]",
                 action=f"READ (line {read_line})",
                 code=read_snip,
                 state_description="Reads initial balance S0 ($100.00). Hits await I/O yield boundary.",
             )
         )
-        timeline.append(
-            TimelineEvent(
-                time_ms=1,
-                worker="[Event Loop]",
-                action="CONTEXT SWITCH",
-                code="event_loop.switch_task(task_A -> task_B)",
-                state_description="Coroutine A suspended on await I/O. Event loop schedules Coroutine B.",
+        for w in worker_names[1:]:
+            t_clock += 1
+            timeline.append(
+                TimelineEvent(
+                    time_ms=t_clock,
+                    worker="[Event Loop]",
+                    action="CONTEXT SWITCH",
+                    code=f"event_loop.switch_task({worker_names[0]} -> {w})",
+                    state_description=f"{worker_names[0]} suspended on await I/O. Event loop schedules {w}.",
+                )
             )
-        )
-        timeline.append(
-            TimelineEvent(
-                time_ms=2,
-                worker="[Coroutine B]",
-                action=f"READ (line {read_line})",
-                code=read_snip,
-                state_description="Executes without .with_for_update() row lock. ALSO reads stale S0 ($100.00).",
+            t_clock += 1
+            timeline.append(
+                TimelineEvent(
+                    time_ms=t_clock,
+                    worker=f"[{w}]",
+                    action=f"READ (line {read_line})",
+                    code=read_snip,
+                    state_description="Executes without .with_for_update() row lock. ALSO reads stale S0 ($100.00).",
+                )
             )
-        )
+
+        t_clock += 1
         timeline.append(
             TimelineEvent(
-                time_ms=3,
-                worker="[Coroutine A]",
+                time_ms=t_clock,
+                worker=f"[{worker_names[0]}]",
                 action=f"MUTATE & COMMIT (lines {mutate_line}, {commit_line})",
                 code=f"{mutate_snip} ; {commit_snip}",
                 state_description="Resumes: computes $100 - $80 = $20. Commits balance = $20 to database.",
             )
         )
-        timeline.append(
-            TimelineEvent(
-                time_ms=4,
-                worker="[Coroutine B]",
-                action=f"MUTATE & COMMIT (lines {mutate_line}, {commit_line})",
-                code=f"{mutate_snip} ; {commit_snip}",
-                state_description="Resumes with stale S0 ($100): computes $100 - $80 = $20. Overwrites balance = $20 (LOST UPDATE!).",
+        for w in worker_names[1:]:
+            t_clock += 1
+            timeline.append(
+                TimelineEvent(
+                    time_ms=t_clock,
+                    worker=f"[{w}]",
+                    action=f"MUTATE & COMMIT (lines {mutate_line}, {commit_line})",
+                    code=f"{mutate_snip} ; {commit_snip}",
+                    state_description="Resumes with stale S0 ($100): computes $100 - $80 = $20. Overwrites balance = $20 (LOST UPDATE!).",
+                )
             )
-        )
+
         anomaly = AnomalyProof(
             anomaly_type="Lost Update / Double-Spend Anomaly",
             initial_state="balance = 100.00",
-            expected_state="balance = 20.00 (1 withdrawal approved, 2nd rejected for insufficient funds)",
-            actual_state="balance = 20.00 (Both withdrawals succeeded! 160.00 debited but only 80.00 deducted)",
+            expected_state=f"balance = 20.00 (1 withdrawal approved, {workers - 1} rejected for insufficient funds)",
+            actual_state=f"balance = 20.00 (All {workers} withdrawals succeeded! {workers * 80:.2f} debited but only 80.00 deducted)",
             root_cause="Missing .with_for_update() row lock allowed Coroutine B to read uncommitted state S0.",
         )
 

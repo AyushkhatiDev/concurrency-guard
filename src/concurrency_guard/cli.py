@@ -598,12 +598,17 @@ def _combine_reproducers(traces: list[InterleavingTrace], workers: int = 2) -> s
     body_parts: list[str] = []
     for i, t in enumerate(traces, start=1):
         code = t.reproducer_code
+        stripped = code.strip()
+        if stripped.startswith('"""'):
+            parts = stripped.split('"""', 2)
+            if len(parts) >= 3:
+                stripped = parts[2].strip()
         lines = [
             ln
-            for ln in code.splitlines()
-            if not ln.startswith("import ")
+            for ln in stripped.splitlines()
+            if not ln.startswith("from __future__")
+            and not ln.startswith("import ")
             and not ln.startswith("from ")
-            and not ln.startswith('"""')
         ]
         body_parts.append(
             f"# --- Finding #{i}: {t.function_name} ({t.rule_id}) ---\n"
