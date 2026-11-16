@@ -18,6 +18,13 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from concurrency_guard import __version__
+from concurrency_guard.baseline import (
+    Baseline,
+    BaselineFilterResult,
+    create_baseline,
+    filter_with_baseline,
+    update_baseline_file,
+)
 from concurrency_guard.cache.file_cache import DEFAULT_CACHE_DIR, FileCache
 from concurrency_guard.cache.manager import (
     CacheManager,
@@ -152,6 +159,22 @@ def scan(
         "-i",
         help="Ignore specific rule IDs (e.g. -i CG-003, or comma-separated).",
     ),
+    baseline: Optional[Path] = typer.Option(
+        None,
+        "--baseline",
+        "-b",
+        help="Path to .cguard-baseline.json to suppress existing findings.",
+    ),
+    update_baseline: bool = typer.Option(
+        False,
+        "--update-baseline",
+        help="Update baseline file by removing resolved findings (downward ratcheting).",
+    ),
+    fail_on_stale_baseline: bool = typer.Option(
+        False,
+        "--fail-on-stale-baseline",
+        help="Exit code 1 if baseline contains resolved findings that have not been cleaned up.",
+    ),
 ) -> None:
     """Scan Python files or directories for concurrency vulnerabilities."""
     start_time = time.perf_counter()
@@ -260,6 +283,34 @@ def scan(
     if cache_mgr is not None and path.is_dir() and hasattr(cache_mgr, "purge_stale_entries"):
         cache_mgr.purge_stale_entries(set(py_files))
 
+    effective_baseline_path: Optional[Path] = baseline
+    if effective_baseline_path is None and config.baseline:
+        cfg_base = Path(config.baseline)
+        if not cfg_base.is_absolute():
+            base_dir = config.config_source.parent if config.config_source else (path if path.is_dir() else path.parent)
+            cfg_base = (base_dir / config.baseline).resolve()
+        effective_baseline_path = cfg_base
+
+    baseline_result: Optional[BaselineFilterResult] = None
+    if effective_baseline_path is not None:
+        if not effective_baseline_path.is_file():
+            raise typer.BadParameter(f"Baseline file not found: {effective_baseline_path}", param_hint="--baseline")
+        loaded_baseline = Baseline.load(effective_baseline_path)
+        workspace_root = path if path.is_dir() else path.parent
+        baseline_result = filter_with_baseline(findings, loaded_baseline, root_dir=workspace_root)
+
+        if update_baseline:
+            update_baseline_file(
+                effective_baseline_path,
+                baseline_result.baselined_findings,
+                root_dir=workspace_root,
+                cguard_version=__version__,
+            )
+
+        findings_to_report = baseline_result.new_findings
+    else:
+        findings_to_report = findings
+
     elapsed_ms = (time.perf_counter() - start_time) * 1000
     elapsed_s = elapsed_ms / 1000.0
     suppressed_count = suppression_filter.suppressed_count
@@ -270,12 +321,18 @@ def scan(
 
     telemetry_summary = (
         f"Scanned {len(py_files)} file(s) ({cache_hits} cached, {cache_misses} parsed across {effective_jobs} worker(s)) "
-        f"in {elapsed_s:.2f}s | Found {len(findings)} issue(s){suppressed_text}"
+        f"in {elapsed_s:.2f}s | Found {len(findings_to_report)} issue(s){suppressed_text}"
+    )
+    if baseline_result is not None:
+        telemetry_summary += f" | {baseline_result.summary_footer}"
+
+    has_fail = bool(findings_to_report) or (
+        fail_on_stale_baseline and baseline_result is not None and baseline_result.total_resolved > 0
     )
 
     if format.lower() == "sarif" or (output is not None and output.suffix.lower() == ".sarif"):
         sarif_text = serialize_sarif(
-            findings,
+            findings_to_report,
             workspace_root=path if path.is_dir() else path.parent,
         )
         if output is not None:
@@ -283,7 +340,7 @@ def scan(
             output.write_text(sarif_text, encoding="utf-8")
         else:
             typer.echo(sarif_text)
-        raise typer.Exit(code=1 if findings else 0)
+        raise typer.Exit(code=1 if has_fail else 0)
 
     if format.lower() == "json" or (output is not None and output.suffix.lower() == ".json"):
         payload = {
@@ -292,8 +349,16 @@ def scan(
             "cache_misses": cache_misses,
             "workers": effective_jobs,
             "elapsed_ms": round(elapsed_ms, 2),
-            "findings_count": len(findings),
+            "findings_count": len(findings_to_report),
             "suppressed_count": suppressed_count,
+            "baseline": {
+                "baselined_count": baseline_result.total_baselined,
+                "new_count": baseline_result.total_new,
+                "resolved_count": baseline_result.total_resolved,
+                "summary": baseline_result.summary_footer,
+            }
+            if baseline_result
+            else None,
             "findings": [
                 {
                     "rule_id": f.rule_id,
@@ -305,7 +370,7 @@ def scan(
                     "suggested_fix_hint": f.suggested_fix_hint,
                     "confidence": f.confidence,
                 }
-                for f in findings
+                for f in findings_to_report
             ],
         }
         json_text = json.dumps(payload, indent=2)
@@ -314,7 +379,7 @@ def scan(
             output.write_text(json_text, encoding="utf-8")
         else:
             typer.echo(json_text)
-        raise typer.Exit(code=1 if findings else 0)
+        raise typer.Exit(code=1 if has_fail else 0)
 
     if format.lower() != "table":
         raise typer.BadParameter("format must be one of: table, json, sarif", param_hint="--format")
@@ -323,11 +388,11 @@ def scan(
         output.parent.mkdir(parents=True, exist_ok=True)
         summary_lines = [
             f"[{f.rule_id}] {f.filename}:{f.lineno} {f.function_name}: {f.message} (Fix: {f.suggested_fix_hint})"
-            for f in findings
+            for f in findings_to_report
         ]
         output.write_text("\n".join(summary_lines) + ("\n" if summary_lines else ""), encoding="utf-8")
 
-    if findings:
+    if findings_to_report:
         table = Table(
             title="Concurrency Guard - AST Vulnerability Findings",
             show_header=True,
@@ -340,7 +405,7 @@ def scan(
         table.add_column("Vulnerability Description", style="white")
         table.add_column("Fix Hint", style="green")
 
-        for f in findings:
+        for f in findings_to_report:
             table.add_row(
                 f.rule_id,
                 f.confidence,
@@ -351,22 +416,40 @@ def scan(
             )
 
         console.print(table)
+        footer_block = f"\n[bold yellow]{baseline_result.summary_footer}[/bold yellow]" if baseline_result else ""
         console.print(
             Panel(
-                f"[bold red]Found {len(findings)} concurrency vulnerability issue(s){suppressed_text}.[/bold red]\n"
-                f"[dim]{telemetry_summary}[/dim]",
+                f"[bold red]Found {len(findings_to_report)} concurrency vulnerability issue(s){suppressed_text}.[/bold red]\n"
+                f"[dim]{telemetry_summary}[/dim]{footer_block}",
                 border_style="red",
             )
         )
+        if baseline_result:
+            console.print(f"[bold]{baseline_result.summary_footer}[/bold]")
         raise typer.Exit(code=1)
 
+    if fail_on_stale_baseline and baseline_result is not None and baseline_result.total_resolved > 0:
+        console.print(
+            Panel(
+                f"[bold red]Strict CI failure: baseline contains {baseline_result.total_resolved} resolved finding(s) that must be cleaned up (--fail-on-stale-baseline).[/bold red]\n"
+                f"[dim]{telemetry_summary}[/dim]\n"
+                f"[bold yellow]{baseline_result.summary_footer}[/bold yellow]",
+                border_style="red",
+            )
+        )
+        console.print(f"[bold]{baseline_result.summary_footer}[/bold]")
+        raise typer.Exit(code=1)
+
+    footer_block = f"\n[bold cyan]{baseline_result.summary_footer}[/bold cyan]" if baseline_result else ""
     console.print(
         Panel(
             f"[bold green]All AST concurrency checks passed. No vulnerabilities found{suppressed_text}.[/bold green]\n"
-            f"[dim]{telemetry_summary}[/dim]",
+            f"[dim]{telemetry_summary}[/dim]{footer_block}",
             border_style="green",
         )
     )
+    if baseline_result:
+        console.print(f"[bold]{baseline_result.summary_footer}[/bold]")
     raise typer.Exit(code=0)
 
 
@@ -906,6 +989,136 @@ def report(
 
     if findings or (barrier_result and barrier_result.get("invariant_violated")):
         raise typer.Exit(code=1)
+    raise typer.Exit(code=0)
+
+
+baseline_app = typer.Typer(
+    name="baseline",
+    help="Manage ConcurrencyGuard technical debt baselines (.cguard-baseline.json).",
+)
+app.add_typer(baseline_app, name="baseline")
+
+
+@baseline_app.command(name="create")
+def baseline_create(
+    path: Path = typer.Argument(
+        Path("."),
+        exists=True,
+        help="Path to Python file or directory to scan for baseline generation.",
+    ),
+    output: Path = typer.Option(
+        Path(".cguard-baseline.json"),
+        "--output",
+        "-o",
+        help="Destination path for generated .cguard-baseline.json file.",
+    ),
+    config_file: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to dedicated configuration file (.cguard.toml, cguard.toml, or pyproject.toml).",
+    ),
+    select_rules: Optional[list[str]] = typer.Option(
+        None,
+        "--select-rule",
+        "-s",
+        help="Whitelist specific rule IDs (e.g. -s CG-001 -s CG-002, or comma-separated).",
+    ),
+    ignore_rules: Optional[list[str]] = typer.Option(
+        None,
+        "--ignore-rule",
+        "-i",
+        help="Ignore specific rule IDs (e.g. -i CG-003, or comma-separated).",
+    ),
+    confidence: Optional[str] = typer.Option(
+        None,
+        "--confidence",
+        help="Filter findings by minimum confidence level: 'high', 'medium', or 'low'.",
+    ),
+    rules: Optional[Path] = typer.Option(
+        None,
+        "--rules",
+        help="YAML file containing custom concurrency rules.",
+    ),
+    ignore_pragma: bool = typer.Option(
+        False,
+        "--ignore-pragma",
+        help="Bypass inline '# cguard: ignore' pragma comments and report all findings.",
+    ),
+    jobs: Optional[int] = typer.Option(
+        None,
+        "--jobs",
+        "-j",
+        help="Number of worker processes for parallel scanning.",
+    ),
+) -> None:
+    """Scan the target codebase and generate a deterministic .cguard-baseline.json snapshot."""
+    try:
+        config = load_cguard_config(start_path=path, config_path=config_file)
+    except (FileNotFoundError, ValueError) as err:
+        raise typer.BadParameter(str(err), param_hint="--config") from err
+
+    cli_selected = _parse_cli_rules(select_rules)
+    if cli_selected:
+        config.select = cli_selected
+        config.ignore = [r for r in config.ignore if r not in cli_selected]
+
+    cli_ignored = _parse_cli_rules(ignore_rules)
+    if cli_ignored:
+        config.ignore = list(dict.fromkeys(config.ignore + cli_ignored))
+
+    if confidence is not None:
+        config.confidence = confidence.lower()
+
+    if jobs is not None:
+        config.jobs = jobs
+
+    py_files = discover_python_files(path, config=config)
+    effective_rules = rules or (path.parent / config.rules_file if config.rules_file and path.is_file() else path / config.rules_file if config.rules_file else None)
+    try:
+        custom_rules = load_yaml_rules(effective_rules) if effective_rules else None
+    except (OSError, ValueError, RuntimeError) as error:
+        raise typer.BadParameter(str(error), param_hint="--rules") from error
+
+    suppression_filter = SuppressionFilter(ignore_pragma=ignore_pragma)
+    effective_jobs = jobs or os.cpu_count() or 4
+    findings = scan_project(
+        py_files,
+        roots=[path] if path.is_dir() else [path.parent],
+        custom_rules=custom_rules,
+        cache_manager=None,
+        suppression_filter=suppression_filter,
+        jobs=effective_jobs,
+        config=config,
+    )
+    if config.select:
+        findings = [f for f in findings if f.rule_id in config.select]
+    elif config.ignore:
+        findings = [f for f in findings if f.rule_id not in config.ignore]
+
+    eff_conf = (confidence or config.confidence or "low").upper()
+    allowed_conf = (
+        {"HIGH"}
+        if eff_conf == "HIGH"
+        else ({"HIGH", "MEDIUM"} if eff_conf == "MEDIUM" else {"HIGH", "MEDIUM", "LOW"})
+    )
+    findings = [f for f in findings if (f.confidence or "HIGH").upper() in allowed_conf]
+
+    workspace_root = path if path.is_dir() else path.parent
+    base_obj = create_baseline(
+        findings,
+        root_dir=workspace_root,
+        cguard_version=__version__,
+    )
+    base_obj.save(output)
+
+    console.print(
+        Panel(
+            f"[bold green]Created baseline with {len(findings)} finding(s) in {output}[/bold green]\n"
+            f"[dim]Scanned {len(py_files)} file(s). All existing findings recorded as technical debt.[/dim]",
+            border_style="green",
+        )
+    )
     raise typer.Exit(code=0)
 
 
