@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v3.1.0
+# ConcurrencyGuard (`cguard`) — v3.2.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-256%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-265%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -25,6 +25,28 @@ Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **SQLModel**,
 Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
+
+## 🛡️ What's New in v3.2.0: Deterministic Async Interleaving Simulator & Chaos Reproducer Generator (`cguard simulate`)
+
+Static analysis tools often suffer from "alert fatigue" when engineers question whether a reported race condition can truly manifest in production. `cguard` v3.2.0 introduces the **Deterministic Async Interleaving Simulator & Automated Pytest Chaos Reproducer Engine**:
+
+1. **AST Timeline Step Extraction (`simulator.py`):**
+   - Deconstructs async endpoint definitions into discrete chronological steps: `READ` / `CHECK`, `YIELD_BOUNDARY` (`await`), `MUTATE` / `ACT`, and `COMMIT`.
+   - Maps precise source code line coordinates and extracts clean expression snippets.
+2. **Deterministic Interleaving Schedule & State Anomaly Simulation (`cguard simulate [PATH]`):**
+   - Simulates multi-coroutine execution on the Python asyncio event loop (with configurable `--workers`, default 2).
+   - Mathematically and empirically proves race condition anomalies:
+     - **Lost Update / Double-Spend (`CG-001`)**: Proves concurrent coroutines read identical initial state $S_0$ during await I/O suspension, causing silent balance overwrite.
+     - **Non-Idempotent Duplicate Action (`CG-002`)**: Models network retry jitter without `Idempotency-Key`, proving duplicate mutations.
+     - **Check-Then-Act Uniqueness Collision (`CG-004`)**: Demonstrates TOCTOU race where multiple coroutines find an entity non-existent and concurrently insert duplicate entries.
+   - Displays formatted Rich tables with millisecond event timelines, coroutine context switches, and empirical chaos proof panels.
+3. **Automated Pytest Async Chaos Reproducer Generator (`--export-test <path>`):**
+   - Automatically generates self-contained, standalone, 100% runnable `pytest` async chaos test suites.
+   - Uses `asyncio.Barrier` to synchronize coroutines at the exact `await` read yield boundary, deterministically forcing the state corruption anomaly without relying on flaky `time.sleep()`.
+   - Includes both an **adversarial test** reproducing the failure and a **safe locked test** verifying that row-level locks or idempotency checks resolve the issue.
+4. **CLI & Machine-Readable Output (`--format json`):**
+   - Supports `--format json` for integration into IDE diagnostics, continuous verification pipelines, and AI agent workflows.
+   - Supports selective simulation with `--rule` (e.g. `cguard simulate . --rule CG-001`).
 
 ## 🛡️ What's New in v3.1.0: Enterprise Baseline & Technical Debt Ratcheting Engine (.cguard-baseline.json)
 
