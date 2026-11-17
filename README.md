@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v3.2.0
+# ConcurrencyGuard (`cguard`) — v3.3.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-265%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-273%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -25,6 +25,25 @@ Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **SQLModel**,
 Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
+
+## 🛡️ What's New in v3.3.0: Autonomous GitHub PR Review Bot & One-Click LibCST Suggestion Blocks (`cguard gh-review`)
+
+Static analysis is only useful when findings reach developers at the right time and place—inside the pull request they are working on. `cguard` v3.3.0 introduces an **Autonomous GitHub PR Inline Review Bot** that maps AST concurrency findings to exact PR diff lines, generates native GitHub `suggestion` blocks with one-click LibCST-patched remediation, and posts idempotent inline review comments via the GitHub REST API:
+
+1. **Unified Diff Line Mapper (`gh_review.py`):**
+   - Parses PR unified diffs (via `git diff origin/main...HEAD` or the GitHub PR Files API) to map each `ASTFinding` line number to its exact position within a PR diff hunk.
+   - Only comments on lines that fall within changed PR hunks — zero noise on untouched code.
+2. **One-Click GitHub Suggestion Blocks:**
+   - Runs the `LibCST` auto-patcher in memory to generate corrected code, then formats it inside GitHub's native ` ```suggestion ` block syntax for one-click "Apply suggestion" remediation directly in the PR UI.
+   - Supports `CG-001` (`.with_for_update()` injection), `CG-002` (`Idempotency-Key` header injection), `CG-004` (integrity error guard), and all other auto-fixable rules.
+3. **Idempotent Bot Commenting:**
+   - Checks existing PR review comments via the GitHub REST API before posting. If an identical `<!-- cguard:finding:RULE:LINE -->` marker already exists, the duplicate is skipped — safe for CI re-runs.
+4. **CLI Command (`cguard gh-review [PATH]`):**
+   - `--dry-run`: Previews the full review payload and markdown suggestion blocks to stdout without hitting the GitHub API (ideal for local testing).
+   - `--token`, `--repo`, `--pr`: Explicit overrides; auto-detected from `GITHUB_TOKEN`, `GITHUB_REPOSITORY`, and `GITHUB_REF` environment variables in GitHub Actions.
+   - Gracefully exits with code `0` and a warning when run outside a GitHub Actions PR context.
+5. **Zero External HTTP Dependencies:**
+   - All GitHub REST API communication uses Python standard library `urllib.request` — no `requests`, `httpx`, or `aiohttp` required.
 
 ## 🛡️ What's New in v3.2.0: Deterministic Async Interleaving Simulator & Chaos Reproducer Generator (`cguard simulate`)
 

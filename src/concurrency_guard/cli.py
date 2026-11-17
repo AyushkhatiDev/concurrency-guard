@@ -9,6 +9,7 @@ import json
 import os
 import sys
 import time
+import urllib.error
 from pathlib import Path
 from typing import Any, Optional
 
@@ -32,6 +33,17 @@ from concurrency_guard.cache.manager import (
     compute_rules_hash,
 )
 from concurrency_guard.config import load_cguard_config
+from concurrency_guard.gh_review import (
+    ReviewComment,
+    detect_github_environment,
+    fetch_existing_pr_comments,
+    fetch_pr_diff,
+    format_suggestion_comment,
+    get_pr_diff,
+    is_duplicate_comment,
+    map_finding_to_pr_diff,
+    post_pr_review_comment,
+)
 from concurrency_guard.patcher.cst_fixer import apply_all_fixes
 from concurrency_guard.patcher.diff_utils import DiffGenerator, colorize_diff
 from concurrency_guard.reporter.github_pr import generate_github_pr_markdown
@@ -771,6 +783,217 @@ def simulate(
             )
         )
 
+    raise typer.Exit(code=0)
+
+
+@app.command("gh-review")
+def gh_review(
+    path: Path = typer.Argument(
+        Path("."),
+        exists=True,
+        help="Repository root or target directory/file containing Python files to scan.",
+    ),
+    token: Optional[str] = typer.Option(
+        None,
+        "--token",
+        "-t",
+        help="GitHub Personal Access Token or GITHUB_TOKEN secret.",
+    ),
+    repo: Optional[str] = typer.Option(
+        None,
+        "--repo",
+        "-r",
+        help="Target GitHub repository in 'owner/repo' format (defaults to GITHUB_REPOSITORY).",
+    ),
+    pr: Optional[int] = typer.Option(
+        None,
+        "--pr",
+        "-p",
+        help="Target Pull Request number (auto-detected from CI environment if omitted).",
+    ),
+    dry_run: bool = typer.Option(
+        False,
+        "--dry-run",
+        help="Preview GitHub review payload and markdown suggestion blocks without making API requests.",
+    ),
+    base_ref: Optional[str] = typer.Option(
+        None,
+        "--base-ref",
+        "-b",
+        help="Base git reference to diff against (e.g. origin/main).",
+    ),
+    config_file: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to dedicated configuration file (.cguard.toml, cguard.toml, or pyproject.toml).",
+    ),
+) -> None:
+    """Post inline GitHub PR review comments with one-click LibCST suggestion blocks."""
+    env = detect_github_environment()
+    effective_token = token or env.get("token")
+    effective_repo = repo or env.get("repo")
+    env_pr = env.get("pr_number")
+    effective_pr = pr or (int(env_pr) if env_pr is not None else None)
+    commit_sha = env.get("commit_sha")
+
+    # If running outside GitHub Actions PR context without required params, exit gracefully
+    if not dry_run and (not effective_token or not effective_repo or not effective_pr):
+        console.print(
+            Panel(
+                "[yellow]Warning: GITHUB_TOKEN, GITHUB_REPOSITORY, or PR number not detected.\n"
+                "Skipping PR review comment posting (running outside a GitHub Actions Pull Request context).[/yellow]",
+                border_style="yellow",
+                title="GitHub Review Bot",
+            )
+        )
+        raise typer.Exit(code=0)
+
+    try:
+        config = load_cguard_config(start_path=path, config_path=config_file)
+    except (FileNotFoundError, ValueError) as err:
+        raise typer.BadParameter(str(err), param_hint="--config") from err
+
+    py_files = discover_python_files(path, config=config)
+    effective_rules = (
+        path.parent / config.rules_file
+        if config.rules_file and path.is_file()
+        else path / config.rules_file
+        if config.rules_file
+        else None
+    )
+    custom_rules = load_yaml_rules(effective_rules) if effective_rules else None
+
+    suppression_filter = SuppressionFilter()
+    all_findings = scan_project(
+        py_files,
+        roots=[path] if path.is_dir() else [path.parent],
+        custom_rules=custom_rules,
+        cache_manager=None,
+        suppression_filter=suppression_filter,
+        jobs=1,
+        config=config,
+    )
+
+    if not all_findings:
+        console.print(
+            Panel(
+                f"[bold green]No concurrency findings detected in {path}. Clean pull request![/bold green]",
+                border_style="green",
+                title="GitHub Review Bot",
+            )
+        )
+        raise typer.Exit(code=0)
+
+    # Obtain unified diff
+    repo_root = path if path.is_dir() else path.parent
+    diff_text = get_pr_diff(repo_root, base_ref=base_ref)
+    if not diff_text and effective_token and effective_repo and effective_pr:
+        try:
+            diff_text = fetch_pr_diff(effective_repo, effective_pr, effective_token)
+        except urllib.error.HTTPError:
+            diff_text = ""
+
+    candidate_comments: list[ReviewComment] = []
+    for f in all_findings:
+        target_path = str(f.filename)
+        target_line = f.lineno
+
+        if diff_text:
+            pos = map_finding_to_pr_diff(f, diff_text, repo_root=repo_root)
+            if pos is None:
+                if not dry_run:
+                    # In live PR mode, GitHub only allows comments on lines inside the PR diff
+                    continue
+                target_path = str(f.filename)
+                target_line = f.lineno
+            else:
+                target_path = pos.path
+                target_line = pos.line
+
+        body = format_suggestion_comment(f)
+        candidate_comments.append(
+            ReviewComment(
+                path=target_path,
+                line=target_line,
+                body=body,
+                commit_id=commit_sha,
+            )
+        )
+
+    if not candidate_comments:
+        console.print(
+            Panel(
+                "[bold green]All detected findings fall outside the PR diff changes. Zero comments required.[/bold green]",
+                border_style="green",
+                title="GitHub Review Bot",
+            )
+        )
+        raise typer.Exit(code=0)
+
+    if dry_run:
+        console.print(
+            Panel(
+                f"[bold cyan]ConcurrencyGuard PR Inline Review Bot (Dry-Run Mode)[/bold cyan]\n"
+                f"Target Repository: [bold]{effective_repo or 'local/preview'}[/bold] | PR: #{effective_pr or 'N/A'}\n"
+                f"Total Comments to Dispatch: {len(candidate_comments)}",
+                border_style="cyan",
+                title="GitHub Review Bot Preview",
+            )
+        )
+        for idx, c in enumerate(candidate_comments, start=1):
+            console.print(
+                Panel(
+                    f"[bold magenta]Target File & Line: {c.path}:{c.line}[/bold magenta]\n\n{c.body}",
+                    title=f"Review Comment #{idx}",
+                    border_style="blue",
+                )
+            )
+        typer.echo(json.dumps([c.to_dict() for c in candidate_comments], indent=2))
+        raise typer.Exit(code=0)
+
+    # Live execution: check existing comments for idempotency
+    assert effective_token is not None
+    assert effective_repo is not None
+    assert effective_pr is not None
+
+    try:
+        existing = fetch_existing_pr_comments(effective_repo, effective_pr, effective_token)
+    except urllib.error.HTTPError as err:
+        console.print(f"[bold red]GitHub API Error fetching existing comments: HTTP {err.code} - {err.reason}[/bold red]")
+        raise typer.Exit(code=1) from err
+    except urllib.error.URLError as err:
+        console.print(f"[bold red]Network connection error: {err.reason}[/bold red]")
+        raise typer.Exit(code=1) from err
+
+    posted_count = 0
+    skipped_count = 0
+
+    for comment in candidate_comments:
+        if is_duplicate_comment(comment, existing):
+            skipped_count += 1
+            continue
+
+        try:
+            post_pr_review_comment(effective_repo, effective_pr, comment, effective_token)
+            posted_count += 1
+        except urllib.error.HTTPError as err:
+            console.print(
+                f"[bold red]GitHub API Error posting comment to {comment.path}:{comment.line}: HTTP {err.code} - {err.reason}[/bold red]"
+            )
+            raise typer.Exit(code=1) from err
+        except urllib.error.URLError as err:
+            console.print(f"[bold red]Network error posting comment: {err.reason}[/bold red]")
+            raise typer.Exit(code=1) from err
+
+    console.print(
+        Panel(
+            f"[bold green]✔ Successfully processed PR #{effective_pr}[/bold green]\n"
+            f"Posted: [bold]{posted_count}[/bold] review comments | Skipped (idempotent): [dim]{skipped_count}[/dim]",
+            border_style="green",
+            title="GitHub Review Bot Complete",
+        )
+    )
     raise typer.Exit(code=0)
 
 
