@@ -7,13 +7,14 @@ __version__ = "3.2.0"
 # Register alias 'cguard' pointing to this package
 sys.modules.setdefault("cguard", sys.modules[__name__])
 
-from concurrency_guard import baseline, call_graph, config, sarif, simulator
+from concurrency_guard import baseline, call_graph, config, gh_review, sarif, simulator
 
 sys.modules.setdefault("cguard.sarif", sarif)
 sys.modules.setdefault("cguard.call_graph", call_graph)
 sys.modules.setdefault("cguard.config", config)
 sys.modules.setdefault("cguard.baseline", baseline)
 sys.modules.setdefault("cguard.simulator", simulator)
+sys.modules.setdefault("cguard.gh_review", gh_review)
 cguard_module = sys.modules.get("cguard")
 if cguard_module is not None:
     setattr(cguard_module, "sarif", sarif)  # noqa: B010
@@ -21,5 +22,6 @@ if cguard_module is not None:
     setattr(cguard_module, "config", config)  # noqa: B010
     setattr(cguard_module, "baseline", baseline)  # noqa: B010
     setattr(cguard_module, "simulator", simulator)  # noqa: B010
+    setattr(cguard_module, "gh_review", gh_review)  # noqa: B010
 
 
