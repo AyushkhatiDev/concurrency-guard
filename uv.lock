@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.9"
 resolution-markers = [
     "python_full_version >= '3.15'",
@@ -199,7 +199,7 @@ wheels = [
 
 [[package]]
 name = "concurrency-guard"
-version = "3.3.0"
+version = "3.4.0"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
@@ -1564,8 +1564,8 @@ resolution-markers = [
     "python_full_version < '3.10'",
 ]
 dependencies = [
-    { name = "greenlet", version = "3.2.5", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version != '3.10.*' and platform_machine == 'AMD64') or (python_full_version != '3.10.*' and platform_machine == 'WIN32') or (python_full_version != '3.10.*' and platform_machine == 'aarch64') or (python_full_version != '3.10.*' and platform_machine == 'amd64') or (python_full_version != '3.10.*' and platform_machine == 'ppc64le') or (python_full_version != '3.10.*' and platform_machine == 'win32') or (python_full_version != '3.10.*' and platform_machine == 'x86_64')" },
-    { name = "greenlet", version = "3.5.6", source = { registry = "https://pypi.org/simple" }, marker = "(python_full_version == '3.10.*' and platform_machine == 'AMD64') or (python_full_version == '3.10.*' and platform_machine == 'WIN32') or (python_full_version == '3.10.*' and platform_machine == 'aarch64') or (python_full_version == '3.10.*' and platform_machine == 'amd64') or (python_full_version == '3.10.*' and platform_machine == 'ppc64le') or (python_full_version == '3.10.*' and platform_machine == 'win32') or (python_full_version == '3.10.*' and platform_machine == 'x86_64')" },
+    { name = "greenlet", version = "3.2.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version != '3.10.*' and (platform_machine == 'AMD64' or platform_machine == 'WIN32' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'ppc64le' or platform_machine == 'win32' or platform_machine == 'x86_64')" },
+    { name = "greenlet", version = "3.5.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version == '3.10.*' and (platform_machine == 'AMD64' or platform_machine == 'WIN32' or platform_machine == 'aarch64' or platform_machine == 'amd64' or platform_machine == 'ppc64le' or platform_machine == 'win32' or platform_machine == 'x86_64')" },
     { name = "typing-extensions" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/a5/bd/08864ddfffbb8914ee13b0c887d84b4b13bc8dd8da3077c0dace5a87699c/sqlalchemy-2.0.55.tar.gz", hash = "sha256:ae40c563bc10a8d56f1fd1f39f069aeb5eb85ca26913b2314dd8d190139258fa", size = 9997689, upload-time = "2026-10-16T20:45:32.724Z" }
