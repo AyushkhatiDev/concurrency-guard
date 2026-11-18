@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v3.3.0
+# ConcurrencyGuard (`cguard`) — v3.4.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-273%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-290%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -25,6 +25,41 @@ Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **SQLModel**,
 Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
+
+## 🛡️ What's New in v3.4.0: Zero-Dependency Language Server Protocol (LSP 3.17) & Real-Time Terminal Watch Mode (`cguard lsp` & `cguard watch`)
+
+Shift-left concurrency security directly into the developer's editor. `cguard` v3.4.0 introduces a **zero-dependency Language Server Protocol (LSP 3.17) engine** and a **low-latency polling/event file watcher** that stream AST diagnostics and `LibCST` Quick-Fix `WorkspaceEdit` patches in real time:
+
+1. **Zero-Dependency JSON-RPC 2.0 LSP Server (`cguard lsp`):**
+   - Implemented using 100% Python standard library (`lsp.py`) with zero external frameworks (no `pygls` required).
+   - Operates over standard input/output (`Content-Length: ...\r\n\r\n{...}`) for universal integration with **VS Code**, **Cursor**, **Neovim**, and **Emacs**.
+   - Full lifecycle management (`initialize`, `initialized`, `shutdown`, `exit`) advertising `textDocumentSync: Full` and `codeActionProvider: true`.
+
+2. **Real-Time In-Memory AST Diagnostics:**
+   - Evaluates documents live in memory on `textDocument/didOpen`, `textDocument/didChange`, and `textDocument/didSave` without requiring files to be saved to disk first.
+   - Publishes `textDocument/publishDiagnostics` with 0-based range coordinates, severity mapping (Error for `HIGH` confidence race conditions like `CG-001` and `CG-004`; Warning for `MEDIUM`/`LOW`), rule code IDs, and clear remediation instructions.
+   - Clears diagnostics instantly when code is fixed with row locks or idempotency guards.
+
+3. **One-Click IDE Quick-Fix Code Actions:**
+   - When the user's cursor or selection touches a fixable finding (`CG-001`, `CG-002`, `CG-004`, `CG-006`, etc.), `textDocument/codeAction` executes the `LibCST` auto-patcher in memory.
+   - Emits an LSP `CodeAction` (`kind: "quickfix"`, `isPreferred: true`) with a full `WorkspaceEdit` `TextEdit` replacement, allowing developers to press `Cmd+.` / `Alt+Enter` to auto-fix concurrency bugs with zero manual typing.
+
+4. **Real-Time Terminal Watch Mode (`cguard watch [PATH]`):**
+   - High-speed, low-CPU incremental file watcher (`watch.py`) monitoring `.py` files using `os.stat` `st_mtime_ns` and SHA-256 digests.
+   - Re-scans ONLY modified files in milliseconds upon save and renders colored terminal updates.
+   - Supports `--auto-fix` to continuously patch race conditions as you save.
+   - Supports `--once` and `--max-cycles <N>` for deterministic testing in CI pipelines.
+
+```bash
+# Start Language Server for editor integration
+cguard lsp
+
+# Watch workspace for changes in real time
+cguard watch src/ --interval 0.5
+
+# Watch and auto-patch issues immediately on save
+cguard watch src/ --auto-fix
+```
 
 ## 🛡️ What's New in v3.3.0: Autonomous GitHub PR Review Bot & One-Click LibCST Suggestion Blocks (`cguard gh-review`)
 
