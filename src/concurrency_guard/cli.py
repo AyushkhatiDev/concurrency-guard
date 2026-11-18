@@ -44,6 +44,7 @@ from concurrency_guard.gh_review import (
     map_finding_to_pr_diff,
     post_pr_review_comment,
 )
+from concurrency_guard.lsp import run_lsp_server
 from concurrency_guard.patcher.cst_fixer import apply_all_fixes
 from concurrency_guard.patcher.diff_utils import DiffGenerator, colorize_diff
 from concurrency_guard.reporter.github_pr import generate_github_pr_markdown
@@ -65,6 +66,7 @@ from concurrency_guard.scanner.ast_rules import (
 from concurrency_guard.scanner.git_filter import get_changed_python_files
 from concurrency_guard.scanner.suppression import SuppressionFilter
 from concurrency_guard.simulator import InterleavingTrace, simulate_finding
+from concurrency_guard.watch import watch_project
 
 app = typer.Typer(no_args_is_help=True, help="Deterministic Concurrency & Idempotency Verifier")
 console = Console()
@@ -1539,6 +1541,103 @@ def baseline_create(
         )
     )
     raise typer.Exit(code=0)
+
+
+@app.command()
+def lsp(
+    stdio: bool = typer.Option(
+        True,
+        "--stdio/--no-stdio",
+        help="Use stdin/stdout for JSON-RPC 2.0 communication (default).",
+    ),
+) -> None:
+    """Start the ConcurrencyGuard Language Server (LSP 3.17) over stdin/stdout.
+
+    Provides real-time AST diagnostics and QuickFix CodeActions for
+    VS Code, Cursor, Neovim, and any LSP-compatible editor.
+    """
+    if not stdio:
+        console.print(
+            "[bold yellow]Only --stdio mode is currently supported.[/bold yellow]"
+        )
+        raise typer.Exit(code=1)
+
+    exit_code = run_lsp_server()
+    raise typer.Exit(code=exit_code)
+
+
+@app.command()
+def watch(
+    path: Path = typer.Argument(
+        Path("."),
+        exists=True,
+        help="Directory or file to watch for Python file changes.",
+    ),
+    interval: float = typer.Option(
+        0.5,
+        "--interval",
+        "-i",
+        help="Polling interval in seconds between file system checks.",
+    ),
+    once: bool = typer.Option(
+        False,
+        "--once",
+        help="Run a single scan cycle and exit (useful for CI/testing).",
+    ),
+    max_cycles: Optional[int] = typer.Option(
+        None,
+        "--max-cycles",
+        "-n",
+        help="Maximum number of watch cycles before exiting (None = infinite).",
+    ),
+    auto_fix: bool = typer.Option(
+        False,
+        "--auto-fix",
+        help="Automatically apply LibCST fixes on changed files.",
+    ),
+    config_file: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to dedicated configuration file (.cguard.toml, cguard.toml, or pyproject.toml).",
+    ),
+) -> None:
+    """Watch Python files for changes and report concurrency issues in real time.
+
+    Monitors .py files using os.stat mtime + SHA-256 digests and re-scans
+    only modified files for near-instant feedback.
+    """
+    try:
+        config = load_cguard_config(start_path=path, config_path=config_file)
+    except (FileNotFoundError, ValueError):
+        config = None
+
+    if not once and max_cycles is None:
+        console.print(
+            Panel(
+                f"[bold cyan]ConcurrencyGuard File Watcher[/bold cyan]\n"
+                f"Watching: [bold]{path}[/bold] | Interval: {interval}s | Auto-fix: {'ON' if auto_fix else 'OFF'}\n"
+                f"[dim]Press Ctrl+C to stop.[/dim]",
+                border_style="cyan",
+            )
+        )
+
+    try:
+        results = watch_project(
+            path,
+            interval=interval,
+            max_cycles=max_cycles,
+            once=once,
+            auto_fix=auto_fix,
+            config=config,
+        )
+    except KeyboardInterrupt:
+        console.print("\n[bold yellow]Watch mode interrupted.[/bold yellow]")
+        raise typer.Exit(code=0) from None
+
+    # Exit code: 1 if any cycle found issues, 0 otherwise
+    has_findings = any(r.findings for r in results)
+    raise typer.Exit(code=1 if has_findings else 0)
 
 
 if __name__ == "__main__":
