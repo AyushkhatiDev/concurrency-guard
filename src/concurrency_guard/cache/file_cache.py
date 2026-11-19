@@ -28,6 +28,7 @@ def compute_cache_key(
     version: str = __version__,
     flags: Optional[dict[str, Any]] = None,
     rules_hash: Optional[str] = None,
+    dependency_digest: Optional[str] = None,
 ) -> str:
     """Compute a deterministic SHA-256 cache key.
 
@@ -36,6 +37,7 @@ def compute_cache_key(
       - cguard version string
       - active analyzer/suppression flags (e.g. ignore_pragma)
       - custom rules hash
+      - imported module dependency digest (cross-file invalidation)
     """
     hasher = hashlib.sha256()
     hasher.update(file_bytes)
@@ -47,6 +49,9 @@ def compute_cache_key(
     hasher.update(b"\x00")
     if rules_hash:
         hasher.update(rules_hash.encode("utf-8"))
+    if dependency_digest:
+        hasher.update(b"\x00")
+        hasher.update(dependency_digest.encode("utf-8"))
     return hasher.hexdigest()
 
 
@@ -92,16 +97,17 @@ class FileCache:
         with self._lock:
             return self._misses
 
-    def get_cache_key(self, file_bytes: bytes) -> str:
+    def get_cache_key(self, file_bytes: bytes, dependency_digest: Optional[str] = None) -> str:
         """Compute the content-addressable SHA-256 key for a byte sequence."""
         return compute_cache_key(
             file_bytes=file_bytes,
             version=self.version,
             flags=self.flags,
             rules_hash=self.rules_hash,
+            dependency_digest=dependency_digest,
         )
 
-    def get(self, filepath: Path) -> Optional[list[ASTFinding]]:
+    def get(self, filepath: Path, dependency_digest: Optional[str] = None) -> Optional[list[ASTFinding]]:
         """Retrieve cached findings for filepath if SHA-256 digest matches.
 
         Returns None on cache miss, cache disabled, or file read/corruption error.
@@ -114,7 +120,7 @@ class FileCache:
         except OSError:
             return None
 
-        key = self.get_cache_key(file_bytes)
+        key = self.get_cache_key(file_bytes, dependency_digest=dependency_digest)
         cache_file = self.cache_dir / f"{key}.json"
 
         if not cache_file.is_file():
@@ -141,7 +147,12 @@ class FileCache:
             self._misses += 1
         return None
 
-    def set(self, filepath: Path, findings: list[ASTFinding]) -> None:
+    def set(
+        self,
+        filepath: Path,
+        findings: list[ASTFinding],
+        dependency_digest: Optional[str] = None,
+    ) -> None:
         """Atomically persist scan findings into .cguard_cache/<sha256>.json."""
         if not self.enabled:
             return
@@ -151,7 +162,7 @@ class FileCache:
         except OSError:
             return
 
-        key = self.get_cache_key(file_bytes)
+        key = self.get_cache_key(file_bytes, dependency_digest=dependency_digest)
 
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -164,19 +175,28 @@ class FileCache:
         except OSError as exc:
             logger.debug("Failed atomic cache write for '%s' (%s).", filepath, exc)
 
-    def get_cached_findings(self, filepath: Path) -> Optional[list[dict[str, Any]]]:
+    def get_cached_findings(
+        self,
+        filepath: Path,
+        dependency_digest: Optional[str] = None,
+    ) -> Optional[list[dict[str, Any]]]:
         """Duck-typing compatibility with CacheManager."""
-        res = self.get(filepath)
+        res = self.get(filepath, dependency_digest=dependency_digest)
         if res is None:
             return None
         return [finding_to_dict(f) for f in res]
 
-    def update_cache(self, filepath: Path, findings: list[Any]) -> None:
+    def update_cache(
+        self,
+        filepath: Path,
+        findings: list[Any],
+        dependency_digest: Optional[str] = None,
+    ) -> None:
         """Duck-typing compatibility with CacheManager."""
         from concurrency_guard.scanner.ast_rules import ASTFinding
 
         converted = [f if isinstance(f, ASTFinding) else dict_to_finding(f) for f in findings]
-        self.set(filepath, converted)
+        self.set(filepath, converted, dependency_digest=dependency_digest)
 
     def clear(self) -> int:
         """Cleanly remove all cached files in the cache directory."""

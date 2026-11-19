@@ -21,12 +21,20 @@ logger = logging.getLogger(__name__)
 DEFAULT_CACHE_FILE = Path(".concurrency_guard_cache.db")
 
 
-def compute_cache_key(file_bytes: bytes, scanner_version: str, rules_hash: str) -> str:
-    """Compute SHA-256 hash based on: file_bytes + scanner_version + rules_config_hash."""
+def compute_cache_key(
+    file_bytes: bytes,
+    scanner_version: str,
+    rules_hash: str,
+    dependency_digest: Optional[str] = None,
+) -> str:
+    """Compute SHA-256 hash based on: file_bytes + scanner_version + rules_config_hash + dependency_digest."""
     hasher = hashlib.sha256()
     hasher.update(file_bytes)
     hasher.update(scanner_version.encode("utf-8"))
     hasher.update(rules_hash.encode("utf-8"))
+    if dependency_digest:
+        hasher.update(b"\x00")
+        hasher.update(dependency_digest.encode("utf-8"))
     return hasher.hexdigest()
 
 
@@ -173,11 +181,24 @@ class CacheManager:
             except (sqlite3.Error, OSError) as exc:
                 logger.warning("Failed to recreate cache database at '%s': %s", self.cache_db_path, exc)
 
-    def compute_content_hash(self, file_bytes: bytes) -> str:
-        """Compute the content hash using current scanner version and rules hash."""
-        return compute_cache_key(file_bytes, self.scanner_version, self.rules_hash)
+    def compute_content_hash(
+        self,
+        file_bytes: bytes,
+        dependency_digest: Optional[str] = None,
+    ) -> str:
+        """Compute the content hash using current scanner version, rules hash, and dependency digest."""
+        return compute_cache_key(
+            file_bytes,
+            self.scanner_version,
+            self.rules_hash,
+            dependency_digest=dependency_digest,
+        )
 
-    def get_cached_findings(self, filepath: Path) -> Optional[list[dict[str, Any]]]:
+    def get_cached_findings(
+        self,
+        filepath: Path,
+        dependency_digest: Optional[str] = None,
+    ) -> Optional[list[dict[str, Any]]]:
         """Retrieve cached findings for filepath if content and parameters match."""
         with self._lock:
             try:
@@ -185,7 +206,7 @@ class CacheManager:
             except OSError:
                 return None
 
-            content_hash = self.compute_content_hash(file_bytes)
+            content_hash = self.compute_content_hash(file_bytes, dependency_digest=dependency_digest)
             norm_path = self._normalize_path(filepath)
 
             try:
@@ -220,7 +241,12 @@ class CacheManager:
                 return None
             return None
 
-    def update_cache(self, filepath: Path, findings: list[dict[str, Any]]) -> None:
+    def update_cache(
+        self,
+        filepath: Path,
+        findings: list[dict[str, Any]],
+        dependency_digest: Optional[str] = None,
+    ) -> None:
         """Store or update the scan findings for filepath in the SQLite cache."""
         with self._lock:
             try:
@@ -228,7 +254,7 @@ class CacheManager:
             except OSError:
                 return
 
-            content_hash = self.compute_content_hash(file_bytes)
+            content_hash = self.compute_content_hash(file_bytes, dependency_digest=dependency_digest)
             norm_path = self._normalize_path(filepath)
             scan_results_json = json.dumps(findings)
             now = time.time()

@@ -191,6 +191,11 @@ def scan(
         "--fail-on-stale-baseline",
         help="Exit code 1 if baseline contains resolved findings that have not been cleaned up.",
     ),
+    cross_file: bool = typer.Option(
+        True,
+        "--cross-file/--no-cross-file",
+        help="Enable cross-file import graph and service-layer taint propagation (enabled by default).",
+    ),
 ) -> None:
     """Scan Python files or directories for concurrency vulnerabilities."""
     start_time = time.perf_counter()
@@ -216,6 +221,8 @@ def scan(
         config.jobs = jobs
     elif workers is not None:
         config.jobs = workers
+
+    config.cross_file = cross_file
 
     py_files = discover_python_files(path, config=config)
     effective_rules = rules or (path.parent / config.rules_file if config.rules_file and path.is_file() else path / config.rules_file if config.rules_file else None)
@@ -276,6 +283,7 @@ def scan(
         workers=workers,
         jobs=effective_jobs,
         config=config,
+        cross_file=cross_file,
     )
     if config.select:
         findings = [finding for finding in findings if finding.rule_id in config.select]

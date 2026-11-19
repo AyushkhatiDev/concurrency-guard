@@ -231,6 +231,8 @@ def _is_ast_query_call(node: ast.AST) -> bool:
                 ".get_or_none",
                 ".scalar",
                 ".scalars",
+                ".scalar_one",
+                ".scalar_one_or_none",
                 ".first",
                 ".one",
                 ".one_or_none",
@@ -364,16 +366,38 @@ def analyze_module_functions(
                         val = node.value.value if isinstance(node.value, ast.Await) else node.value
                         if isinstance(val, ast.Name) and val.id in param_aliases:
                             param_aliases[target.id] = param_aliases[val.id]
+                        if isinstance(val, ast.Call):
+                            # Inherit query source from arguments (e.g. res = await db.execute(stmt))
+                            for arg in val.args:
+                                if isinstance(arg, ast.Name) and arg.id in var_query_sources:
+                                    is_q, has_lock = var_query_sources[arg.id]
+                                    var_query_sources[target.id] = (is_q, has_lock or _has_ast_query_lock(val))
+                            # Inherit query source from receiver (e.g. wallet = res.scalar_one_or_none())
+                            root = _extract_target_root_name(val.func)
+                            if root in var_query_sources:
+                                is_q, has_lock = var_query_sources[root]
+                                var_query_sources[target.id] = (is_q, has_lock or _has_ast_query_lock(val))
                         if _is_ast_query_call(val):
                             has_lock = _has_ast_query_lock(val)
-                            var_query_sources[target.id] = (True, has_lock)
+                            _, prev_l = var_query_sources.get(target.id, (False, False))
+                            var_query_sources[target.id] = (True, prev_l or has_lock)
             elif isinstance(node, (ast.AnnAssign, ast.NamedExpr)) and node.value is not None and isinstance(node.target, ast.Name):
                 val = node.value.value if isinstance(node.value, ast.Await) else node.value
                 if isinstance(val, ast.Name) and val.id in param_aliases:
                     param_aliases[node.target.id] = param_aliases[val.id]
+                if isinstance(val, ast.Call):
+                    for arg in val.args:
+                        if isinstance(arg, ast.Name) and arg.id in var_query_sources:
+                            is_q, has_lock = var_query_sources[arg.id]
+                            var_query_sources[node.target.id] = (is_q, has_lock or _has_ast_query_lock(val))
+                    root = _extract_target_root_name(val.func)
+                    if root in var_query_sources:
+                        is_q, has_lock = var_query_sources[root]
+                        var_query_sources[node.target.id] = (is_q, has_lock or _has_ast_query_lock(val))
                 if _is_ast_query_call(val):
                     has_lock = _has_ast_query_lock(val)
-                    var_query_sources[node.target.id] = (True, has_lock)
+                    _, prev_l = var_query_sources.get(node.target.id, (False, False))
+                    var_query_sources[node.target.id] = (True, prev_l or has_lock)
 
             # Check parameter mutations (AugAssign: user.balance -= 50)
             if isinstance(node, ast.AugAssign):
@@ -411,11 +435,20 @@ def analyze_module_functions(
             # Check return statements
             if isinstance(node, ast.Return) and node.value is not None:
                 ret_val = node.value.value if isinstance(node.value, ast.Await) else node.value
-                if _is_ast_query_call(ret_val):
-                    if _has_ast_query_lock(ret_val):
-                        summary.returns_locked_entity = True
-                    else:
-                        summary.returns_unlocked_entity = True
+                if isinstance(ret_val, ast.Call):
+                    root = _extract_target_root_name(ret_val.func)
+                    if root in var_query_sources:
+                        is_q, has_lock = var_query_sources[root]
+                        if is_q:
+                            if has_lock or _has_ast_query_lock(ret_val):
+                                summary.returns_locked_entity = True
+                            else:
+                                summary.returns_unlocked_entity = True
+                    elif _is_ast_query_call(ret_val):
+                        if _has_ast_query_lock(ret_val):
+                            summary.returns_locked_entity = True
+                        else:
+                            summary.returns_unlocked_entity = True
                 elif isinstance(ret_val, ast.Name) and ret_val.id in var_query_sources:
                     is_q, has_lock = var_query_sources[ret_val.id]
                     if is_q:

@@ -41,6 +41,10 @@ from concurrency_guard.lsp import (
     read_message,
     run_lsp_server,
 )
+from concurrency_guard.project_graph import (
+    ProjectSymbolGraph,
+    resolve_module_path,
+)
 from concurrency_guard.sarif import findings_to_sarif, serialize_sarif
 from concurrency_guard.simulator import (
     AnomalyProof,
@@ -71,6 +75,7 @@ __all__ = [
     "InterleavingTrace",
     "LanguageServer",
     "PRDiffPosition",
+    "ProjectSymbolGraph",
     "ReviewComment",
     "ReviewResult",
     "TimelineEvent",
@@ -99,6 +104,7 @@ __all__ = [
     "parse_unified_diff",
     "post_pr_review_comment",
     "read_message",
+    "resolve_module_path",
     "run_lsp_server",
     "run_pr_review",
     "serialize_sarif",
