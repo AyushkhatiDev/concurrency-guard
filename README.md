@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v3.4.0
+# ConcurrencyGuard (`cguard`) — v3.5.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-290%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-297%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -25,6 +25,31 @@ Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **SQLModel**,
 Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
+
+## 🛡️ What's New in v3.5.0: Cross-File Project Import Graph & Multi-Module Service-Layer Taint Propagation (`project_graph.py`)
+
+Production enterprise codebases separate database operations across layered architectures: repositories query models, services mutate business entities, and API routers manage transaction boundaries. Single-file AST analyzers suffer from silent false negatives because the query and commit exist in different files. `cguard` v3.5.0 introduces the **Cross-File Project Import Graph & Multi-Module Taint Propagation Engine**:
+
+1. **Workspace Module Resolver & Cross-File Symbol Table (`project_graph.py`):**
+   - Implements a two-pass deterministic project symbol table (`ProjectSymbolGraph`) that resolves relative (`from ..repositories.wallet import fetch_wallet`) and absolute dotted imports (`from app.services import balance_service`) across `src/` and workspace roots.
+   - Extracts and indexes module-level `FunctionSummary` models for functions and class methods across all workspace files.
+
+2. **Cycle-Safe Fixed-Point Taint Propagation:**
+   - Inter-procedurally tracks query origins, lock status (`has_lock`), and entity mutability across module boundaries.
+   - Handles mutual and circular imports gracefully without infinite recursion or stack overflows using iterative fixed-point propagation.
+   - Detects when an unlocked entity returned from a repository function (e.g. `get_wallet(db, user_id)`) is mutated and committed in a separate router or service (`CG-001`), providing multi-file origin context in diagnostic reports.
+
+3. **Multi-Module Service Mutation & Check-Then-Act Propagation:**
+   - Identifies functions that mutate entity parameters in-place or execute queries/commits on behalf of the caller.
+   - Resolves cross-module check-then-act uniqueness races (`CG-004`) across repository queries and service insertions.
+
+4. **Dependency-Digest Aware Incremental Caching:**
+   - Incorporates transitive import dependency SHA-256 digests into cache keys (`file_cache.py`, `manager.py`).
+   - If a repository module changes (e.g. removing `.with_for_update()`), all dependent router files are automatically invalidated and re-analyzed on subsequent scans.
+
+5. **CLI Control (`--cross-file` / `--no-cross-file`):**
+   - Enabled by default in `cguard scan` and programmatic APIs.
+   - Run `cguard scan --no-cross-file` to restrict analysis strictly to single-file local AST boundaries when scanning isolated scripts.
 
 ## 🛡️ What's New in v3.4.0: Zero-Dependency Language Server Protocol (LSP 3.17) & Real-Time Terminal Watch Mode (`cguard lsp` & `cguard watch`)
 
