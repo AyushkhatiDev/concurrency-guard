@@ -12,6 +12,7 @@ from typing import Any, Optional, Union
 
 import yaml  # type: ignore[import-untyped]
 
+from concurrency_guard.project_graph import ProjectSymbolGraph
 from concurrency_guard.scanner.call_graph import (
     FunctionSummary,
     analyze_module_functions,
@@ -604,9 +605,12 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         tree: Optional[ast.AST] = None,
         config: Optional[Any] = None,
         custom_lock_names: Optional[Union[list[str], set[str]]] = None,
+        project_graph: Optional[Any] = None,
     ) -> None:
         self.filename = filename
         self.config = config
+        self.project_graph = project_graph
+        self.entity_origins: dict[str, str] = {}
         self.custom_lock_names: set[str] = set(custom_lock_names or [])
         if config is not None and hasattr(config, "custom_lock_names"):
             self.custom_lock_names.update(config.custom_lock_names)
@@ -1031,6 +1035,12 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 and _helper_name(n.func) in self.function_summaries
                 and self.function_summaries[_helper_name(n.func)].performs_commit
             )
+            or (
+                isinstance(n, ast.Call)
+                and self.project_graph is not None
+                and (self.project_graph.resolve_call(self.filename, n) is not None)
+                and self.project_graph.resolve_call(self.filename, n)[0].performs_commit
+            )
             for n in local_nodes
         )
         if not has_commit:
@@ -1105,11 +1115,22 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                     for name in _extract_names(t):
                         entity_sources[name] = (unwrapped, q_line, q_end, tort_locked)
 
-            # Check A0: Local helper function returning locked or unlocked entity
+            # Check A0: Local or cross-file helper function returning locked or unlocked entity
             if isinstance(unwrapped, ast.Call):
                 callee_name = _helper_name(unwrapped.func)
-                if callee_name in self.function_summaries:
+                callee_sum: Optional[FunctionSummary] = None
+                origin_desc = ""
+
+                if self.project_graph is not None:
+                    pg_res = self.project_graph.resolve_call(self.filename, unwrapped)
+                    if pg_res is not None:
+                        callee_sum, origin_file, symbol_name = pg_res
+                        origin_desc = f" (via {symbol_name} in {Path(origin_file).name})"
+
+                if callee_sum is None and callee_name in self.function_summaries:
                     callee_sum = self.function_summaries[callee_name]
+
+                if callee_sum is not None:
                     call_line = getattr(unwrapped, "lineno", stmt_lineno)
                     call_end = max(getattr(unwrapped, "end_lineno", call_line), stmt_end_lineno)
                     if callee_sum.returns_locked_entity:
@@ -1120,6 +1141,8 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         for t in targets:
                             for name in _extract_names(t):
                                 entity_sources[name] = (unwrapped, call_line, call_end, False)
+                                if origin_desc:
+                                    self.entity_origins[name] = origin_desc
 
             # Check A: Assignment of a query, e.g. stmt = select(...)
             if any(_is_select_call(c) for c in ast.walk(unwrapped)):
@@ -1288,28 +1311,35 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
             if call_obj is not None:
                 callee_name = _helper_name(call_obj.func)
-                if callee_name in self.function_summaries:
-                    callee_sum = self.function_summaries[callee_name]
-                    if not callee_sum.acquires_lock_context:
-                        for arg_idx, arg in enumerate(call_obj.args):
-                            root = _target_root_name(arg)
-                            if root in entity_sources and arg_idx in callee_sum.mutated_param_indices:
+                mut_callee_sum: Optional[FunctionSummary] = None
+                if self.project_graph is not None:
+                    pg_res = self.project_graph.resolve_call(self.filename, call_obj)
+                    if pg_res is not None:
+                        mut_callee_sum = pg_res[0]
+                if mut_callee_sum is None and callee_name in self.function_summaries:
+                    mut_callee_sum = self.function_summaries[callee_name]
+
+                if mut_callee_sum is not None and not mut_callee_sum.acquires_lock_context:
+                    for arg_idx, arg in enumerate(call_obj.args):
+                        root = _target_root_name(arg)
+                        if root in entity_sources and arg_idx in mut_callee_sum.mutated_param_indices:
+                            _, q_line, q_end_line, q_db_locked = entity_sources[root]
+                            if not q_db_locked:
+                                reported_entities.add((root, q_line, q_end_line))
+                    for kw in call_obj.keywords:
+                        if kw.arg:
+                            root = _target_root_name(kw.value)
+                            if root in entity_sources and kw.arg in mut_callee_sum.mutated_param_names:
                                 _, q_line, q_end_line, q_db_locked = entity_sources[root]
                                 if not q_db_locked:
                                     reported_entities.add((root, q_line, q_end_line))
-                        for kw in call_obj.keywords:
-                            if kw.arg:
-                                root = _target_root_name(kw.value)
-                                if root in entity_sources and kw.arg in callee_sum.mutated_param_names:
-                                    _, q_line, q_end_line, q_db_locked = entity_sources[root]
-                                    if not q_db_locked:
-                                        reported_entities.add((root, q_line, q_end_line))
 
         # 5. Emit findings with HIGH confidence
         reported_lines: set[int] = set()
-        for _, q_line, q_end_line in sorted(reported_entities, key=lambda x: x[1]):
+        for root_name, q_line, q_end_line in sorted(reported_entities, key=lambda x: x[1]):
             if q_line not in reported_lines:
                 reported_lines.add(q_line)
+                origin_ctx = self.entity_origins.get(root_name, "")
                 self.findings.append(
                     ASTFinding(
                         rule_id="CG-001",
@@ -1318,7 +1348,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         function_name=node.name,
                         message=(
                             "Unlocked Read-Modify-Write Race Condition: database state is read and "
-                            "mutated without '.with_for_update()' lock before commit."
+                            f"mutated without '.with_for_update()' lock before commit{origin_ctx}."
                         ),
                         suggested_fix_hint=(
                             "Add '.with_for_update()' to the select statement to acquire row locks "
@@ -1391,8 +1421,14 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         for n in local_nodes:
             if isinstance(n, ast.Call):
                 hname = _helper_name(n.func)
-                if hname in self.function_summaries:
+                sumry: Optional[FunctionSummary] = None
+                if self.project_graph is not None:
+                    pg_res = self.project_graph.resolve_call(self.filename, n)
+                    if pg_res is not None:
+                        sumry = pg_res[0]
+                if sumry is None and hname in self.function_summaries:
                     sumry = self.function_summaries[hname]
+                if sumry is not None:
                     if sumry.returns_unlocked_entity or sumry.returns_locked_entity:
                         query_calls.append(n)
                     if sumry.performs_commit:
@@ -2068,6 +2104,7 @@ def scan_source_code(
     custom_rules: Optional[list[dict[str, Any]]] = None,
     config: Optional[Any] = None,
     custom_lock_names: Optional[Union[list[str], set[str]]] = None,
+    project_graph: Optional[Any] = None,
 ) -> list[ASTFinding]:
     """Scan Python source code string for concurrency vulnerabilities."""
     tree = ast.parse(source_code, filename=filename)
@@ -2076,6 +2113,7 @@ def scan_source_code(
         tree=tree,
         config=config,
         custom_lock_names=custom_lock_names,
+        project_graph=project_graph,
     )
     visitor.visit(tree)
     visitor._check_deadlocks()
@@ -2132,14 +2170,22 @@ def scan_file(
     cache_manager: Optional[Any] = None,
     suppression_filter: Optional[SuppressionFilter] = None,
     config: Optional[Any] = None,
+    project_graph: Optional[Any] = None,
 ) -> list[ASTFinding]:
     """Scan a Python file for concurrency vulnerabilities, skipping unparseable files."""
+    dep_digest = project_graph.get_dependency_digest(file_path) if project_graph is not None else None
     if cache_manager is not None:
         cached: Optional[list[ASTFinding]] = None
         if hasattr(cache_manager, "get"):
-            cached = cache_manager.get(file_path)
+            try:
+                cached = cache_manager.get(file_path, dependency_digest=dep_digest)
+            except TypeError:
+                cached = cache_manager.get(file_path)
         elif hasattr(cache_manager, "get_cached_findings"):
-            raw_cached = cache_manager.get_cached_findings(file_path)
+            try:
+                raw_cached = cache_manager.get_cached_findings(file_path, dependency_digest=dep_digest)
+            except TypeError:
+                raw_cached = cache_manager.get_cached_findings(file_path)
             if raw_cached is not None:
                 from concurrency_guard.cache.manager import dict_to_finding
 
@@ -2162,6 +2208,7 @@ def scan_file(
             filename=str(file_path),
             custom_rules=custom_rules,
             config=config,
+            project_graph=project_graph,
         )
     except (SyntaxError, ValueError):
         findings = []
@@ -2174,11 +2221,19 @@ def scan_file(
 
     if cache_manager is not None:
         if hasattr(cache_manager, "set"):
-            cache_manager.set(file_path, final_findings)
+            try:
+                cache_manager.set(file_path, final_findings, dependency_digest=dep_digest)
+            except TypeError:
+                cache_manager.set(file_path, final_findings)
         elif hasattr(cache_manager, "update_cache"):
             from concurrency_guard.cache.manager import finding_to_dict
 
-            cache_manager.update_cache(file_path, [finding_to_dict(f) for f in findings])
+            try:
+                cache_manager.update_cache(
+                    file_path, [finding_to_dict(f) for f in findings], dependency_digest=dep_digest
+                )
+            except TypeError:
+                cache_manager.update_cache(file_path, [finding_to_dict(f) for f in findings])
 
     return final_findings
 
@@ -2201,6 +2256,7 @@ def _scan_worker_task(
     custom_rules: Optional[list[dict[str, Any]]],
     ignore_pragma: bool,
     config: Optional[Any] = None,
+    project_graph: Optional[Any] = None,
 ) -> tuple[Path, list[ASTFinding]]:
     """Isolated, picklable worker task for parallel ProcessPoolExecutor execution."""
     suppression = SuppressionFilter(ignore_pragma=ignore_pragma)
@@ -2209,6 +2265,7 @@ def _scan_worker_task(
         custom_rules=custom_rules,
         suppression_filter=suppression,
         config=config,
+        project_graph=project_graph,
     )
     return file_path, findings
 
@@ -2221,6 +2278,7 @@ def scan_directory(
     workers: Optional[int] = None,
     jobs: Optional[int] = None,
     config: Optional[Any] = None,
+    cross_file: bool = True,
 ) -> list[ASTFinding]:
     """Scan a directory recursively, including cross-file call-chain analysis."""
     return scan_project(
@@ -2232,6 +2290,7 @@ def scan_directory(
         workers=workers,
         jobs=jobs,
         config=config,
+        cross_file=cross_file,
     )
 
 
@@ -2244,6 +2303,7 @@ def scan_project(
     workers: Optional[int] = None,
     jobs: Optional[int] = None,
     config: Optional[Any] = None,
+    cross_file: bool = True,
 ) -> list[ASTFinding]:
     """Scan files and propagate shared-state hazards to transitive callers.
 
@@ -2252,6 +2312,16 @@ def scan_project(
     only; no scanned code is imported or executed.
     """
     active_filter = suppression_filter or SuppressionFilter()
+
+    effective_cross_file = cross_file if cross_file is not None else getattr(config, "cross_file", True)
+    project_graph: Optional[ProjectSymbolGraph] = None
+    if effective_cross_file and file_paths:
+        custom_locks = getattr(config, "custom_lock_names", None)
+        project_graph = ProjectSymbolGraph.build(
+            file_paths,
+            roots=roots,
+            custom_lock_names=custom_locks,
+        )
 
     # Determine effective worker count
     num_jobs = jobs if jobs is not None else workers
@@ -2266,11 +2336,18 @@ def scan_project(
     # First, check cache for immediate hits
     if cache_manager is not None:
         for file_path in file_paths:
+            dep_digest = project_graph.get_dependency_digest(file_path) if project_graph is not None else None
             cached: Optional[list[ASTFinding]] = None
             if hasattr(cache_manager, "get"):
-                cached = cache_manager.get(file_path)
+                try:
+                    cached = cache_manager.get(file_path, dependency_digest=dep_digest)
+                except TypeError:
+                    cached = cache_manager.get(file_path)
             elif hasattr(cache_manager, "get_cached_findings"):
-                raw_cached = cache_manager.get_cached_findings(file_path)
+                try:
+                    raw_cached = cache_manager.get_cached_findings(file_path, dependency_digest=dep_digest)
+                except TypeError:
+                    raw_cached = cache_manager.get_cached_findings(file_path)
                 if raw_cached is not None:
                     from concurrency_guard.cache.manager import dict_to_finding
 
@@ -2297,20 +2374,30 @@ def scan_project(
                             custom_rules,
                             active_filter.ignore_pragma,
                             config,
+                            project_graph,
                         ): fp
                         for fp in uncached_files
                     }
                     for future in concurrent.futures.as_completed(futures):
                         fp, file_findings = future.result()
                         if cache_manager is not None:
+                            fp_dep = project_graph.get_dependency_digest(fp) if project_graph is not None else None
                             if hasattr(cache_manager, "set"):
-                                cache_manager.set(fp, file_findings)
+                                try:
+                                    cache_manager.set(fp, file_findings, dependency_digest=fp_dep)
+                                except TypeError:
+                                    cache_manager.set(fp, file_findings)
                             elif hasattr(cache_manager, "update_cache"):
                                 from concurrency_guard.cache.manager import finding_to_dict
 
-                                cache_manager.update_cache(
-                                    fp, [finding_to_dict(f) for f in file_findings]
-                                )
+                                try:
+                                    cache_manager.update_cache(
+                                        fp, [finding_to_dict(f) for f in file_findings], dependency_digest=fp_dep
+                                    )
+                                except TypeError:
+                                    cache_manager.update_cache(
+                                        fp, [finding_to_dict(f) for f in file_findings]
+                                    )
                         findings.extend(file_findings)
             except Exception:  # noqa: BLE001
                 # Graceful fallback to sequential scanning
@@ -2322,6 +2409,7 @@ def scan_project(
                             cache_manager=cache_manager,
                             suppression_filter=active_filter,
                             config=config,
+                            project_graph=project_graph,
                         )
                     )
         elif effective_jobs > 1 and len(uncached_files) > 2:
@@ -2336,6 +2424,7 @@ def scan_project(
                         cache_manager=cache_manager,
                         suppression_filter=active_filter,
                         config=config,
+                        project_graph=project_graph,
                     ): file_path
                     for file_path in uncached_files
                 }
@@ -2350,6 +2439,7 @@ def scan_project(
                         cache_manager=cache_manager,
                         suppression_filter=active_filter,
                         config=config,
+                        project_graph=project_graph,
                     )
                 )
 
