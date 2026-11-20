@@ -1965,6 +1965,424 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         "Acquire the lock inside the loop per item, or consume items into a local list under lock before yielding.",
                     )
 
+    # -- Distributed Task Queue & Transaction Boundary Rules (CG-022..CG-024) --
+
+    def _check_cg_022(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], local_nodes: list[ast.AST]
+    ) -> None:
+        """Rule CG-022: Premature Background Task Dispatch Before Commit (Transactional Outbox Race).
+
+        Pattern A (SQLAlchemy/SQLModel): Inside a function that writes to DB and calls commit()
+        (or inside session.begin() block), flag any task dispatch (.delay/.apply_async/.send/enqueue_job/add_task)
+        whose line occurs BEFORE the commit() call (or inside session.begin()).
+
+        Pattern B (Django): Flag .delay()/.apply_async() inside transaction.atomic() (or inside
+        a function decorated with @transaction.atomic) unless wrapped in transaction.on_commit().
+
+        Sanitizers:
+        - Task dispatched after commit()
+        - Task wrapped in transaction.on_commit(...)
+        - Read-only function with no DB writes/commits
+        """
+        _DISPATCH_ATTRS: frozenset[str] = frozenset({
+            "delay", "apply_async", "send", "send_with_options",
+        })
+        _DISPATCH_FUNCS: frozenset[str] = frozenset({
+            "enqueue_job",
+        })
+
+        def _is_task_dispatch(n: ast.AST) -> bool:
+            if not isinstance(n, ast.Call):
+                return False
+            if isinstance(n.func, ast.Attribute) and n.func.attr in _DISPATCH_ATTRS:
+                return True
+            if isinstance(n.func, ast.Name) and n.func.id in _DISPATCH_FUNCS:
+                return True
+            # background_tasks.add_task(...)
+            return bool(
+                isinstance(n.func, ast.Attribute)
+                and n.func.attr == "add_task"
+                and isinstance(n.func.value, ast.Name)
+                and "task" in n.func.value.id.lower()
+            )
+
+        def _is_db_write(n: ast.AST) -> bool:
+            """Check for session.add, db.add, session.execute(insert/update), or entity mutation."""
+            if not isinstance(n, ast.Call) or not isinstance(n.func, ast.Attribute):
+                return False
+            attr = n.func.attr
+            if attr in ("add", "add_all", "merge", "bulk_save_objects"):
+                return _is_db_or_session(n.func.value)
+            if attr in ("execute", "exec") and _is_db_or_session(n.func.value):
+                # Check if executing an insert/update (not select)
+                for arg in n.args:
+                    for child in ast.walk(arg):
+                        if (
+                            isinstance(child, ast.Call)
+                            and isinstance(child.func, ast.Name)
+                            and child.func.id in ("insert", "update", "delete")
+                        ):
+                            return True
+                        if (
+                            isinstance(child, ast.Call)
+                            and isinstance(child.func, ast.Attribute)
+                            and child.func.attr in ("insert", "update", "delete")
+                        ):
+                            return True
+                return False
+            return False
+
+        # Collect all expressions wrapped in transaction.on_commit(...)
+        on_commit_calls: set[int] = set()
+        for n in local_nodes:
+            if isinstance(n, ast.Call):
+                func_name = _expr_name(n.func).lower()
+                if func_name.endswith("on_commit") or func_name == "on_commit":
+                    for sub in ast.walk(n):
+                        if sub is not n:
+                            on_commit_calls.add(id(sub))
+
+        reported_dispatches: set[int] = set()
+
+        # -- Pattern A: SQLAlchemy/SQLModel pre-commit dispatch --
+        db_writes = [n for n in local_nodes if isinstance(n, ast.Call) and _is_db_write(n)]
+        commit_calls = [n for n in local_nodes if _is_commit_call(n)]
+        dispatches = [n for n in local_nodes if _is_task_dispatch(n) and id(n) not in on_commit_calls]
+
+        # Also detect entity attribute mutations (e.g. order.status = "paid")
+        has_entity_mutation = any(
+            isinstance(n, (ast.Assign, ast.AugAssign))
+            and (
+                (isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Attribute))
+                or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Attribute) for t in n.targets))
+            )
+            for n in local_nodes
+        )
+
+        has_db_writes = bool(db_writes) or has_entity_mutation
+
+        if has_db_writes and commit_calls and dispatches:
+            first_commit_line = min(getattr(c, "lineno", 0) for c in commit_calls)
+            for dispatch in dispatches:
+                dispatch_line = getattr(dispatch, "lineno", 0)
+                if dispatch_line < first_commit_line and id(dispatch) not in reported_dispatches:
+                    reported_dispatches.add(id(dispatch))
+                    self._add(
+                        "CG-022",
+                        dispatch,
+                        node.name,
+                        "Premature background task dispatch before commit: task may execute "
+                        "while database transaction has not yet committed, causing the task "
+                        "to read stale or non-existent data (Transactional Outbox Race).",
+                        "Move the task dispatch call (.delay()/.apply_async()/.send()) "
+                        "after the db.commit() / await db.commit() call, or use a "
+                        "transactional outbox pattern.",
+                    )
+
+        # -- session.begin() blocks (SQLAlchemy context manager) --
+        for with_stmt in (n for n in local_nodes if isinstance(n, (ast.With, ast.AsyncWith))):
+            is_session_begin = any(
+                ".begin" in _expr_name(item.context_expr).lower()
+                or (isinstance(item.context_expr, ast.Call) and ".begin" in _expr_name(item.context_expr.func).lower())
+                for item in with_stmt.items
+            )
+            if is_session_begin:
+                for child in ast.walk(with_stmt):
+                    if (
+                        isinstance(child, ast.Call)
+                        and _is_task_dispatch(child)
+                        and id(child) not in on_commit_calls
+                        and id(child) not in reported_dispatches
+                    ):
+                        reported_dispatches.add(id(child))
+                        self._add(
+                            "CG-022",
+                            child,
+                            node.name,
+                            "Premature background task dispatch inside session.begin(): task dispatched "
+                            "inside transaction block before commit (Transactional Outbox Race).",
+                            "Move the task dispatch call outside the session.begin() block "
+                            "so it executes only after the transaction has successfully committed.",
+                        )
+
+        # -- Pattern B: Django transaction.atomic() pre-commit dispatch --
+        for with_stmt in (n for n in local_nodes if isinstance(n, (ast.With, ast.AsyncWith))):
+            is_atomic = False
+            for item in with_stmt.items:
+                ctx_name = _expr_name(item.context_expr).lower()
+                if ctx_name in ("atomic", "transaction.atomic", "django.db.transaction.atomic"):
+                    is_atomic = True
+                    break
+                if isinstance(item.context_expr, ast.Call):
+                    func_name = _expr_name(item.context_expr.func).lower()
+                    if func_name in ("atomic", "transaction.atomic", "django.db.transaction.atomic"):
+                        is_atomic = True
+                        break
+
+            if not is_atomic:
+                continue
+
+            for child in ast.walk(with_stmt):
+                if not isinstance(child, ast.Call):
+                    continue
+                if not _is_task_dispatch(child) or id(child) in on_commit_calls:
+                    continue
+                if id(child) not in reported_dispatches:
+                    reported_dispatches.add(id(child))
+                    self._add(
+                        "CG-022",
+                        child,
+                        node.name,
+                        "Premature task dispatch inside Django transaction.atomic(): "
+                        "if the transaction rolls back, the enqueued task will operate "
+                        "on non-existent data (Transactional Outbox Race).",
+                        "Wrap the task dispatch in transaction.on_commit(lambda: "
+                        "my_task.delay(...)) to ensure it runs only after a successful commit.",
+                    )
+
+        # Also check if function has @transaction.atomic decorator
+        is_func_atomic = any(
+            _expr_name(dec.func if isinstance(dec, ast.Call) else dec).lower() in (
+                "atomic", "transaction.atomic", "django.db.transaction.atomic"
+            )
+            for dec in node.decorator_list
+        )
+        if is_func_atomic:
+            for dispatch in dispatches:
+                if id(dispatch) not in reported_dispatches:
+                    reported_dispatches.add(id(dispatch))
+                    self._add(
+                        "CG-022",
+                        dispatch,
+                        node.name,
+                        "Premature task dispatch inside Django transaction.atomic(): "
+                        "if the transaction rolls back, the enqueued task will operate "
+                        "on non-existent data (Transactional Outbox Race).",
+                        "Wrap the task dispatch in transaction.on_commit(lambda: "
+                        "my_task.delay(...)) to ensure it runs only after a successful commit.",
+                    )
+
+    def _check_cg_023(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], local_nodes: list[ast.AST]
+    ) -> None:
+        """Rule CG-023: Non-Idempotent Retryable Worker Task.
+
+        Detect functions decorated with Celery/Dramatiq/ARQ retry semantics that perform
+        state mutations + DB commit without idempotency guards.
+        """
+        is_retryable_task = False
+
+        for dec in node.decorator_list:
+            func = dec.func if isinstance(dec, ast.Call) else dec
+            dec_expr = _expr_name(func).lower()
+
+            # Celery / Dramatiq / ARQ decorators
+            if any(
+                k in dec_expr
+                for k in ("task", "shared_task", "actor", "dramatiq")
+            ):
+                if isinstance(dec, ast.Call):
+                    for kw in dec.keywords:
+                        if kw.arg == "acks_late" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
+                            is_retryable_task = True
+                        if kw.arg in ("autoretry_for", "max_retries", "retry_backoff"):
+                            is_retryable_task = True
+                if "actor" in dec_expr:
+                    is_retryable_task = True
+
+        # Check for self.retry() calls in body
+        for n in local_nodes:
+            if (
+                isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "retry"
+                and isinstance(n.func.value, ast.Name)
+                and n.func.value.id == "self"
+            ):
+                is_retryable_task = True
+
+        if not is_retryable_task:
+            return
+
+        # Check for state mutations + DB commit
+        has_mutation = any(
+            isinstance(n, ast.Call)
+            and isinstance(n.func, ast.Attribute)
+            and n.func.attr in ("commit", "save", "update", "add")
+            for n in local_nodes
+        ) or any(
+            isinstance(n, (ast.Assign, ast.AugAssign))
+            and (
+                (isinstance(n, ast.AugAssign) and isinstance(n.target, ast.Attribute))
+                or (isinstance(n, ast.Assign) and any(isinstance(t, ast.Attribute) for t in n.targets))
+            )
+            for n in local_nodes
+        )
+
+        has_commit = any(_is_commit_call(n) for n in local_nodes)
+
+        if not (has_mutation and has_commit):
+            return
+
+        # Check for idempotency guards (sanitizers)
+        has_idempotency = False
+        lock_spans = _get_lock_spans(node, custom_lock_names=self.custom_lock_names)
+        if lock_spans:
+            has_idempotency = True
+
+        if not has_idempotency:
+            for n in local_nodes:
+                name = ""
+                if isinstance(n, ast.Name):
+                    name = n.id.lower()
+                elif isinstance(n, ast.Attribute):
+                    name = n.attr.lower()
+                elif isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+                    name = n.func.attr.lower()
+                    if name in ("with_for_update", "select_for_update"):
+                        has_idempotency = True
+                        break
+                    if name in ("get_or_create", "update_or_create"):
+                        has_idempotency = True
+                        break
+
+                if any(k in name for k in ("idempotency", "dedup", "lock", "advisory_lock")):
+                    has_idempotency = True
+                    break
+
+        # Check for custom lock names from config
+        if not has_idempotency and self.custom_lock_names:
+            for n in local_nodes:
+                expr_str = _expr_name(n).lower()
+                if any(c_lock.lower() in expr_str for c_lock in self.custom_lock_names):
+                    has_idempotency = True
+                    break
+
+        # Check for IntegrityError handling
+        if not has_idempotency:
+            for n in local_nodes:
+                if isinstance(n, ast.Try) and _catches_integrity_error(n):
+                    has_idempotency = True
+                    break
+
+        if not has_idempotency:
+            self._add(
+                "CG-023",
+                node,
+                node.name,
+                "Non-idempotent retryable worker task: task configured with retries "
+                "performs state mutations and DB commits without idempotency guards "
+                "(row lock, deduplication key, or IntegrityError handling).",
+                "Add a distributed lock (redis.lock), database row lock "
+                "(.with_for_update()), idempotency key check, or IntegrityError "
+                "handler to prevent duplicate side effects on task retry.",
+            )
+
+    def _check_cg_024(
+        self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], local_nodes: list[ast.AST]
+    ) -> None:
+        """Rule CG-024: External Network I/O Inside Open Database Transaction.
+
+        Detect external HTTP/RPC calls inside active database transaction contexts
+        (transaction.atomic(), session.begin(), or between with_for_update and commit).
+        Holding DB row locks across unpredictable external network latency causes
+        connection pool exhaustion and production deadlocks.
+        """
+        _HTTP_METHODS: frozenset[str] = frozenset({
+            "get", "post", "put", "delete", "patch", "head", "options", "request",
+        })
+
+        def _is_network_call(call_node: ast.Call) -> bool:
+            if isinstance(call_node.func, ast.Attribute):
+                attr = call_node.func.attr.lower()
+                caller = _expr_name(call_node.func.value).lower()
+                if (
+                    attr in _HTTP_METHODS
+                    and any(
+                        m in caller
+                        for m in ("requests", "httpx", "aiohttp", "urllib", "client", "http", "api")
+                    )
+                    and not any(db_k in caller for db_k in ("db", "database", "sql"))
+                ):
+                    return True
+                if "stripe" in caller or "stripe" in attr:
+                    return True
+                if "urlopen" in attr and "urllib" in caller:
+                    return True
+            elif isinstance(call_node.func, ast.Name):
+                name = call_node.func.id.lower()
+                if name in ("urlopen",):
+                    return True
+            return False
+
+        def _is_db_transaction_context(ctx_expr: ast.AST) -> bool:
+            name = _expr_name(ctx_expr.func if isinstance(ctx_expr, ast.Call) else ctx_expr).lower()
+            return any(
+                k in name
+                for k in ("atomic", "transaction.atomic", "session.begin", ".begin")
+            )
+
+        reported_calls: set[int] = set()
+
+        for with_stmt in (n for n in local_nodes if isinstance(n, (ast.With, ast.AsyncWith))):
+            is_tx = False
+            for item in with_stmt.items:
+                if _is_db_transaction_context(item.context_expr):
+                    is_tx = True
+                    break
+            if not is_tx:
+                continue
+
+            for child in ast.walk(with_stmt):
+                if (
+                    isinstance(child, ast.Call)
+                    and _is_network_call(child)
+                    and id(child) not in reported_calls
+                ):
+                    reported_calls.add(id(child))
+                    self._add(
+                        "CG-024",
+                        child,
+                        node.name,
+                        "External network I/O inside open database transaction: HTTP/RPC "
+                        "call executed while holding database row locks or inside "
+                        "transaction.atomic()/session.begin() causes connection pool "
+                        "exhaustion and production deadlocks under network latency.",
+                        "Move the external HTTP/RPC call outside the database transaction "
+                        "scope, or use a two-phase commit / transactional outbox pattern.",
+                    )
+
+        # Also check between with_for_update() and commit()
+        locked_query_lines: list[int] = []
+        for n in local_nodes:
+            if isinstance(n, ast.Call):
+                func_expr = _expr_name(n.func).lower()
+                if "with_for_update" in func_expr or "select_for_update" in func_expr:
+                    locked_query_lines.append(getattr(n, "lineno", 0))
+
+        commit_lines = [getattr(n, "lineno", 0) for n in local_nodes if _is_commit_call(n)]
+
+        if locked_query_lines and commit_lines:
+            q_line = min(locked_query_lines)
+            c_line = max(commit_lines)
+            if q_line < c_line:
+                for n in local_nodes:
+                    if isinstance(n, ast.Call) and _is_network_call(n):
+                        call_line = getattr(n, "lineno", 0)
+                        if q_line < call_line < c_line and id(n) not in reported_calls:
+                            reported_calls.add(id(n))
+                            self._add(
+                                "CG-024",
+                                n,
+                                node.name,
+                                "External network I/O inside open database transaction: HTTP/RPC "
+                                "call executed while holding database row locks or inside "
+                                "transaction.atomic()/session.begin() causes connection pool "
+                                "exhaustion and production deadlocks under network latency.",
+                                "Move the external HTTP/RPC call outside the database transaction "
+                                "scope, or use a two-phase commit / transactional outbox pattern.",
+                            )
+
     def visit_FunctionDef(self, node: ast.FunctionDef) -> None:
         """Inspect sync function definitions for rule CG-005."""
         saved_aliases, saved_context = self.aliases, self.context_stack
@@ -1978,6 +2396,9 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             self._check_cg_019(node, local_nodes)
             self._check_cg_020(node, local_nodes)
             self._check_cg_021(node, local_nodes)
+            self._check_cg_022(node, local_nodes)
+            self._check_cg_023(node, local_nodes)
+            self._check_cg_024(node, local_nodes)
             self._check_standard_library_rules(node, local_nodes)
             self.generic_visit(node)
         finally:
@@ -2000,6 +2421,9 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             self._check_cg_019(node, local_nodes)
             self._check_cg_020(node, local_nodes)
             self._check_cg_021(node, local_nodes)
+            self._check_cg_022(node, local_nodes)
+            self._check_cg_023(node, local_nodes)
+            self._check_cg_024(node, local_nodes)
             self._check_standard_library_rules(node, local_nodes)
 
             # Check for synchronous locks acquired inside async coroutine
