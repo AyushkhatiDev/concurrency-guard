@@ -108,6 +108,8 @@ def _preflight_targets(source_code: str, rule_id: str, findings: list[ASTFinding
             skipped.append(PatchSkip(rule_id, function_name, lineno, "Dynamic dispatch or **kwargs requires a manual fix."))
         elif rule_id == "CG-016" and not _finding_is_inside_atomic(function, lineno):
             skipped.append(PatchSkip(rule_id, function_name, lineno, "select_for_update() must be added inside transaction.atomic() manually."))
+        elif rule_id == "CG-022" and not _finding_is_inside_atomic(function, lineno):
+            skipped.append(PatchSkip(rule_id, function_name, lineno, "Premature dispatch outside transaction.atomic() must be manually moved after commit()."))
         else:
             safe.add(function_name)
             if rule_id == "CG-001":
@@ -821,6 +823,94 @@ class DjangoFExpressionTransformer(cst.CSTTransformer):
         return updated_node
 
 
+class TransactionOnCommitTransformer(cst.CSTTransformer):
+    """LibCST transformer wrapping premature task dispatch inside Django transaction.atomic()
+    with transaction.on_commit(lambda: ...).
+
+    Transforms:
+        with transaction.atomic():
+            ...
+            my_task.delay(order.id)
+
+    Into:
+        with transaction.atomic():
+            ...
+            transaction.on_commit(lambda: my_task.delay(order.id))
+    """
+
+    _DISPATCH_ATTRS: frozenset[str] = frozenset({
+        "delay", "apply_async", "send", "send_with_options",
+    })
+
+    def __init__(self, target_functions: Optional[set[str]] = None) -> None:
+        super().__init__()
+        self.target_functions = target_functions
+        self._active = False
+        self._atomic_depth = 0
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
+        self._active = (
+            self.target_functions is None
+            or node.name.value in self.target_functions
+        )
+        return True
+
+    def leave_FunctionDef(
+        self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef
+    ) -> cst.FunctionDef:
+        if self.target_functions is not None and original_node.name.value in self.target_functions:
+            self._active = False
+            self._atomic_depth = 0
+        return updated_node
+
+    def visit_With(self, node: cst.With) -> bool:
+        if self._active:
+            for item in node.items:
+                mod_name = _get_module_name(item.item)
+                if mod_name in ("atomic", "transaction.atomic", "django.db.transaction.atomic"):
+                    self._atomic_depth += 1
+                    break
+        return True
+
+    def leave_With(self, original_node: cst.With, updated_node: cst.With) -> cst.With:
+        if self._active:
+            for item in original_node.items:
+                mod_name = _get_module_name(item.item)
+                if mod_name in ("atomic", "transaction.atomic", "django.db.transaction.atomic"):
+                    self._atomic_depth -= 1
+                    break
+        return updated_node
+
+    def _is_dispatch_call(self, node: cst.Call) -> bool:
+        """Check if the call is a task dispatch: foo.delay(...), foo.apply_async(...)."""
+        return bool(isinstance(node.func, cst.Attribute) and node.func.attr.value in self._DISPATCH_ATTRS)
+
+    def _is_on_commit_wrapped(self, node: cst.CSTNode) -> bool:
+        """Check if the expression is already wrapped in transaction.on_commit."""
+        if isinstance(node, cst.Call):
+            name = _get_module_name(node.func)
+            if name in ("transaction.on_commit", "on_commit"):
+                return True
+        return False
+
+    def leave_Expr(self, original_node: cst.Expr, updated_node: cst.Expr) -> cst.Expr:
+        if not self._active or not self._atomic_depth:
+            return updated_node
+
+        if isinstance(updated_node.value, cst.Call):
+            call = updated_node.value
+            if self._is_on_commit_wrapped(call):
+                return updated_node
+            if self._is_dispatch_call(call):
+                new_call = cst.Call(
+                    func=cst.Attribute(value=cst.Name("transaction"), attr=cst.Name("on_commit")),
+                    args=[cst.Arg(value=cst.Lambda(params=cst.Parameters(), body=call))],
+                )
+                return updated_node.with_changes(value=new_call)
+
+        return updated_node
+
+
 def apply_all_fixes_with_report(
     source_code: str,
     rules: Optional[set[str]] = None,
@@ -844,6 +934,7 @@ def apply_all_fixes_with_report(
             "CG-009",
             "CG-016",
             "CG-017",
+            "CG-022",
         }
     current_code = source_code
     suppressions = SuppressionFilter()
@@ -983,6 +1074,14 @@ def apply_all_fixes_with_report(
             candidate = _ensure_import(tree, "django.db.models", "F").code
             current_code = _verify_gate(candidate, current_code, "CG-017", targets)
 
+    # 9. CG-022: wrap premature Django task dispatch in transaction.on_commit()
+    if "CG-022" in effective_rules:
+        targets = targets_for("CG-022")
+        if targets:
+            tree = cst.parse_module(current_code).visit(TransactionOnCommitTransformer(target_functions=targets))
+            candidate = tree.code
+            current_code = _verify_gate(candidate, current_code, "CG-022", targets)
+
     ast.parse(current_code)
     cst.parse_module(current_code)
 
@@ -1068,6 +1167,7 @@ from concurrency_guard.patcher.diff_utils import (
 __all__ = [
     "DiffGenerator",
     "DiffResult",
+    "DjangoFExpressionTransformer",
     "DjangoSelectForUpdateTransformer",
     "FileLockTransformer",
     "IdempotencyHeaderTransformer",
@@ -1075,6 +1175,7 @@ __all__ = [
     "PatchResult",
     "PatchSkip",
     "SharedStateLockTransformer",
+    "TransactionOnCommitTransformer",
     "WithForUpdateTransformer",
     "apply_all_fixes",
     "apply_all_fixes_with_report",
