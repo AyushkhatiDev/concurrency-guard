@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v3.5.0
+# ConcurrencyGuard (`cguard`) — v3.6.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-297%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-306%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -25,6 +25,27 @@ Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **SQLModel**,
 Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
+
+## 🛡️ What's New in v3.6.0: Distributed Task Queue & Transaction Boundary Race Detection (`CG-022`, `CG-023`, `CG-024`) + `LibCST` Auto-Remediation
+
+Distributed worker architectures and microservices frequently suffer from race conditions that straddle asynchronous queues and relational database transaction boundaries. `cguard` v3.6.0 introduces three high-signal static analysis rules and automated LibCST code repair for Celery, Dramatiq, ARQ, FastAPI `BackgroundTasks`, and transactional boundaries:
+
+1. **`CG-022` — Premature Background Task Dispatch Before Commit (Transactional Outbox Race):**
+   - **Pattern A (SQLAlchemy / SQLModel):** Identifies background tasks enqueued (`.delay()`, `.apply_async()`, `.send()`, `enqueue_job()`, `background_tasks.add_task()`) *before* `db.commit()` / `await db.commit()` or inside `session.begin()` blocks. If the database transaction rolls back or worker picks up the task before the transaction commits, the worker reads non-existent or stale data.
+   - **Pattern B (Django):** Detects `.delay()` or `.apply_async()` executed directly within `with transaction.atomic():` blocks or `@transaction.atomic` functions unless safely deferred.
+   - **Zero False-Positive Sanitizers:** Dispatches after `commit()`, dispatches inside `transaction.on_commit(...)`, or read-only execution flows.
+
+2. **`LibCST` Auto-Fix for Django (`TransactionOnCommitTransformer`):**
+   - Automatically wraps premature task invocations inside `with transaction.atomic():` into `transaction.on_commit(lambda: my_task.delay(...))`.
+   - Preserves formatting, comments, and verifies AST round-tripping for zero syntax regressions (`cguard fix --diff` / `cguard fix --check`).
+
+3. **`CG-023` — Non-Idempotent Retryable Worker Task:**
+   - Detects worker functions decorated with retry semantics (`@shared_task`, `@app.task`, `@celery.task`, `@dramatiq.actor` with `acks_late=True`, `autoretry_for=...`, `max_retries`, or `self.retry()`).
+   - Flags tasks that perform state mutations and database commits without idempotency guards (`redis.lock`, `.with_for_update()`, `get_or_create`, or `IntegrityError` handlers).
+
+4. **`CG-024` — External Network I/O Inside Open Database Transaction (Lock Starvation / Deadlock Risk):**
+   - Flags external HTTP/RPC requests (`requests`, `httpx`, `aiohttp`, `urllib.request`, `stripe`) executed inside active transactions (`transaction.atomic()`, `session.begin()`, or while holding row locks via `.with_for_update()`).
+   - Prevents database connection pool exhaustion and cascading production deadlocks caused by network latency during open transactions.
 
 ## 🛡️ What's New in v3.5.0: Cross-File Project Import Graph & Multi-Module Service-Layer Taint Propagation (`project_graph.py`)
 
@@ -219,7 +240,7 @@ In large production codebases with tens of thousands of lines of legacy code, fi
 1. **Spec-Compliant OASIS SARIF v2.1.0 Serializer (`cguard/sarif.py`):**
    - Implements full SARIF schema (`https://json.schemastore.org/sarif-2.1.0.json`) with deterministic JSON serialization (`indent=2`, sorted keys).
    - Generates exact 1-based region coordinates (`startLine`, `startColumn`, `endLine`, `endColumn`) and POSIX-normalized workspace relative URIs across Linux, macOS, and Windows.
-2. **Comprehensive CWE-362 Concurrency Rule Registry (`CG-001` through `CG-021`):**
+2. **Comprehensive CWE-362 Concurrency Rule Registry (`CG-001` through `CG-024`):**
    - Every rule is registered with rich metadata: unique `id`, `name`, `shortDescription`, `fullDescription`, `helpUri`, `defaultConfiguration.level` (`"error"` for high confidence, `"warning"` for medium), security severity scores, and MITRE CWE tags (`["cwe-362", "security", "concurrency", "race-condition"]`).
 3. **Commit-Resilient Alert Tracking (`partialFingerprints`):**
    - Computes deterministic SHA-256 location line hashes (`primaryLocationLineHash = SHA256(ruleId:uri:line:message)`) allowing GitHub Code Scanning to track alert lifecycle, resolutions, and reintroductions across git branches and commits.
@@ -497,6 +518,9 @@ Explore ConcurrencyGuard interactively in your browser at **[concurrencyguard.de
 | **BackgroundTasks Session Leak** | `CG-019` | ❌ Ignored | ⚠️ Blind to async task lifetimes | ✅ **Request-scoped DB session lifetime audit** |
 | **Unbounded Lock Across I/O** | `CG-020` | ❌ Ignored | ⚠️ Misses pool exhaustion risk | ✅ **Connection-pool boundary validation** |
 | **Generator Lock Leak (`yield`)** | `CG-021` | ❌ Ignored | ⚠️ Misses generator suspension | ✅ **Context-aware yield point audit** |
+| **Premature Task Dispatch** | `CG-022` | ❌ Ignored | ⚠️ Misses outbox race | ✅ **Transactional outbox & commit timing audit** |
+| **Non-Idempotent Retry Task** | `CG-023` | ❌ Ignored | ⚠️ Assumes clean execution | ✅ **Retry semantics & idempotency guard audit** |
+| **Network I/O in DB Transaction** | `CG-024` | ❌ Ignored | ⚠️ Overlooks pool starvation | ✅ **Transaction boundary latency audit** |
 | **Empirical Runtime Verification** | — | ❌ None | ❌ Cannot execute or stress code | ✅ **Synchronized `Barrier` stress engine** |
 | **Deterministic Code Remediation** | — | ⚠️ Style fixes only | ⚠️ Introduces syntax regressions | ✅ **Lossless `LibCST` + `ast.parse` preflight** |
 

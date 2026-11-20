@@ -17,7 +17,7 @@ SARIF_VERSION = "2.1.0"
 TOOL_NAME = "ConcurrencyGuard"
 TOOL_INFO_URI = "https://concurrencyguard.dev"
 
-# Comprehensive CWE-362 Concurrency & Race-Condition Rule Registry (CG-001 through CG-021)
+# Comprehensive CWE-362 Concurrency & Race-Condition Rule Registry (CG-001 through CG-024)
 RULE_REGISTRY: dict[str, dict[str, Any]] = {
     "CG-001": {
         "id": "CG-001",
@@ -395,6 +395,67 @@ RULE_REGISTRY: dict[str, dict[str, Any]] = {
             "tags": ["concurrency", "generator", "deadlock", "cwe-833", "cwe-362"],
             "precision": "high",
             "security-severity": "7.5",
+        },
+    },
+    "CG-022": {
+        "id": "CG-022",
+        "name": "PrematureTaskDispatchBeforeCommit",
+        "shortDescription": {"text": "Premature Background Task Dispatch Before Commit"},
+        "fullDescription": {
+            "text": (
+                "A background task is dispatched (.delay(), .apply_async(), .send(), add_task()) "
+                "before the enclosing database transaction has committed. If the transaction "
+                "rolls back or the commit is delayed, the worker task operates on stale or "
+                "non-existent data (Transactional Outbox Race)."
+            )
+        },
+        "helpUri": "https://concurrencyguard.dev/rules/CG-022",
+        "defaultConfiguration": {"level": "error"},
+        "properties": {
+            "tags": ["security", "concurrency", "race-condition", "celery", "cwe-362"],
+            "precision": "high",
+            "security-severity": "8.0",
+        },
+    },
+    "CG-023": {
+        "id": "CG-023",
+        "name": "NonIdempotentRetryableWorkerTask",
+        "shortDescription": {"text": "Non-Idempotent Retryable Worker Task"},
+        "fullDescription": {
+            "text": (
+                "A Celery/Dramatiq/ARQ worker task configured with retries (acks_late, "
+                "autoretry_for, max_retries) performs state mutations and DB commits without "
+                "idempotency guards (row lock, deduplication key, or IntegrityError handling), "
+                "causing duplicate side effects on task retry after worker crash or timeout."
+            )
+        },
+        "helpUri": "https://concurrencyguard.dev/rules/CG-023",
+        "defaultConfiguration": {"level": "error"},
+        "properties": {
+            "tags": ["security", "concurrency", "celery", "idempotency", "cwe-362", "cwe-662"],
+            "precision": "high",
+            "security-severity": "8.0",
+        },
+    },
+    "CG-024": {
+        "id": "CG-024",
+        "name": "ExternalIOInsideDBTransaction",
+        "shortDescription": {"text": "External Network I/O Inside Open Database Transaction"},
+        "fullDescription": {
+            "text": (
+                "An external HTTP/RPC call (requests, httpx, aiohttp, stripe, urllib) is "
+                "executed inside an active database transaction (transaction.atomic(), "
+                "session.begin(), or while holding row locks via with_for_update()). "
+                "Unpredictable external network latency holds DB connections and row locks "
+                "open, causing connection pool exhaustion and production deadlocks."
+            )
+        },
+        "helpUri": "https://concurrencyguard.dev/rules/CG-024",
+        "defaultConfiguration": {"level": "warning"},
+        "properties": {
+            "tags": ["concurrency", "performance", "lock-contention", "cwe-662", "cwe-400"],
+            "precision": "high",
+            "security-severity": "7.0",
         },
     },
 }
