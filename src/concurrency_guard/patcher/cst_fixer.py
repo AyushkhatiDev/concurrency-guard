@@ -911,6 +911,86 @@ class TransactionOnCommitTransformer(cst.CSTTransformer):
         return updated_node
 
 
+class AsyncSleepTransformer(cst.CSTTransformer):
+    """LibCST transformer rewriting synchronous time.sleep(...) calls inside async def
+    functions into await asyncio.sleep(...).
+
+    Transforms:
+        async def handler():
+            time.sleep(1)
+
+    Into:
+        async def handler():
+            await asyncio.sleep(1)
+    """
+
+    def __init__(self, target_functions: Optional[set[str]] = None) -> None:
+        super().__init__()
+        self.target_functions = target_functions
+        self._in_async_func = False
+        self._async_depth = 0
+
+    def visit_FunctionDef(self, node: cst.FunctionDef) -> bool:
+        if node.asynchronous is not None and (
+            self.target_functions is None or node.name.value in self.target_functions
+        ):
+            self._async_depth += 1
+            self._in_async_func = True
+        return True
+
+    def leave_FunctionDef(
+        self, original_node: cst.FunctionDef, updated_node: cst.FunctionDef
+    ) -> cst.FunctionDef:
+        if original_node.asynchronous is not None and (
+            self.target_functions is None or original_node.name.value in self.target_functions
+        ):
+            self._async_depth -= 1
+            if self._async_depth <= 0:
+                self._in_async_func = False
+                self._async_depth = 0
+        return updated_node
+
+    def leave_Expr(self, original_node: cst.Expr, updated_node: cst.Expr) -> cst.Expr:
+        if not self._in_async_func:
+            return updated_node
+
+        val = updated_node.value
+        # Case 1: time.sleep(...) -> await asyncio.sleep(...)
+        if isinstance(val, cst.Call):
+            name = _get_module_name(val.func)
+            if name in ("time.sleep", "sleep"):
+                new_call = val.with_changes(
+                    func=cst.Attribute(value=cst.Name("asyncio"), attr=cst.Name("sleep"))
+                )
+                return updated_node.with_changes(value=cst.Await(expression=new_call))
+
+        # Case 2: await time.sleep(...) -> await asyncio.sleep(...)
+        if isinstance(val, cst.Await) and isinstance(val.expression, cst.Call):
+            call = val.expression
+            name = _get_module_name(call.func)
+            if name in ("time.sleep", "sleep"):
+                new_call = call.with_changes(
+                    func=cst.Attribute(value=cst.Name("asyncio"), attr=cst.Name("sleep"))
+                )
+                return updated_node.with_changes(value=cst.Await(expression=new_call))
+
+        return updated_node
+
+    def leave_Assign(self, original_node: cst.Assign, updated_node: cst.Assign) -> cst.Assign:
+        if not self._in_async_func:
+            return updated_node
+
+        if isinstance(updated_node.value, cst.Call):
+            name = _get_module_name(updated_node.value.func)
+            if name in ("time.sleep", "sleep"):
+                new_call = updated_node.value.with_changes(
+                    func=cst.Attribute(value=cst.Name("asyncio"), attr=cst.Name("sleep"))
+                )
+                return updated_node.with_changes(value=cst.Await(expression=new_call))
+
+        return updated_node
+
+
 def apply_all_fixes_with_report(
     source_code: str,
     rules: Optional[set[str]] = None,
@@ -935,6 +1015,7 @@ def apply_all_fixes_with_report(
             "CG-016",
             "CG-017",
             "CG-022",
+            "CG-025",
         }
     current_code = source_code
     suppressions = SuppressionFilter()
@@ -1082,6 +1163,14 @@ def apply_all_fixes_with_report(
             candidate = tree.code
             current_code = _verify_gate(candidate, current_code, "CG-022", targets)
 
+    # 10. CG-025: replace time.sleep() inside async def with await asyncio.sleep()
+    if "CG-025" in effective_rules:
+        targets = targets_for("CG-025")
+        if targets:
+            tree = cst.parse_module(current_code).visit(AsyncSleepTransformer(target_functions=targets))
+            candidate = _ensure_module_import(tree, "asyncio").code
+            current_code = _verify_gate(candidate, current_code, "CG-025", targets)
+
     ast.parse(current_code)
     cst.parse_module(current_code)
 
@@ -1165,6 +1254,7 @@ from concurrency_guard.patcher.diff_utils import (
 )
 
 __all__ = [
+    "AsyncSleepTransformer",
     "DiffGenerator",
     "DiffResult",
     "DjangoFExpressionTransformer",
