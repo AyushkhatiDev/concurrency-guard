@@ -10,6 +10,13 @@ from concurrency_guard.baseline import (
     filter_with_baseline,
     update_baseline_file,
 )
+from concurrency_guard.engine import (
+    ParsedModule,
+    parse_module,
+    parse_modules_parallel,
+    scan_directory_parallel,
+    scan_project_parallel,
+)
 from concurrency_guard.gh_review import (
     DiffFile,
     DiffHunk,
@@ -75,6 +82,7 @@ __all__ = [
     "InterleavingTrace",
     "LanguageServer",
     "PRDiffPosition",
+    "ParsedModule",
     "ProjectSymbolGraph",
     "ReviewComment",
     "ReviewResult",
@@ -101,12 +109,16 @@ __all__ = [
     "inject_message",
     "is_duplicate_comment",
     "map_finding_to_pr_diff",
+    "parse_module",
+    "parse_modules_parallel",
     "parse_unified_diff",
     "post_pr_review_comment",
     "read_message",
     "resolve_module_path",
     "run_lsp_server",
     "run_pr_review",
+    "scan_directory_parallel",
+    "scan_project_parallel",
     "serialize_sarif",
     "simulate_finding",
     "update_baseline_file",

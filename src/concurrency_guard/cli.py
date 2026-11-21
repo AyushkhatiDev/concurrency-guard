@@ -1115,6 +1115,8 @@ def fix(
         "CG-009": "Wrapped concurrent file write in FileLock",
         "CG-016": "Added Django select_for_update() to ORM fetch",
         "CG-017": "Replaced in-memory arithmetic with atomic database F() expression",
+        "CG-022": "Wrapped premature task dispatch in transaction.on_commit()",
+        "CG-025": "Replaced blocking time.sleep() with await asyncio.sleep()",
     }
 
     for target in target_files:

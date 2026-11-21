@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v3.6.0
+# ConcurrencyGuard (`cguard`) — v3.7.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-306%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-311%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -25,6 +25,27 @@ Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **SQLModel**,
 Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
+
+## 🛡️ What's New in v3.7.0: Parse-Once Parallel Scan Engine + Asyncio/Redis Concurrency Rules (`CG-025`, `CG-026`, `CG-027`) + `LibCST` Auto-Fix
+
+High-throughput async backends and distributed systems require fast, multi-core analysis and specialized race detection for asynchronous event loops and distributed caches. `cguard` v3.7.0 introduces the **Parse-Once IR & Parallel Multi-Core Scanner Engine** alongside three dedicated rules for pure `asyncio` and `redis`:
+
+1. **Parse-Once IR & Multi-Core Parallel Scanner (`engine.py` / `--jobs N`):**
+   - Introduces lightweight `ParsedModule` intermediate representation so every `.py` file is read and parsed via `ast.parse()` **exactly once** per scan, sharing AST trees across `ProjectSymbolGraph`, taint tracking, and rule visitors.
+   - Auto-enables multi-core scanning across workers via `concurrent.futures.ThreadPoolExecutor` when scanning > 20 files, configurable via `--jobs N` / `-j N` (defaulting to `os.cpu_count()`).
+   - Guarantees byte-for-byte deterministic output ordering sorted by `(file_path, line, rule_id)`.
+
+2. **`CG-025` — Blocking Call Inside `async def` (Event-Loop Starvation):**
+   - Detects synchronous blocking calls (`time.sleep(...)`, `requests.*(...)`, `urllib.request.urlopen(...)`, `subprocess.*(...)`) invoked directly inside async coroutines.
+   - **Zero False-Positive Sanitizers:** Automatically suppresses alerts when calls are offloaded via `asyncio.to_thread(...)`, `loop.run_in_executor(...)`, or `anyio.to_thread.run_sync(...)`.
+   - **`LibCST` Auto-Fix (`AsyncSleepTransformer`):** Automatically rewrites `time.sleep(X)` inside `async def` to `await asyncio.sleep(X)` and injects `import asyncio` via `cguard fix --write`.
+
+3. **`CG-026` — Unreferenced / Orphan Asyncio Background Task (Fire-and-Forget Task Race):**
+   - Identifies bare expression calls to `asyncio.create_task(...)` or `loop.create_task(...)` where the returned task is discarded.
+   - Prevents silent task drops and dropped work caused by Python runtime garbage collection destroying unreferenced tasks mid-execution.
+
+4. **`CG-027` — Non-Atomic Redis Check-Then-Set Race (Distributed Cache Race):**
+   - Flags patterns where a Redis get operation (`redis.get`, `client.get`, `cache.get`) is followed by an `if` condition and a Redis set operation without atomic guards (`nx=True`, `xx=True`), Redis transaction pipeline (`pipeline()`), or distributed lock (`redis.lock(...)`).
 
 ## 🛡️ What's New in v3.6.0: Distributed Task Queue & Transaction Boundary Race Detection (`CG-022`, `CG-023`, `CG-024`) + `LibCST` Auto-Remediation
 
@@ -240,7 +261,7 @@ In large production codebases with tens of thousands of lines of legacy code, fi
 1. **Spec-Compliant OASIS SARIF v2.1.0 Serializer (`cguard/sarif.py`):**
    - Implements full SARIF schema (`https://json.schemastore.org/sarif-2.1.0.json`) with deterministic JSON serialization (`indent=2`, sorted keys).
    - Generates exact 1-based region coordinates (`startLine`, `startColumn`, `endLine`, `endColumn`) and POSIX-normalized workspace relative URIs across Linux, macOS, and Windows.
-2. **Comprehensive CWE-362 Concurrency Rule Registry (`CG-001` through `CG-024`):**
+2. **Comprehensive CWE-362 Concurrency Rule Registry (`CG-001` through `CG-027`):**
    - Every rule is registered with rich metadata: unique `id`, `name`, `shortDescription`, `fullDescription`, `helpUri`, `defaultConfiguration.level` (`"error"` for high confidence, `"warning"` for medium), security severity scores, and MITRE CWE tags (`["cwe-362", "security", "concurrency", "race-condition"]`).
 3. **Commit-Resilient Alert Tracking (`partialFingerprints`):**
    - Computes deterministic SHA-256 location line hashes (`primaryLocationLineHash = SHA256(ruleId:uri:line:message)`) allowing GitHub Code Scanning to track alert lifecycle, resolutions, and reintroductions across git branches and commits.
@@ -521,6 +542,9 @@ Explore ConcurrencyGuard interactively in your browser at **[concurrencyguard.de
 | **Premature Task Dispatch** | `CG-022` | ❌ Ignored | ⚠️ Misses outbox race | ✅ **Transactional outbox & commit timing audit** |
 | **Non-Idempotent Retry Task** | `CG-023` | ❌ Ignored | ⚠️ Assumes clean execution | ✅ **Retry semantics & idempotency guard audit** |
 | **Network I/O in DB Transaction** | `CG-024` | ❌ Ignored | ⚠️ Overlooks pool starvation | ✅ **Transaction boundary latency audit** |
+| **Blocking Call in `async def`** | `CG-025` | ❌ Ignored | ⚠️ Misses event-loop starvation | ✅ **Thread offload sanitizer & auto-fix** |
+| **Orphan Asyncio Task** | `CG-026` | ❌ Ignored | ⚠️ Misses task GC drop | ✅ **Strong reference & lifetime audit** |
+| **Redis Check-Then-Set Race** | `CG-027` | ❌ Ignored | ⚠️ Overlooks distributed cache race | ✅ **Atomic `nx=True`, pipeline & lock audit** |
 | **Empirical Runtime Verification** | — | ❌ None | ❌ Cannot execute or stress code | ✅ **Synchronized `Barrier` stress engine** |
 | **Deterministic Code Remediation** | — | ⚠️ Style fixes only | ⚠️ Introduces syntax regressions | ✅ **Lossless `LibCST` + `ast.parse` preflight** |
 

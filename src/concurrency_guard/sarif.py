@@ -17,7 +17,7 @@ SARIF_VERSION = "2.1.0"
 TOOL_NAME = "ConcurrencyGuard"
 TOOL_INFO_URI = "https://concurrencyguard.dev"
 
-# Comprehensive CWE-362 Concurrency & Race-Condition Rule Registry (CG-001 through CG-024)
+# Comprehensive CWE-362 Concurrency & Race-Condition Rule Registry (CG-001 through CG-027)
 RULE_REGISTRY: dict[str, dict[str, Any]] = {
     "CG-001": {
         "id": "CG-001",
@@ -456,6 +456,66 @@ RULE_REGISTRY: dict[str, dict[str, Any]] = {
             "tags": ["concurrency", "performance", "lock-contention", "cwe-662", "cwe-400"],
             "precision": "high",
             "security-severity": "7.0",
+        },
+    },
+    "CG-025": {
+        "id": "CG-025",
+        "name": "BlockingAsyncCall",
+        "shortDescription": {"text": "Blocking Call Inside async def (Event-Loop Starvation)"},
+        "fullDescription": {
+            "text": (
+                "A synchronous blocking call (time.sleep, requests, urllib, subprocess) is "
+                "executed directly inside an async coroutine without offloading to a thread "
+                "or executor. This halts the single-threaded asyncio event loop, starving "
+                "all concurrent tasks and degrading throughput."
+            )
+        },
+        "helpUri": "https://concurrencyguard.dev/rules/CG-025",
+        "defaultConfiguration": {"level": "error"},
+        "properties": {
+            "tags": ["performance", "concurrency", "asyncio", "event-loop", "cwe-400"],
+            "precision": "high",
+            "security-severity": "7.5",
+        },
+    },
+    "CG-026": {
+        "id": "CG-026",
+        "name": "OrphanBackgroundTask",
+        "shortDescription": {"text": "Unreferenced / Orphan Asyncio Background Task"},
+        "fullDescription": {
+            "text": (
+                "An asyncio task is created via asyncio.create_task() or loop.create_task() "
+                "as a bare expression without retaining a strong reference. The Python runtime "
+                "garbage collector may destroy unreferenced tasks mid-execution, causing "
+                "silent task termination and dropped work."
+            )
+        },
+        "helpUri": "https://concurrencyguard.dev/rules/CG-026",
+        "defaultConfiguration": {"level": "warning"},
+        "properties": {
+            "tags": ["concurrency", "asyncio", "reliability", "cwe-662"],
+            "precision": "high",
+            "security-severity": "6.5",
+        },
+    },
+    "CG-027": {
+        "id": "CG-027",
+        "name": "RedisCheckThenSetRace",
+        "shortDescription": {"text": "Non-Atomic Redis Check-Then-Set Race"},
+        "fullDescription": {
+            "text": (
+                "A Redis get operation is followed by a conditional check and a Redis set "
+                "operation without atomic guards (nx=True, xx=True), transaction pipeline, "
+                "or distributed lock. Concurrent distributed workers can read stale values "
+                "and overwrite each other's updates."
+            )
+        },
+        "helpUri": "https://concurrencyguard.dev/rules/CG-027",
+        "defaultConfiguration": {"level": "error"},
+        "properties": {
+            "tags": ["concurrency", "distributed", "redis", "race-condition", "cwe-362"],
+            "precision": "high",
+            "security-severity": "8.0",
         },
     },
 }
