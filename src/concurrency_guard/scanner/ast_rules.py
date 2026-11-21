@@ -12,15 +12,12 @@ from typing import Any, Optional, Union
 
 import yaml  # type: ignore[import-untyped]
 
-from concurrency_guard.project_graph import ProjectSymbolGraph
 from concurrency_guard.scanner.call_graph import (
     FunctionSummary,
     analyze_module_functions,
-    build_call_graph,
 )
 from concurrency_guard.scanner.suppression import SuppressionFilter
 from concurrency_guard.scanner.taint_tracker import (
-    find_tainted_shared_state_mutations,
     find_tainted_shared_state_mutations_in_source,
 )
 
@@ -2529,17 +2526,18 @@ def scan_source_code(
     config: Optional[Any] = None,
     custom_lock_names: Optional[Union[list[str], set[str]]] = None,
     project_graph: Optional[Any] = None,
+    tree: Optional[ast.AST] = None,
 ) -> list[ASTFinding]:
     """Scan Python source code string for concurrency vulnerabilities."""
-    tree = ast.parse(source_code, filename=filename)
+    parsed_tree = tree if tree is not None else ast.parse(source_code, filename=filename)
     visitor = ConcurrencyASTVisitor(
         filename=filename,
-        tree=tree,
+        tree=parsed_tree,
         config=config,
         custom_lock_names=custom_lock_names,
         project_graph=project_graph,
     )
-    visitor.visit(tree)
+    visitor.visit(parsed_tree)
     visitor._check_deadlocks()
     taint_findings = [
         ASTFinding(
@@ -2558,7 +2556,7 @@ def scan_source_code(
         )
         for finding in find_tainted_shared_state_mutations_in_source(source_code, filename)
     ]
-    raw_findings = visitor.findings + taint_findings + (_custom_rule_findings(tree, filename, custom_rules) if custom_rules else [])
+    raw_findings = visitor.findings + taint_findings + (_custom_rule_findings(parsed_tree, filename, custom_rules) if custom_rules else [])
     if config is not None and hasattr(config, "is_rule_enabled"):
         return [f for f in raw_findings if config.is_rule_enabled(f.rule_id, file_path=filename)]
     return raw_findings
@@ -2595,6 +2593,7 @@ def scan_file(
     suppression_filter: Optional[SuppressionFilter] = None,
     config: Optional[Any] = None,
     project_graph: Optional[Any] = None,
+    parsed_module: Optional[Any] = None,
 ) -> list[ASTFinding]:
     """Scan a Python file for concurrency vulnerabilities, skipping unparseable files."""
     dep_digest = project_graph.get_dependency_digest(file_path) if project_graph is not None else None
@@ -2621,10 +2620,23 @@ def scan_file(
                 return [f for f in filtered if config.is_rule_enabled(f.rule_id, file_path=file_path)]
             return filtered
 
-    try:
-        source_code = file_path.read_text(encoding="utf-8-sig")
-    except (UnicodeDecodeError, OSError):
-        return []
+    parsed_tree: Optional[ast.AST] = None
+    if parsed_module is not None:
+        if hasattr(parsed_module, "source") and hasattr(parsed_module, "tree"):
+            source_code = parsed_module.source
+            parsed_tree = parsed_module.tree
+        elif isinstance(parsed_module, tuple) and len(parsed_module) == 2:
+            parsed_tree, source_code = parsed_module
+        else:
+            try:
+                source_code = file_path.read_text(encoding="utf-8-sig")
+            except (UnicodeDecodeError, OSError):
+                return []
+    else:
+        try:
+            source_code = file_path.read_text(encoding="utf-8-sig")
+        except (UnicodeDecodeError, OSError):
+            return []
 
     try:
         findings = scan_source_code(
@@ -2633,6 +2645,7 @@ def scan_file(
             custom_rules=custom_rules,
             config=config,
             project_graph=project_graph,
+            tree=parsed_tree,
         )
     except (SyntaxError, ValueError):
         findings = []
@@ -2663,14 +2676,14 @@ def scan_file(
 
 
 def sort_findings(findings: list[ASTFinding]) -> list[ASTFinding]:
-    """Sort findings deterministically by (filename, lineno, col_offset, rule_id)."""
+    """Sort findings deterministically by (filename, lineno, rule_id, col_offset)."""
     return sorted(
         dict.fromkeys(findings),
         key=lambda f: (
             str(f.filename),
             f.lineno,
-            getattr(f, "col_offset", 0) or 0,
             f.rule_id,
+            getattr(f, "col_offset", 0) or 0,
         ),
     )
 
@@ -2682,7 +2695,7 @@ def _scan_worker_task(
     config: Optional[Any] = None,
     project_graph: Optional[Any] = None,
 ) -> tuple[Path, list[ASTFinding]]:
-    """Isolated, picklable worker task for parallel ProcessPoolExecutor execution."""
+    """Isolated, picklable worker task for parallel execution."""
     suppression = SuppressionFilter(ignore_pragma=ignore_pragma)
     findings = scan_file(
         file_path,
@@ -2705,9 +2718,10 @@ def scan_directory(
     cross_file: bool = True,
 ) -> list[ASTFinding]:
     """Scan a directory recursively, including cross-file call-chain analysis."""
-    return scan_project(
-        discover_python_files(dir_path, config=config),
-        roots=[dir_path],
+    from concurrency_guard.engine import scan_directory_parallel
+
+    return scan_directory_parallel(
+        dir_path=dir_path,
         custom_rules=custom_rules,
         cache_manager=cache_manager,
         suppression_filter=suppression_filter,
@@ -2728,200 +2742,20 @@ def scan_project(
     jobs: Optional[int] = None,
     config: Optional[Any] = None,
     cross_file: bool = True,
+    parsed_modules: Optional[dict[Path, Any]] = None,
 ) -> list[ASTFinding]:
-    """Scan files and propagate shared-state hazards to transitive callers.
+    """Scan files and propagate shared-state hazards to transitive callers."""
+    from concurrency_guard.engine import scan_project_parallel
 
-    CG-014 reports at a public caller when its cross-file call chain reaches a
-    function that mutates module shared state. Graph construction reads source
-    only; no scanned code is imported or executed.
-    """
-    active_filter = suppression_filter or SuppressionFilter()
-
-    effective_cross_file = cross_file if cross_file is not None else getattr(config, "cross_file", True)
-    project_graph: Optional[ProjectSymbolGraph] = None
-    if effective_cross_file and file_paths:
-        custom_locks = getattr(config, "custom_lock_names", None)
-        project_graph = ProjectSymbolGraph.build(
-            file_paths,
-            roots=roots,
-            custom_lock_names=custom_locks,
-        )
-
-    # Determine effective worker count
-    num_jobs = jobs if jobs is not None else workers
-    if num_jobs is not None and num_jobs > 0:
-        effective_jobs = num_jobs
-    else:
-        effective_jobs = os.cpu_count() or 4
-
-    findings: list[ASTFinding] = []
-    uncached_files: list[Path] = []
-
-    # First, check cache for immediate hits
-    if cache_manager is not None:
-        for file_path in file_paths:
-            dep_digest = project_graph.get_dependency_digest(file_path) if project_graph is not None else None
-            cached: Optional[list[ASTFinding]] = None
-            if hasattr(cache_manager, "get"):
-                try:
-                    cached = cache_manager.get(file_path, dependency_digest=dep_digest)
-                except TypeError:
-                    cached = cache_manager.get(file_path)
-            elif hasattr(cache_manager, "get_cached_findings"):
-                try:
-                    raw_cached = cache_manager.get_cached_findings(file_path, dependency_digest=dep_digest)
-                except TypeError:
-                    raw_cached = cache_manager.get_cached_findings(file_path)
-                if raw_cached is not None:
-                    from concurrency_guard.cache.manager import dict_to_finding
-
-                    cached = [dict_to_finding(d) for d in raw_cached]
-
-            if cached is not None:
-                findings.extend(active_filter.filter_findings(cached, file_path=file_path))
-            else:
-                uncached_files.append(file_path)
-    else:
-        uncached_files = list(file_paths)
-
-    # Scan uncached files
-    if uncached_files:
-        if len(uncached_files) > 8 and effective_jobs > 1:
-            import concurrent.futures
-
-            try:
-                with concurrent.futures.ProcessPoolExecutor(max_workers=effective_jobs) as executor:
-                    futures = {
-                        executor.submit(
-                            _scan_worker_task,
-                            fp,
-                            custom_rules,
-                            active_filter.ignore_pragma,
-                            config,
-                            project_graph,
-                        ): fp
-                        for fp in uncached_files
-                    }
-                    for future in concurrent.futures.as_completed(futures):
-                        fp, file_findings = future.result()
-                        if cache_manager is not None:
-                            fp_dep = project_graph.get_dependency_digest(fp) if project_graph is not None else None
-                            if hasattr(cache_manager, "set"):
-                                try:
-                                    cache_manager.set(fp, file_findings, dependency_digest=fp_dep)
-                                except TypeError:
-                                    cache_manager.set(fp, file_findings)
-                            elif hasattr(cache_manager, "update_cache"):
-                                from concurrency_guard.cache.manager import finding_to_dict
-
-                                try:
-                                    cache_manager.update_cache(
-                                        fp, [finding_to_dict(f) for f in file_findings], dependency_digest=fp_dep
-                                    )
-                                except TypeError:
-                                    cache_manager.update_cache(
-                                        fp, [finding_to_dict(f) for f in file_findings]
-                                    )
-                        findings.extend(file_findings)
-            except Exception:  # noqa: BLE001
-                # Graceful fallback to sequential scanning
-                for file_path in uncached_files:
-                    findings.extend(
-                        scan_file(
-                            file_path,
-                            custom_rules=custom_rules,
-                            cache_manager=cache_manager,
-                            suppression_filter=active_filter,
-                            config=config,
-                            project_graph=project_graph,
-                        )
-                    )
-        elif effective_jobs > 1 and len(uncached_files) > 2:
-            import concurrent.futures
-
-            with concurrent.futures.ThreadPoolExecutor(max_workers=effective_jobs) as executor:
-                futures_tp = {
-                    executor.submit(
-                        scan_file,
-                        file_path,
-                        custom_rules=custom_rules,
-                        cache_manager=cache_manager,
-                        suppression_filter=active_filter,
-                        config=config,
-                        project_graph=project_graph,
-                    ): file_path
-                    for file_path in uncached_files
-                }
-                for future_thread in concurrent.futures.as_completed(futures_tp):
-                    findings.extend(future_thread.result())
-        else:
-            for file_path in uncached_files:
-                findings.extend(
-                    scan_file(
-                        file_path,
-                        custom_rules=custom_rules,
-                        cache_manager=cache_manager,
-                        suppression_filter=active_filter,
-                        config=config,
-                        project_graph=project_graph,
-                    )
-                )
-
-    graph = build_call_graph(file_paths, roots=roots)
-    taint_findings = find_tainted_shared_state_mutations(file_paths, graph)
-    for finding in taint_findings:
-        if not active_filter.should_suppress("CG-015", Path(finding.filename), finding.lineno):
-            findings.append(
-                ASTFinding(
-                    rule_id="CG-015",
-                    filename=finding.filename,
-                    lineno=finding.lineno,
-                    function_name=finding.function_name,
-                    message=(
-                        "Tainted Shared State Mutation: a local variable referencing shared state is "
-                        "mutated without concurrency controls."
-                    ),
-                    suggested_fix_hint=(
-                        "Protect the complete shared-state access with the appropriate lock or atomic "
-                        "operation before mutating the local reference."
-                    ),
-                )
-            )
-        else:
-            active_filter.suppressed_count += 1
-
-    reported: set[tuple[str, str]] = set()
-    for mutation in graph.shared_mutations:
-        mutated = graph.functions[mutation]
-        for caller_name in graph.callers_of(mutation):
-            caller = graph.functions[caller_name]
-            if caller.filename == mutated.filename:
-                continue
-            key = (caller_name, mutation)
-            if key in reported:
-                continue
-            reported.add(key)
-            if not active_filter.should_suppress("CG-014", Path(caller.filename), caller.lineno):
-                findings.append(
-                    ASTFinding(
-                        rule_id="CG-014",
-                        filename=caller.filename,
-                        lineno=caller.lineno,
-                        function_name=caller.name,
-                        message=(
-                            f"Inter-procedural shared-state race: call chain reaches '{mutation}', "
-                            "which mutates module shared state."
-                        ),
-                        suggested_fix_hint=(
-                            "Propagate a lock or synchronization boundary through the call chain, "
-                            "or make the shared-state operation atomic in the callee."
-                        ),
-                    )
-                )
-            else:
-                active_filter.suppressed_count += 1
-
-    if config is not None and hasattr(config, "is_rule_enabled"):
-        findings = [f for f in findings if config.is_rule_enabled(f.rule_id, file_path=f.filename)]
-
-    return sort_findings(findings)
+    return scan_project_parallel(
+        file_paths=file_paths,
+        roots=roots,
+        custom_rules=custom_rules,
+        cache_manager=cache_manager,
+        suppression_filter=suppression_filter,
+        workers=workers,
+        jobs=jobs,
+        config=config,
+        cross_file=cross_file,
+        parsed_modules=parsed_modules,
+    )

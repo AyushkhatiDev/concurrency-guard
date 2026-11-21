@@ -14,7 +14,7 @@ import os
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from concurrency_guard.scanner.call_graph import (
     FunctionSummary,
@@ -159,6 +159,7 @@ class ProjectSymbolGraph:
         file_paths: list[Path],
         roots: Optional[list[Path]] = None,
         custom_lock_names: Optional[Union[list[str], set[str]]] = None,
+        parsed_modules: Optional[dict[Path, Any]] = None,
     ) -> ProjectSymbolGraph:
         """Construct the ProjectSymbolGraph in two deterministic passes."""
         effective_roots: list[Path] = []
@@ -173,18 +174,34 @@ class ProjectSymbolGraph:
         graph = cls(roots=effective_roots)
         known_files = {f.resolve() for f in file_paths}
 
-        parsed_modules: dict[Path, tuple[ast.Module, str]] = {}
+        parsed_mods: dict[Path, tuple[ast.Module, str]] = {}
 
         # --- PASS 1: Parse and Index Local Function Summaries ---
         for fpath in file_paths:
             resolved_path = fpath.resolve()
-            try:
-                code = resolved_path.read_text(encoding="utf-8-sig")
-                tree = ast.parse(code, filename=str(resolved_path))
-            except (OSError, UnicodeDecodeError, SyntaxError):
-                continue
+            pm = None
+            if parsed_modules:
+                pm = parsed_modules.get(resolved_path) or parsed_modules.get(fpath)
 
-            parsed_modules[resolved_path] = (tree, code)
+            if pm is not None:
+                if hasattr(pm, "tree") and hasattr(pm, "source"):
+                    tree, code = pm.tree, pm.source
+                elif isinstance(pm, tuple) and len(pm) == 2:
+                    tree, code = pm
+                else:
+                    try:
+                        code = resolved_path.read_text(encoding="utf-8-sig")
+                        tree = ast.parse(code, filename=str(resolved_path))
+                    except (OSError, UnicodeDecodeError, SyntaxError):
+                        continue
+            else:
+                try:
+                    code = resolved_path.read_text(encoding="utf-8-sig")
+                    tree = ast.parse(code, filename=str(resolved_path))
+                except (OSError, UnicodeDecodeError, SyntaxError):
+                    continue
+
+            parsed_mods[resolved_path] = (tree, code)
 
             # Analyze local function summaries
             summaries = analyze_module_functions(tree, custom_lock_names=custom_lock_names)
@@ -201,7 +218,7 @@ class ProjectSymbolGraph:
             graph.file_summaries[resolved_path] = summaries
 
         # --- PASS 2: Import & Cross-File Call Resolution ---
-        for resolved_path, (tree, _) in parsed_modules.items():
+        for resolved_path, (tree, _) in parsed_mods.items():
             imports: dict[str, tuple[Path, str]] = {}
 
             for stmt in tree.body:
@@ -255,9 +272,9 @@ class ProjectSymbolGraph:
         for _ in range(3):
             changed = False
             for source_path, summaries in graph.file_summaries.items():
-                if source_path not in parsed_modules:
+                if source_path not in parsed_mods:
                     continue
-                tree, _ = parsed_modules[source_path]
+                tree, _ = parsed_mods[source_path]
 
                 for func_node in (n for n in tree.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))):
                     summary = summaries.get(func_node.name)
