@@ -59,6 +59,8 @@ from concurrency_guard.report import (
     get_cwe_for_finding,
     get_finding_severity,
     is_auto_fixable,
+    render_html_report,
+    render_markdown_report,
 )
 from concurrency_guard.sarif import findings_to_sarif, serialize_sarif
 from concurrency_guard.simulator import (
@@ -128,6 +130,8 @@ __all__ = [
     "parse_unified_diff",
     "post_pr_review_comment",
     "read_message",
+    "render_html_report",
+    "render_markdown_report",
     "resolve_module_path",
     "run_lsp_server",
     "run_pr_review",
