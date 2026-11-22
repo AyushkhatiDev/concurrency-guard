@@ -15,6 +15,7 @@ from concurrency_guard import (
     gh_review,
     lsp,
     project_graph,
+    report,
     sarif,
     simulator,
     watch,
@@ -30,6 +31,7 @@ sys.modules.setdefault("cguard.lsp", lsp)
 sys.modules.setdefault("cguard.watch", watch)
 sys.modules.setdefault("cguard.project_graph", project_graph)
 sys.modules.setdefault("cguard.engine", engine)
+sys.modules.setdefault("cguard.report", report)
 cguard_module = sys.modules.get("cguard")
 if cguard_module is not None:
     setattr(cguard_module, "sarif", sarif)  # noqa: B010
@@ -42,5 +44,6 @@ if cguard_module is not None:
     setattr(cguard_module, "watch", watch)  # noqa: B010
     setattr(cguard_module, "project_graph", project_graph)  # noqa: B010
     setattr(cguard_module, "engine", engine)  # noqa: B010
+    setattr(cguard_module, "report", report)  # noqa: B010
 
 
