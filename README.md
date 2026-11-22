@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v3.7.0
+# ConcurrencyGuard (`cguard`) — v3.8.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-311%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-316%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -25,6 +25,36 @@ Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **SQLModel**,
 Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
+
+## 🛡️ What's New in v3.8.0: Executive Concurrency Health Scorer & Zero-Dependency Interactive HTML/Markdown Audit Report (`report.py` & `cguard report`)
+
+Enterprise platforms and platform engineering teams require comprehensive executive reporting, compliance tracking, and CI/CD quality gates. `cguard` v3.8.0 introduces the **Executive Concurrency Health Scorer & Zero-Dependency Interactive HTML/Markdown Audit Reporter**:
+
+1. **Executive Concurrency Health Score (0–100) & Letter Grading (A–F):**
+   - Automatically computes a deterministic repository-wide health score weighted by severity:
+     - `HIGH` severity findings: -12 points
+     - `MEDIUM` severity findings: -5 points
+     - `LOW` severity findings: -2 points
+     - Clamped to `[0, 100]`, where clean repositories achieve `100 / A`.
+   - Clear letter grades: `A` (90–100), `B` (80–89), `C` (70–79), `D` (60–69), and `F` (<60).
+   - Hotspot file ranking identifies the top risk files and tracks deterministic auto-fixable counts across the codebase.
+
+2. **100% Zero-Dependency & Offline-Safe Interactive HTML5 Report:**
+   - Single standalone HTML5 document with clean inline slate/dark CSS and minimal vanilla JS.
+   - **Air-Gapped Enterprise Ready:** Zero CDN dependencies, zero external fonts, zero tracking or remote scripts.
+   - **Strict XSS Safety:** Comprehensive `html.escape()` sanitization ensures malicious strings or injection vectors in scanned Python files can never execute.
+   - **Interactive UI Components:**
+     - Executive KPI cards: Health Score, Total Findings, High Severity, Auto-Fixable, Files Scanned.
+     - Real-time client-side severity filtering (`All`, `HIGH`, `MEDIUM`, `LOW`, `Auto-Fixable`).
+     - Instant rule ID, file, and message search box.
+     - Top Hotspot Files table and CWE compliance breakdown summary (`CWE-362`, `CWE-662`, `CWE-400`).
+     - Expandable `<details>` cards with syntax-highlighted source context snippets and one-click `cguard fix` remediation commands.
+
+3. **Multi-Format Export & CI/CD Quality Gate (`cguard report [PATH]`):**
+   - `--format html`: Generates standalone interactive dashboard (defaults to `cguard-report.html`).
+   - `--format markdown`: Clean GitHub-flavored Markdown summary table ready for PR descriptions, Notion, or Confluence.
+   - `--format json`: Machine-readable metrics payload for downstream security dashboards and SOC2 compliance tooling.
+   - `--min-score <INT>`: CI/CD build breaker—exits with status `1` if repository health score falls below the required threshold.
 
 ## 🛡️ What's New in v3.7.0: Parse-Once Parallel Scan Engine + Asyncio/Redis Concurrency Rules (`CG-025`, `CG-026`, `CG-027`) + `LibCST` Auto-Fix
 

@@ -52,6 +52,16 @@ from concurrency_guard.project_graph import (
     ProjectSymbolGraph,
     resolve_module_path,
 )
+from concurrency_guard.report import (
+    AuditMetrics,
+    HotspotFile,
+    compute_audit_metrics,
+    get_cwe_for_finding,
+    get_finding_severity,
+    is_auto_fixable,
+    render_html_report,
+    render_markdown_report,
+)
 from concurrency_guard.sarif import findings_to_sarif, serialize_sarif
 from concurrency_guard.simulator import (
     AnomalyProof,
@@ -70,6 +80,7 @@ from concurrency_guard.watch import (
 
 __all__ = [
     "AnomalyProof",
+    "AuditMetrics",
     "Baseline",
     "BaselineEntry",
     "BaselineFilterResult",
@@ -79,6 +90,7 @@ __all__ = [
     "DocumentStore",
     "ExecutionStep",
     "FileSnapshot",
+    "HotspotFile",
     "InterleavingTrace",
     "LanguageServer",
     "PRDiffPosition",
@@ -89,6 +101,7 @@ __all__ = [
     "TimelineEvent",
     "WatchResult",
     "__version__",
+    "compute_audit_metrics",
     "compute_finding_fingerprint",
     "create_baseline",
     "create_test_server",
@@ -104,9 +117,12 @@ __all__ = [
     "format_suggestion_comment",
     "generate_code_actions",
     "generate_pytest_reproducer",
+    "get_cwe_for_finding",
+    "get_finding_severity",
     "get_pr_diff",
     "github_api_request",
     "inject_message",
+    "is_auto_fixable",
     "is_duplicate_comment",
     "map_finding_to_pr_diff",
     "parse_module",
@@ -114,6 +130,8 @@ __all__ = [
     "parse_unified_diff",
     "post_pr_review_comment",
     "read_message",
+    "render_html_report",
+    "render_markdown_report",
     "resolve_module_path",
     "run_lsp_server",
     "run_pr_review",

@@ -47,6 +47,11 @@ from concurrency_guard.gh_review import (
 from concurrency_guard.lsp import run_lsp_server
 from concurrency_guard.patcher.cst_fixer import apply_all_fixes
 from concurrency_guard.patcher.diff_utils import DiffGenerator, colorize_diff
+from concurrency_guard.report import (
+    compute_audit_metrics,
+    render_html_report,
+    render_markdown_report,
+)
 from concurrency_guard.reporter.github_pr import generate_github_pr_markdown
 from concurrency_guard.runner.barrier_engine import (
     BarrierResult,
@@ -1336,78 +1341,111 @@ def fix(
 @app.command()
 def report(
     file_path: Path = typer.Argument(
-        ...,
+        Path("."),
         exists=True,
-        dir_okay=False,
         readable=True,
-        help="Target Python file to generate Markdown report for",
+        help="Target Python file or directory to generate concurrency audit report for",
+    ),
+    format: str = typer.Option(
+        "html",
+        "--format",
+        "-f",
+        help="Report output format: 'html', 'markdown', or 'json'",
     ),
     output: Optional[Path] = typer.Option(
         None,
         "--output",
         "-o",
-        help="Optional path to write the Markdown report to",
+        help="Path to write the report to (defaults to cguard-report.html for HTML)",
     ),
-    workers: int = typer.Option(
-        20,
+    min_score: Optional[int] = typer.Option(
+        None,
+        "--min-score",
+        help="Minimum required Concurrency Health Score (0-100) for CI quality gate (exits 1 if score < min-score)",
+    ),
+    confidence: Optional[str] = typer.Option(
+        None,
+        "--confidence",
+        help="Filter findings by minimum confidence level: 'high', 'medium', or 'low'",
+    ),
+    ignore_pragma: bool = typer.Option(
+        False,
+        "--ignore-pragma",
+        help="Bypass inline '# cguard: ignore' comments and report all findings",
+    ),
+    config_file: Optional[Path] = typer.Option(
+        None,
+        "--config",
+        "-c",
+        help="Path to pyproject.toml configuration file",
+    ),
+    jobs: Optional[int] = typer.Option(
+        None,
+        "--jobs",
+        "-j",
+        help="Number of worker processes for parallel scanning",
+    ),
+    workers: Optional[int] = typer.Option(
+        None,
         "--workers",
         "-w",
-        help="Number of concurrent workers for barrier runtime verification if applicable",
+        help="Legacy alias for --jobs or barrier worker count",
     ),
 ) -> None:
-    """Generate a GitHub Pull Request Markdown report for AST findings and barrier exploit proofs."""
-    source_code = file_path.read_text(encoding="utf-8")
-    findings = scan_file(file_path)
+    """Generate an executive concurrency health score and interactive HTML/Markdown audit report."""
+    # Backward compatibility with legacy PR barrier report
+    if file_path.is_file() and output is not None and str(output).endswith("pr_report.md") and format != "markdown":
+        source_code = file_path.read_text(encoding="utf-8")
+        findings = scan_file(file_path)
 
-    barrier_result: Optional[BarrierResult] = None
-    try:
-        module_name = f"cguard_report_target_{file_path.stem}"
-        spec = importlib.util.spec_from_file_location(module_name, file_path)
-        if spec is not None and spec.loader is not None:
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = module
-            spec.loader.exec_module(module)
-            target_app: Any = getattr(module, "app", None)
-            if target_app is not None:
-                engine: Any = getattr(module, "engine", None)
-                session_factory: Any = getattr(
-                    module, "async_session", getattr(module, "AsyncSessionLocal", None)
-                )
-                wallet_model: Any = getattr(module, "Wallet", None)
-                base_class: Any = getattr(module, "Base", None)
-                base_metadata: Any = getattr(base_class, "metadata", None) if base_class else None
-
-                has_withdraw_route = any(
-                    getattr(route, "path", None) == "/wallet/withdraw"
-                    for route in getattr(target_app, "routes", [])
-                )
-                if has_withdraw_route:
-                    barrier_result = asyncio.run(
-                        run_barrier_test(
-                            app=target_app,
-                            endpoint="/wallet/withdraw",
-                            workers=workers,
-                            initial_balance=50,
-                            withdraw_amount=50,
-                            engine=engine,
-                            session_factory=session_factory,
-                            wallet_model=wallet_model,
-                            base_metadata=base_metadata,
-                        )
+        barrier_result: Optional[BarrierResult] = None
+        try:
+            module_name = f"cguard_report_target_{file_path.stem}"
+            spec = importlib.util.spec_from_file_location(module_name, file_path)
+            if spec is not None and spec.loader is not None:
+                module = importlib.util.module_from_spec(spec)
+                sys.modules[module_name] = module
+                spec.loader.exec_module(module)
+                target_app: Any = getattr(module, "app", None)
+                if target_app is not None:
+                    engine: Any = getattr(module, "engine", None)
+                    session_factory: Any = getattr(
+                        module, "async_session", getattr(module, "AsyncSessionLocal", None)
                     )
-    except Exception:  # noqa: BLE001
-        barrier_result = None
+                    wallet_model: Any = getattr(module, "Wallet", None)
+                    base_class: Any = getattr(module, "Base", None)
+                    base_metadata: Any = getattr(base_class, "metadata", None) if base_class else None
 
-    patched_code = apply_all_fixes(source_code)
-    markdown_report = generate_github_pr_markdown(
-        file_path=file_path,
-        findings=findings,
-        barrier_result=barrier_result,
-        patched_code=patched_code if patched_code != source_code else None,
-        original_code=source_code,
-    )
+                    has_withdraw_route = any(
+                        getattr(route, "path", None) == "/wallet/withdraw"
+                        for route in getattr(target_app, "routes", [])
+                    )
+                    if has_withdraw_route:
+                        barrier_result = asyncio.run(
+                            run_barrier_test(
+                                app=target_app,
+                                endpoint="/wallet/withdraw",
+                                workers=workers or 20,
+                                initial_balance=50,
+                                withdraw_amount=50,
+                                engine=engine,
+                                session_factory=session_factory,
+                                wallet_model=wallet_model,
+                                base_metadata=base_metadata,
+                            )
+                        )
+        except Exception:  # noqa: BLE001
+            barrier_result = None
 
-    if output is not None:
+        patched_code = apply_all_fixes(source_code)
+        markdown_report = generate_github_pr_markdown(
+            file_path=file_path,
+            findings=findings,
+            barrier_result=barrier_result,
+            patched_code=patched_code if patched_code != source_code else None,
+            original_code=source_code,
+        )
+
         output.write_text(markdown_report, encoding="utf-8")
         console.print(
             Panel(
@@ -1415,12 +1453,96 @@ def report(
                 border_style="green",
             )
         )
-    else:
-        console.print(markdown_report)
+        if findings or (barrier_result and barrier_result.get("invariant_violated")):
+            raise typer.Exit(code=1)
+        raise typer.Exit(code=0)
 
-    if findings or (barrier_result and barrier_result.get("invariant_violated")):
-        raise typer.Exit(code=1)
-    raise typer.Exit(code=0)
+    # Executive Concurrency Health Report
+    cfg = load_cguard_config(
+        start_path=file_path if file_path.is_dir() else file_path.parent,
+        config_path=config_file,
+    )
+
+    if file_path.is_file():
+        py_files = [file_path]
+        roots = [file_path.parent]
+    else:
+        py_files = discover_python_files(file_path, config=cfg)
+        roots = [file_path]
+
+    effective_jobs = jobs if jobs is not None else (workers or os.cpu_count() or 4)
+    suppression_filter = SuppressionFilter(ignore_pragma=ignore_pragma)
+
+    findings = scan_project(
+        py_files,
+        roots=roots,
+        suppression_filter=suppression_filter,
+        jobs=effective_jobs,
+        config=cfg,
+    )
+
+    if confidence:
+        eff_conf = confidence.upper()
+        allowed = {"HIGH"} if eff_conf == "HIGH" else ({"HIGH", "MEDIUM"} if eff_conf == "MEDIUM" else {"HIGH", "MEDIUM", "LOW"})
+        findings = [f for f in findings if getattr(f, "confidence", "HIGH").upper() in allowed]
+
+    metrics = compute_audit_metrics(findings, scanned_files=py_files)
+
+    fmt = format.lower().strip()
+    if fmt == "html":
+        content = render_html_report(metrics, findings, scanned_files=py_files)
+        target_out = output if output is not None else Path("cguard-report.html")
+        target_out.write_text(content, encoding="utf-8")
+        console.print(
+            Panel(
+                f"[bold green]✔ Executive Concurrency Health Report saved to {target_out}[/bold green]\n"
+                f"Health Score: [bold]{metrics.health_score} / 100[/bold] (Grade [bold]{metrics.grade}[/bold]) | "
+                f"Findings: {metrics.total_findings} ({metrics.high_count} High) | "
+                f"Auto-Fixable: {metrics.auto_fixable_count} | Files: {metrics.files_scanned}",
+                border_style="green",
+            )
+        )
+    elif fmt in ("markdown", "md"):
+        content = render_markdown_report(metrics, findings)
+        if output is not None:
+            output.write_text(content, encoding="utf-8")
+            console.print(
+                Panel(
+                    f"[bold green]✔ Executive Markdown Report saved to {output}[/bold green]",
+                    border_style="green",
+                )
+            )
+        else:
+            sys.stdout.write(content + "\n")
+    elif fmt == "json":
+        json_data = json.dumps(metrics.to_dict(), indent=2)
+        if output is not None:
+            output.write_text(json_data, encoding="utf-8")
+            console.print(
+                Panel(
+                    f"[bold green]✔ Executive JSON Report saved to {output}[/bold green]",
+                    border_style="green",
+                )
+            )
+        else:
+            sys.stdout.write(json_data + "\n")
+    else:
+        raise typer.BadParameter(f"Unknown format: '{format}'. Choose from 'html', 'markdown', or 'json'.")
+
+    # CI Quality Gate Check
+    if min_score is not None:
+        if metrics.health_score < min_score:
+            console.print(
+                f"[bold red]✖ CI Quality Gate Failed:[/bold red] Concurrency Health Score {metrics.health_score}/100 "
+                f"is below required minimum {min_score}/100 (Grade {metrics.grade})"
+            )
+            raise typer.Exit(code=1)
+        else:
+            console.print(
+                f"[bold green]✔ CI Quality Gate Passed:[/bold green] Concurrency Health Score {metrics.health_score}/100 "
+                f"meets or exceeds required minimum {min_score}/100 (Grade {metrics.grade})"
+            )
+            raise typer.Exit(code=0)
 
 
 baseline_app = typer.Typer(
