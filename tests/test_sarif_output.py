@@ -170,7 +170,7 @@ def test_cli_format_sarif_stdout() -> None:
 
     parsed = json.loads(res.stdout)
     assert parsed["version"] == "2.1.0"
-    assert len(parsed["runs"][0]["results"]) >= 5
+    assert len(parsed["runs"][0]["results"]) == 4
 
 
 def test_cli_format_sarif_output_file(tmp_path: Path) -> None:
@@ -196,7 +196,7 @@ def test_cli_format_sarif_output_file(tmp_path: Path) -> None:
 
     assert parsed["$schema"] == SARIF_SCHEMA_URI
     assert parsed["version"] == "2.1.0"
-    assert len(parsed["runs"][0]["results"]) >= 5
+    assert len(parsed["runs"][0]["results"]) == 4
 
     # File must not contain ANSI escape sequences
     assert "\x1b[" not in raw_content

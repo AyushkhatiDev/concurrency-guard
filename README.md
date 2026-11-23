@@ -69,6 +69,10 @@ The scan exits with status 1 when it reports findings. For a GitHub Actions setu
 
 Version 3.9.1 improves self-scan accuracy. Deadlock checks resolve local functions and methods by their receiver and class. Redis checks distinguish Redis operations from generic file-cache calls and match the receiver and key.
 
+When scanning this repository, `examples/` and `tests/` include intentional unsafe code used to demonstrate and verify findings. Run `cguard scan src/` to audit the scanner implementation.
+
+Version 3.9.2 recognizes simple repeated database status assignments in retryable tasks and keeps retry warnings when `acks_late=True` is the only safeguard. Arithmetic writes, inserts, state-dependent transitions, and unknown side-effect calls retain their diagnostics.
+
 ## More commands
 
 | Command | When to use it |
