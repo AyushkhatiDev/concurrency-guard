@@ -67,6 +67,8 @@ cguard report . --format html --output cguard-report.html
 
 The scan exits with status 1 when it reports findings. For a GitHub Actions setup, see the [example Code Scanning workflow](./examples/github-code-scanning.yml). To scan only files changed against a Git base branch, use `cguard scan . --base-ref origin/main`.
 
+Version 3.9.1 improves self-scan accuracy. Deadlock checks resolve local functions and methods by their receiver and class. Redis checks distinguish Redis operations from generic file-cache calls and match the receiver and key.
+
 ## More commands
 
 | Command | When to use it |

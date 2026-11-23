@@ -606,6 +606,13 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         custom_lock_names: Optional[Union[list[str], set[str]]] = None,
         project_graph: Optional[Any] = None,
     ) -> None:
+        self.parents = {
+            child: parent for parent in ast.walk(tree) for child in ast.iter_child_nodes(parent)
+        } if tree is not None else {}
+        self.local_functions = {
+            self._qualified_function(n): n for n in ast.walk(tree)
+            if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+        } if tree is not None else {}
         self.filename = filename
         self.config = config
         self.project_graph = project_graph
@@ -625,6 +632,55 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         self.function_summaries: dict[str, FunctionSummary] = (
             analyze_module_functions(tree, custom_lock_names=self.custom_lock_names) if isinstance(tree, ast.Module) else {}
         )
+
+    def _qualified_function(self, node: ast.AST) -> str:
+        parts = []
+        current: Optional[ast.AST] = node
+        while current is not None:
+            if isinstance(current, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                parts.append(current.name)
+            current = self.parents.get(current)
+        return ".".join(reversed(parts))
+
+    def _lock_identity(self, name: str, node: ast.AST) -> str:
+        if name.startswith(("self.", "cls.")):
+            current: Optional[ast.AST] = node
+            while current is not None:
+                if isinstance(current, ast.ClassDef):
+                    return self._qualified_function(current) + "::" + name
+                current = self.parents.get(current)
+        return name
+
+    def _resolve_locked_call(
+        self, caller: Union[ast.FunctionDef, ast.AsyncFunctionDef], call: ast.Call,
+    ) -> Optional[str]:
+        """Resolve direct local calls without guessing from a receiver's method name."""
+        scope = self._qualified_function(caller).split(".")[:-1]
+        if isinstance(call.func, ast.Attribute):
+            if not isinstance(call.func.value, ast.Name) or call.func.value.id not in {"self", "cls"}:
+                return None
+            parent = self.parents.get(caller)
+            if not isinstance(parent, ast.ClassDef):
+                return None
+            candidate = ".".join([*scope, call.func.attr])
+            return candidate if candidate in self.local_functions else None
+        if isinstance(call.func, ast.Name):
+            name = call.func.id
+            # A parameter or local binding can shadow a function with the same name.
+            if any(arg.arg == name for arg in (
+                *caller.args.posonlyargs, *caller.args.args, *caller.args.kwonlyargs,
+                *([caller.args.vararg] if caller.args.vararg else []),
+                *([caller.args.kwarg] if caller.args.kwarg else []),
+            )) or any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and n.id == name
+                      for n in _walk_local_nodes(caller)):
+                return None
+            for length in range(len(scope) + 1, -1, -1):
+                prefix = self._qualified_function(caller).split(".")[:length]
+                candidate = ".".join([*prefix, name])
+                target = self.local_functions.get(candidate)
+                if target is not None and not isinstance(self.parents.get(target), ast.ClassDef):
+                    return candidate
+        return None
 
     def _is_reentrant(self, name: str) -> bool:
         low = name.lower()
@@ -684,7 +740,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             if "rlock" in val_name or "reentrant" in val_name:
                 tname = _expr_name(target)
                 if tname:
-                    self.reentrant_locks.add(tname)
+                    self.reentrant_locks.add(self._lock_identity(tname, node))
             if isinstance(target, ast.Name):
                 if isinstance(node.value, ast.Name):
                     self.set_alias(target.id, node.value.id)
@@ -710,7 +766,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             if "rlock" in val_name or "reentrant" in val_name:
                 tname = _expr_name(node.target)
                 if tname:
-                    self.reentrant_locks.add(tname)
+                    self.reentrant_locks.add(self._lock_identity(tname, node))
         if isinstance(node.target, ast.Name):
             if isinstance(node.value, ast.Name):
                 self.set_alias(node.target.id, node.value.id)
@@ -947,15 +1003,16 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             outer = [_expr_name(item.context_expr) for item in with_node.items if _is_lock_expr(item.context_expr)]
             for lname in outer:
                 if lname:
-                    self.function_locks[node.name].add(lname)
+                    self.function_locks[self._qualified_function(node)].add(self._lock_identity(lname, node))
             for call_child in (n for n in _walk_local_nodes(with_node) if isinstance(n, ast.Call)):
-                callee_expr = _expr_name(call_child.func)
-                callee_base = callee_expr.split(".")[-1]
-                for olock in outer:
-                    if olock:
-                        self.calls_under_lock.append((node.name, olock, callee_base, with_node.lineno))
-                        if callee_expr != callee_base:
-                            self.calls_under_lock.append((node.name, olock, callee_expr, with_node.lineno))
+                callee = self._resolve_locked_call(node, call_child)
+                if callee is not None:
+                    for olock in outer:
+                        if olock:
+                            self.calls_under_lock.append((
+                                self._qualified_function(node),
+                                self._lock_identity(olock, node), callee, call_child.lineno,
+                            ))
 
             if len(outer) > 1:
                 seen_locks: set[str] = set()
@@ -995,9 +1052,6 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         inter_reported: set[tuple[str, str, str]] = set()
         for caller, lock, callee, lineno in self.calls_under_lock:
             callee_locks = self.function_locks.get(callee, set())
-            if not callee_locks:
-                base = callee.split(".")[-1]
-                callee_locks = self.function_locks.get(base, set())
             if lock in callee_locks and not self._is_reentrant(lock):
                 key = (caller, callee, lock)
                 if key not in inter_reported:
@@ -2515,23 +2569,30 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         def _is_span_protected(lineno: int) -> bool:
             return any(start <= lineno <= end for start, end in all_safe_spans)
 
+        redis_receivers = {
+            _expr_name(n.target) for n in local_nodes
+            if isinstance(n, ast.AnnAssign) and "redis" in _expr_name(n.annotation).lower()
+        }
+        for assignment in local_nodes:
+            if isinstance(assignment, ast.Assign) and isinstance(assignment.value, ast.Call):
+                factory = _expr_name(assignment.value.func).lower().split(".")
+                if any(part in {"redis", "strictredis"} for part in factory):
+                    redis_receivers.update(_expr_name(t) for t in assignment.targets)
+
+        def _redis_receiver(call: ast.Call) -> str:
+            if not isinstance(call.func, ast.Attribute):
+                return ""
+            base = _expr_name(call.func.value)
+            tokens = base.lower().replace("_", ".").split(".")
+            return base if "redis" in tokens or base in redis_receivers else ""
+
         def _is_redis_get(call: ast.Call) -> bool:
-            name = _expr_name(call.func).lower()
-            parts = name.split(".")
-            if len(parts) >= 2 and parts[-1] == "get":
-                base = ".".join(parts[:-1])
-                return any(k in base for k in ("redis", "cache", "client", "r", "conn"))
-            return False
+            return isinstance(call.func, ast.Attribute) and call.func.attr == "get" and bool(_redis_receiver(call))
 
         def _is_redis_set(call: ast.Call) -> bool:
-            name = _expr_name(call.func).lower()
-            parts = name.split(".")
-            if len(parts) >= 2 and parts[-1] in ("set", "setex", "setrange", "mset"):
-                base = ".".join(parts[:-1])
-                if any(k in base for k in ("pipe", "pipeline")):
-                    return False
-                return any(k in base for k in ("redis", "cache", "client", "r", "conn"))
-            return False
+            return (isinstance(call.func, ast.Attribute)
+                    and call.func.attr in {"set", "setex", "setrange", "mset"}
+                    and bool(_redis_receiver(call)))
 
         def _has_atomic_flag(call: ast.Call) -> bool:
             for kw in call.keywords:
@@ -2559,7 +2620,11 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             for if_node in (n for n in local_nodes if isinstance(n, ast.If)):
                 if if_node.lineno >= get_line:
                     for child in ast.walk(if_node):
-                        if isinstance(child, ast.Call) and _is_redis_set(child):
+                        if (isinstance(child, ast.Call) and _is_redis_set(child)
+                                and _redis_receiver(child) == _redis_receiver(get_call)):
+                            if (get_call.args and child.args
+                                    and ast.dump(get_call.args[0]) != ast.dump(child.args[0])):
+                                continue
                             set_line = getattr(child, "lineno", 0)
                             if set_line < get_line:
                                 continue

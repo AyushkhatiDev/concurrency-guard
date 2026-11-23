@@ -233,7 +233,7 @@ wheels = [
 
 [[package]]
 name = "concurrency-guard"
-version = "3.9.0"
+version = "3.9.1"
 source = { editable = "." }
 dependencies = [
     { name = "aiosqlite" },
