@@ -12,6 +12,7 @@ from typing import Any, Optional, Union
 
 import yaml  # type: ignore[import-untyped]
 
+from concurrency_guard.cfg import mutation_protection
 from concurrency_guard.scanner.call_graph import (
     FunctionSummary,
     analyze_module_functions,
@@ -1017,7 +1018,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         )
                     )
 
-    def _check_cg_001(self, node: ast.AsyncFunctionDef, local_nodes: list[ast.AST]) -> None:
+    def _check_cg_001(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], local_nodes: list[ast.AST]) -> None:
         """Rule CG-001: Unlocked Read-Modify-Write Race Condition."""
         # 1. Fast check: must have a commit, flush, or save call
         has_commit = any(
@@ -1041,6 +1042,15 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             for n in local_nodes
         )
         if not has_commit:
+            return
+
+        protected, partial, live = mutation_protection(node)
+        for statement in local_nodes:
+            if id(statement) in partial:
+                self._add("CG-028", statement, node.name,
+                          f"Partial-path unlocked mutation of '{partial[id(statement)]}' before commit.",
+                          "Acquire the same lock on every path to the mutation.")
+        if not isinstance(node, ast.AsyncFunctionDef):
             return
 
         # 2. Collect lock spans: statements inside locks are safe
@@ -1253,7 +1263,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
         for stmt in local_nodes:
             stmt_line = getattr(stmt, "lineno", 0)
-            if is_locked_line(stmt_line):
+            if id(stmt) not in live or id(stmt) in protected or id(stmt) in partial or is_locked_line(stmt_line):
                 continue
 
             # Case A: AugAssign, e.g. user.balance -= amount
@@ -2577,6 +2587,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         self.aliases, self.context_stack = {}, []
         try:
             local_nodes = list(_walk_local_nodes(node, include_self=False))
+            self._check_cg_001(node, local_nodes)
             self._check_cg_005(node, local_nodes)
             self._check_cg_016(node, local_nodes)
             self._check_cg_017(node, local_nodes)
