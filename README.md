@@ -1,13 +1,13 @@
 <div align="center">
 
-# ConcurrencyGuard (`cguard`) — v3.8.0
+# ConcurrencyGuard (`cguard`) — v3.9.0
 
 ### The Universal Semantic SAST, Empirical Race Verifier & Lossless Auto-Patcher for Python
 
 [![PyPI version](https://img.shields.io/pypi/v/concurrency-guard.svg)](https://pypi.org/project/concurrency-guard/)
 [![Python Version](https://img.shields.io/badge/python-3.10%2B%20%7C%20analyzes%203.9%2B-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Test Suite](https://img.shields.io/badge/tests-316%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
+[![Test Suite](https://img.shields.io/badge/tests-322%2B%20passing-brightgreen.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Static Typing](https://img.shields.io/badge/typing-mypy%20--strict-blueviolet.svg)](https://github.com/python/mypy)
 [![Zero External APIs](https://img.shields.io/badge/AI%20APIs-100%25%20Offline%20%7C%20Zero%20Calls-success.svg)](https://github.com/AyushkhatiDev/concurrency-guard)
 [![Official Website](https://img.shields.io/badge/Website-concurrencyguard.dev-FF4D1C?logo=googlechrome&logoColor=white)](https://concurrencyguard.dev)
@@ -25,6 +25,18 @@ Natively securing **FastAPI**, **Django ORM**, **SQLAlchemy 2.0**, **SQLModel**,
 Explore interactive race simulations, rule breakdowns, and live AST patches at **[concurrencyguard.dev](https://concurrencyguard.dev)**.
 
 </div>
+
+## Path-sensitive concurrency analysis in v3.9.0
+
+The scanner follows branches, early returns, exception handlers, and scoped locks within each function. CG-001 uses these paths when deciding whether a database mutation is protected.
+
+| Rule | Diagnostic | Classification |
+| --- | --- | --- |
+| CG-028 | A branch protects a resource while another reachable path mutates it without protection before commit. | CWE-362 |
+| CG-029 | Two or more files acquire resources in a cyclic order. The diagnostic traces each acquisition to a file and line. | HIGH, CWE-833 |
+| CG-030 | A coroutine reads shared module or class state, awaits, and writes to that state. A shared asyncio or AnyIO lock can protect the full operation. | CWE-362 |
+
+Run `cguard scan . --select CG-028,CG-029,CG-030` to inspect these findings. Use `--format sarif` for code scanning or `cguard report . --format html` for the HTML report.
 
 ## 🛡️ What's New in v3.8.0: Executive Concurrency Health Scorer & Zero-Dependency Interactive HTML/Markdown Audit Report (`report.py` & `cguard report`)
 

@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "concurrency-guard"
-version = "3.8.0"
+version = "3.9.0"
 description = "Universal static concurrency analysis, semantic taint tracking, and runtime verification for Python"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -32,6 +32,8 @@ dev = [
     "pytest-asyncio>=0.23.0",
     "ruff>=0.4.0",
     "mypy>=1.10.0",
+    "types-PyYAML",
+    "celery-types",
 ]
 
 [project.scripts]
@@ -62,6 +64,8 @@ exclude = [
 ]
 
 [tool.mypy]
+explicit_package_bases = true
+mypy_path = "src"
 # Mypy itself no longer supports a Python 3.9 target; runtime support remains >=3.9.
 python_version = "3.10"
 strict = true

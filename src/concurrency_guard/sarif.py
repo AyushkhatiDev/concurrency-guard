@@ -521,6 +521,19 @@ RULE_REGISTRY: dict[str, dict[str, Any]] = {
 }
 
 
+for _id, _name, _title, _cwe in (
+    ("CG-028", "PartialPathUnlockedMutation", "Partial-path unlocked mutation", "cwe-362"),
+    ("CG-029", "CrossFileLockOrderInversion", "Cross-file lock-order inversion", "cwe-833"),
+    ("CG-030", "AsyncSharedStateAcrossAwait", "Shared-state mutation across await", "cwe-362"),
+):
+    RULE_REGISTRY[_id] = {
+        "id": _id, "name": _name, "helpUri": f"https://concurrencyguard.dev/rules/{_id}", "shortDescription": {"text": _title},
+        "fullDescription": {"text": _title + "."},
+        "defaultConfiguration": {"level": "error"},
+        "properties": {"tags": ["concurrency", _cwe], "precision": "high"},
+    }
+
+
 def normalize_sarif_uri(filename: str, workspace_root: Optional[Union[Path, str]] = None) -> str:
     """Normalize a file path to a POSIX-compliant URI relative to the workspace root.
 
@@ -660,15 +673,9 @@ def findings_to_sarif(
             },
         }
 
-        # Include remediation guidance in fixes if suggested fix hint is available
+        # A SARIF fix requires concrete artifact edits. Keep textual advice as metadata.
         if finding.suggested_fix_hint:
-            result_obj["fixes"] = [
-                {
-                    "description": {
-                        "text": finding.suggested_fix_hint,
-                    }
-                }
-            ]
+            result_obj["properties"] = {"remediation": finding.suggested_fix_hint}
 
         results.append(result_obj)
 

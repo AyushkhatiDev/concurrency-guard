@@ -137,7 +137,7 @@ def test_sarif_deterministic_fingerprints() -> None:
 
 
 def test_sarif_fixes_remediation_guidance() -> None:
-    """Remediation hints are mapped to SARIF fixes array."""
+    """Textual remediation is retained without advertising a machine-applicable edit."""
     finding_with_fix = ASTFinding(
         rule_id="CG-001",
         filename="app.py",
@@ -148,8 +148,8 @@ def test_sarif_fixes_remediation_guidance() -> None:
     )
     doc = findings_to_sarif([finding_with_fix])
     result = doc["runs"][0]["results"][0]
-    assert "fixes" in result
-    assert result["fixes"][0]["description"]["text"] == "Use select(...).with_for_update()"
+    assert "fixes" not in result
+    assert result["properties"]["remediation"] == "Use select(...).with_for_update()"
 
     finding_no_fix = ASTFinding(
         rule_id="CG-001",

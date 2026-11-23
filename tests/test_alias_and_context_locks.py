@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-from concurrency_guard.scanner.ast_rules import scan_source_code
+from concurrency_guard.scanner.ast_rules import ASTFinding, scan_source_code
 
 
-def _cg016(source: str):
+def _cg016(source: str) -> list[ASTFinding]:
     return [finding for finding in scan_source_code(source) if finding.rule_id == "CG-016"]
 
 
-def _cg006(source: str):
+def _cg006(source: str) -> list[ASTFinding]:
     return [finding for finding in scan_source_code(source) if finding.rule_id == "CG-006"]
 
 
-def _cg007(source: str):
+def _cg007(source: str) -> list[ASTFinding]:
     return [finding for finding in scan_source_code(source) if finding.rule_id == "CG-007"]
 
 

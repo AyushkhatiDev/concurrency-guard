@@ -10,8 +10,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
 
-import yaml  # type: ignore[import-untyped]
+import yaml
 
+from concurrency_guard.cfg import mutation_protection
 from concurrency_guard.scanner.call_graph import (
     FunctionSummary,
     analyze_module_functions,
@@ -20,6 +21,7 @@ from concurrency_guard.scanner.suppression import SuppressionFilter
 from concurrency_guard.scanner.taint_tracker import (
     find_tainted_shared_state_mutations_in_source,
 )
+from concurrency_guard.shared_state import shared_writes
 
 EXCLUDED_DIRS: frozenset[str] = frozenset({
     ".venv",
@@ -1017,7 +1019,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         )
                     )
 
-    def _check_cg_001(self, node: ast.AsyncFunctionDef, local_nodes: list[ast.AST]) -> None:
+    def _check_cg_001(self, node: Union[ast.FunctionDef, ast.AsyncFunctionDef], local_nodes: list[ast.AST]) -> None:
         """Rule CG-001: Unlocked Read-Modify-Write Race Condition."""
         # 1. Fast check: must have a commit, flush, or save call
         has_commit = any(
@@ -1041,6 +1043,15 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             for n in local_nodes
         )
         if not has_commit:
+            return
+
+        protected, partial, live, unlocked = mutation_protection(node)
+        for statement in local_nodes:
+            if id(statement) in partial:
+                self._add("CG-028", statement, node.name,
+                          f"Partial-path unlocked mutation of '{partial[id(statement)]}' before commit.",
+                          "Acquire the same lock on every path to the mutation.")
+        if not isinstance(node, ast.AsyncFunctionDef):
             return
 
         # 2. Collect lock spans: statements inside locks are safe
@@ -1253,7 +1264,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
         for stmt in local_nodes:
             stmt_line = getattr(stmt, "lineno", 0)
-            if is_locked_line(stmt_line):
+            if id(stmt) not in live or id(stmt) in protected or id(stmt) in partial or is_locked_line(stmt_line):
                 continue
 
             # Case A: AugAssign, e.g. user.balance -= amount
@@ -1261,7 +1272,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 root = _target_root_name(stmt.target)
                 if root in entity_sources:
                     _, q_line, q_end_line, q_db_locked = entity_sources[root]
-                    if not q_db_locked:
+                    if not q_db_locked or id(stmt) in unlocked:
                         reported_entities.add((root, q_line, q_end_line))
 
             # Case B: Assign, e.g. user.balance = user.balance - amount or user.status = "active"
@@ -1280,7 +1291,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                             )
                             if not is_atomic_f:
                                 _, q_line, q_end_line, q_db_locked = entity_sources[root]
-                                if not q_db_locked:
+                                if not q_db_locked or id(stmt) in unlocked:
                                     reported_entities.add((root, q_line, q_end_line))
 
             # Case C: Mutating method calls, e.g. user.tags.append(...)
@@ -1292,7 +1303,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                     root = _target_root_name(call.func.value)
                     if root in entity_sources:
                         _, q_line, q_end_line, q_db_locked = entity_sources[root]
-                        if not q_db_locked:
+                        if not q_db_locked or id(stmt) in unlocked:
                             reported_entities.add((root, q_line, q_end_line))
 
             # Case D: Mutating helper calls, e.g. debit_account(user, 50) or await debit_account(user, 50)
@@ -1321,14 +1332,14 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         root = _target_root_name(arg)
                         if root in entity_sources and arg_idx in mut_callee_sum.mutated_param_indices:
                             _, q_line, q_end_line, q_db_locked = entity_sources[root]
-                            if not q_db_locked:
+                            if not q_db_locked or id(stmt) in unlocked:
                                 reported_entities.add((root, q_line, q_end_line))
                     for kw in call_obj.keywords:
                         if kw.arg:
                             root = _target_root_name(kw.value)
                             if root in entity_sources and kw.arg in mut_callee_sum.mutated_param_names:
                                 _, q_line, q_end_line, q_db_locked = entity_sources[root]
-                                if not q_db_locked:
+                                if not q_db_locked or id(stmt) in unlocked:
                                     reported_entities.add((root, q_line, q_end_line))
 
         # 5. Emit findings with HIGH confidence
@@ -2577,6 +2588,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         self.aliases, self.context_stack = {}, []
         try:
             local_nodes = list(_walk_local_nodes(node, include_self=False))
+            self._check_cg_001(node, local_nodes)
             self._check_cg_005(node, local_nodes)
             self._check_cg_016(node, local_nodes)
             self._check_cg_017(node, local_nodes)
@@ -2734,6 +2746,10 @@ def scan_source_code(
         project_graph=project_graph,
     )
     visitor.visit(parsed_tree)
+    if isinstance(parsed_tree, ast.Module):
+        for site, function, resource in shared_writes(parsed_tree):
+            visitor._add("CG-030", site, function, f"Shared state '{resource}' read before await and mutated afterward.",
+                         "Protect the read, await and mutation with one shared async lock.")
     visitor._check_deadlocks()
     taint_findings = [
         ASTFinding(
