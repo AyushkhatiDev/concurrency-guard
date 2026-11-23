@@ -68,14 +68,15 @@ def test_directory_scanner_skips_venv_and_alembic(tmp_path: Path) -> None:
 
 
 def test_scan_cli_json_output_format() -> None:
-    """Verify cguard scan examples/real_world_ecommerce/ --format json outputs valid JSON with CG-001 to CG-005."""
+    """Verify cguard scan examples/real_world_ecommerce/ --format json outputs valid JSON with the intentional CG-001 through CG-004 findings."""
     result = runner.invoke(app, ["scan", "examples/real_world_ecommerce", "--format", "json"])
     assert result.exit_code == 1
     data = json.loads(result.stdout)
     assert data["scanned_files"] == 4
-    assert data["findings_count"] >= 5
+    assert data["findings_count"] >= 4
     rules = {f["rule_id"] for f in data["findings"]}
-    assert {"CG-001", "CG-002", "CG-003", "CG-004", "CG-005"}.issubset(rules)
+    assert {"CG-001", "CG-002", "CG-003", "CG-004"}.issubset(rules)
+    assert not {"CG-005", "CG-023"}.intersection(rules)
 
 
 def test_graceful_handling_of_syntax_error_files(tmp_path: Path) -> None:

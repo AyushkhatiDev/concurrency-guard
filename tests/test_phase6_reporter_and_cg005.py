@@ -35,8 +35,8 @@ def process_payout(payout_id: int):
     assert "acks_late=True" in f.suggested_fix_hint
 
 
-def test_ignores_cg005_celery_task_with_acks_late() -> None:
-    """Tasks with acks_late=True or an idempotency/dedup lock must not trigger CG-005."""
+def test_acks_late_retains_cg005_and_lock_guard_is_recognized() -> None:
+    """Late acknowledgment retains retry diagnostics while lock guards are recognized."""
     code_acks_late = """
 from celery import Celery
 
@@ -49,7 +49,7 @@ def safe_payout_with_acks(payout_id: int):
     session.commit()
 """
     findings = scan_source_code(code_acks_late)
-    assert not any(f.rule_id == "CG-005" for f in findings)
+    assert any(f.rule_id == "CG-005" for f in findings)
 
     code_with_lock = """
 from celery import shared_task

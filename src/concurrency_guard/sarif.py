@@ -98,8 +98,8 @@ RULE_REGISTRY: dict[str, dict[str, Any]] = {
         "shortDescription": {"text": "Non-Idempotent Celery Retry Task"},
         "fullDescription": {
             "text": (
-                "A retrying Celery task lacks late acknowledgment (acks_late=True) or distributed "
-                "locking, causing duplicated execution of uncommitted work on worker crash."
+                "A retrying Celery task performs side effects without a detected idempotency guard. "
+                "Repeated execution can duplicate effects. Late acknowledgment controls message delivery."
             )
         },
         "helpUri": "https://concurrencyguard.dev/rules/CG-005",

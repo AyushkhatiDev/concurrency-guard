@@ -1,4 +1,4 @@
-"""Celery background tasks demonstrating retry non-idempotency."""
+"""Celery task demonstrating a repeatable database status assignment."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ SyncSessionLocal = sessionmaker(bind=sync_engine, class_=Session)
 
 @shared_task(autoretry_for=(Exception,), max_retries=5)
 def process_refund(order_id: int) -> dict[str, str]:
-    """Process order refund with retries but without idempotency protection (CG-005)."""
+    """Record the refunded status. Repeating this assignment has the same result."""
     session = SyncSessionLocal()
     try:
         order = session.get(Order, order_id)

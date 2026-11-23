@@ -511,16 +511,6 @@ def _has_celery_retry_kwarg(dec: ast.AST) -> bool:
     return False
 
 
-def _has_acks_late_true(dec: ast.AST) -> bool:
-    """Check if decorator specifies acks_late=True."""
-    if not isinstance(dec, ast.Call):
-        return False
-    for kw in dec.keywords:
-        if kw.arg == "acks_late" and isinstance(kw.value, ast.Constant) and kw.value.value is True:
-            return True
-    return False
-
-
 def _has_mutation_or_side_effect(local_nodes: list[ast.AST]) -> bool:
     """Check if body contains .add(), .commit(), or .post() call."""
     for n in local_nodes:
@@ -531,6 +521,53 @@ def _has_mutation_or_side_effect(local_nodes: list[ast.AST]) -> bool:
         ):
             return True
     return False
+
+
+def _has_repeatable_row_assignment(node: Union[ast.FunctionDef, ast.AsyncFunctionDef]) -> bool:
+    """Recognize a narrow session.get / literal field assignment / commit pattern.
+
+    Unknown calls, inserts, computed writes and mutations keep their retry diagnostics.
+    """
+    local_nodes = [child for stmt in node.body for child in _walk_local_nodes(stmt)]
+    sessions: set[str] = set()
+    entities: set[str] = set()
+    wrote = False
+    for n in sorted(local_nodes, key=lambda n: getattr(n, "lineno", 0)):
+        if isinstance(n, ast.Assign) and len(n.targets) == 1:
+            target = n.targets[0]
+            if isinstance(target, ast.Name) and isinstance(n.value, ast.Call):
+                call = n.value
+                if isinstance(call.func, ast.Name) and call.func.id.lower().endswith("sessionlocal"):
+                    sessions.add(target.id)
+                elif (isinstance(call.func, ast.Attribute) and call.func.attr == "get"
+                      and isinstance(call.func.value, ast.Name) and call.func.value.id in sessions):
+                    entities.add(target.id)
+        if isinstance(n, ast.Call):
+            if isinstance(n.func, ast.Name) and n.func.id.lower().endswith("sessionlocal"):
+                continue
+            if (isinstance(n.func, ast.Attribute) and isinstance(n.func.value, ast.Name)
+                    and n.func.value.id in sessions and n.func.attr in {"get", "commit", "close", "rollback"}):
+                continue
+            return False
+        if (isinstance(n, ast.Attribute) and isinstance(n.ctx, ast.Load)
+                and isinstance(n.value, ast.Name) and n.value.id in entities):
+            return False
+        if isinstance(n, (ast.AugAssign, ast.Delete, ast.NamedExpr)):
+            return False
+        if isinstance(n, (ast.Assign, ast.AnnAssign)):
+            targets = n.targets if isinstance(n, ast.Assign) else [n.target]
+            for target in targets:
+                if isinstance(target, ast.Attribute):
+                    if (not isinstance(target.value, ast.Name) or target.value.id not in entities
+                            or not isinstance(n.value, ast.Constant)):
+                        return False
+                    wrote = True
+                elif not isinstance(target, ast.Name):
+                    return False
+                elif (target.id in entities or target.id in sessions) and not isinstance(n.value, ast.Call):
+                    # Rebinding a known receiver to a different expression loses provenance.
+                    return False
+    return wrote
 
 
 def _has_idempotency_or_lock(local_nodes: list[ast.AST], docstring: Optional[str] = None) -> bool:
@@ -1540,21 +1577,18 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         """Rule CG-005: Non-Idempotent Celery Retry Task."""
         matching_task_dec: Optional[ast.AST] = None
         has_retry = False
-        has_acks_late = False
 
         for dec in node.decorator_list:
             if _is_celery_task(dec):
                 matching_task_dec = dec
                 if _has_celery_retry_kwarg(dec):
                     has_retry = True
-                if _has_acks_late_true(dec):
-                    has_acks_late = True
 
         if not matching_task_dec or not has_retry:
             return
 
         docstring = ast.get_docstring(node)
-        if has_acks_late or _has_idempotency_or_lock(local_nodes, docstring=docstring):
+        if _has_repeatable_row_assignment(node) or _has_idempotency_or_lock(local_nodes, docstring=docstring):
             return
 
         if _has_mutation_or_side_effect(local_nodes):
@@ -1566,11 +1600,12 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                     function_name=node.name,
                     message=(
                         "Non-Idempotent Celery Retry Task: Celery task configured with retries "
-                        "executes side effects without acks_late=True or idempotency deduplication lock."
+                        "executes side effects that may repeat without an idempotency guard."
                     ),
                     suggested_fix_hint=(
-                        "Add 'acks_late=True' to the Celery task decorator and enforce an "
-                        "idempotency lock before executing database commits or external POST calls on retry."
+                        "Persist an idempotency key and its result atomically with the database changes. "
+                        "Use provider idempotency keys for external requests. Late acknowledgment (acks_late=True) "
+                        "changes delivery timing and can still repeat side effects."
                     ),
                     end_lineno=getattr(node, "end_lineno", node.lineno),
                 )
@@ -2283,7 +2318,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
 
         has_commit = any(_is_commit_call(n) for n in local_nodes)
 
-        if not (has_mutation and has_commit):
+        if not (has_mutation and has_commit) or _has_repeatable_row_assignment(node):
             return
 
         # Check for idempotency guards (sanitizers)
