@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional, Union
 
-import yaml  # type: ignore[import-untyped]
+import yaml
 
 from concurrency_guard.cfg import mutation_protection
 from concurrency_guard.scanner.call_graph import (
@@ -21,6 +21,7 @@ from concurrency_guard.scanner.suppression import SuppressionFilter
 from concurrency_guard.scanner.taint_tracker import (
     find_tainted_shared_state_mutations_in_source,
 )
+from concurrency_guard.shared_state import shared_writes
 
 EXCLUDED_DIRS: frozenset[str] = frozenset({
     ".venv",
@@ -1044,7 +1045,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         if not has_commit:
             return
 
-        protected, partial, live = mutation_protection(node)
+        protected, partial, live, unlocked = mutation_protection(node)
         for statement in local_nodes:
             if id(statement) in partial:
                 self._add("CG-028", statement, node.name,
@@ -1271,7 +1272,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 root = _target_root_name(stmt.target)
                 if root in entity_sources:
                     _, q_line, q_end_line, q_db_locked = entity_sources[root]
-                    if not q_db_locked:
+                    if not q_db_locked or id(stmt) in unlocked:
                         reported_entities.add((root, q_line, q_end_line))
 
             # Case B: Assign, e.g. user.balance = user.balance - amount or user.status = "active"
@@ -1290,7 +1291,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                             )
                             if not is_atomic_f:
                                 _, q_line, q_end_line, q_db_locked = entity_sources[root]
-                                if not q_db_locked:
+                                if not q_db_locked or id(stmt) in unlocked:
                                     reported_entities.add((root, q_line, q_end_line))
 
             # Case C: Mutating method calls, e.g. user.tags.append(...)
@@ -1302,7 +1303,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                     root = _target_root_name(call.func.value)
                     if root in entity_sources:
                         _, q_line, q_end_line, q_db_locked = entity_sources[root]
-                        if not q_db_locked:
+                        if not q_db_locked or id(stmt) in unlocked:
                             reported_entities.add((root, q_line, q_end_line))
 
             # Case D: Mutating helper calls, e.g. debit_account(user, 50) or await debit_account(user, 50)
@@ -1331,14 +1332,14 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                         root = _target_root_name(arg)
                         if root in entity_sources and arg_idx in mut_callee_sum.mutated_param_indices:
                             _, q_line, q_end_line, q_db_locked = entity_sources[root]
-                            if not q_db_locked:
+                            if not q_db_locked or id(stmt) in unlocked:
                                 reported_entities.add((root, q_line, q_end_line))
                     for kw in call_obj.keywords:
                         if kw.arg:
                             root = _target_root_name(kw.value)
                             if root in entity_sources and kw.arg in mut_callee_sum.mutated_param_names:
                                 _, q_line, q_end_line, q_db_locked = entity_sources[root]
-                                if not q_db_locked:
+                                if not q_db_locked or id(stmt) in unlocked:
                                     reported_entities.add((root, q_line, q_end_line))
 
         # 5. Emit findings with HIGH confidence
@@ -2745,6 +2746,10 @@ def scan_source_code(
         project_graph=project_graph,
     )
     visitor.visit(parsed_tree)
+    if isinstance(parsed_tree, ast.Module):
+        for site, function, resource in shared_writes(parsed_tree):
+            visitor._add("CG-030", site, function, f"Shared state '{resource}' read before await and mutated afterward.",
+                         "Protect the read, await and mutation with one shared async lock.")
     visitor._check_deadlocks()
     taint_findings = [
         ASTFinding(

@@ -195,6 +195,12 @@ def scan_project_parallel(
             for fp in uncached_files:
                 findings.extend(_scan_one(fp))
 
+    if project_graph is not None:
+        from concurrency_guard.deadlock_graph import project_deadlocks
+
+        for cycle in project_deadlocks(((p, m.tree) for p, m in modules_map.items()), project_graph):
+            findings.extend(active_filter.filter_findings([cycle], file_path=Path(cycle.filename)))
+
     # Step 5: Taint tracking & inter-procedural shared state hazards
     graph = build_call_graph(file_paths, roots=roots)
     taint_findings = find_tainted_shared_state_mutations(file_paths, graph)

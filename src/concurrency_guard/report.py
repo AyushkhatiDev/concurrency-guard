@@ -39,6 +39,7 @@ SEVERITY_DEDUCTIONS: dict[str, int] = {
 }
 
 CWE_DESCRIPTIONS: dict[str, str] = {
+    "CWE-833": "Deadlock",
     "CWE-362": "Concurrent Execution using Shared Resource with Improper Synchronization (Race Condition)",
     "CWE-662": "Improper Synchronization / Uncontrolled Concurrent Execution",
     "CWE-400": "Uncontrolled Resource Consumption (Event-Loop Starvation & Lock Contention)",
