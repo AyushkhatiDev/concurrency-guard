@@ -26,7 +26,7 @@ jobs:
           python-version: "3.11"
 
       - name: Install ConcurrencyGuard
-        run: pip install --upgrade concurrency-guard
+        run: pip install .
 
       - name: Run ConcurrencyGuard SARIF Scan
         run: cguard scan . --format sarif --output cguard.sarif || true

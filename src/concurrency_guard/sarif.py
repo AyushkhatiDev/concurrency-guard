@@ -673,15 +673,9 @@ def findings_to_sarif(
             },
         }
 
-        # Include remediation guidance in fixes if suggested fix hint is available
+        # A SARIF fix requires concrete artifact edits. Keep textual advice as metadata.
         if finding.suggested_fix_hint:
-            result_obj["fixes"] = [
-                {
-                    "description": {
-                        "text": finding.suggested_fix_hint,
-                    }
-                }
-            ]
+            result_obj["properties"] = {"remediation": finding.suggested_fix_hint}
 
         results.append(result_obj)
 

@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from concurrency_guard import __version__
 from concurrency_guard.sarif import RULE_REGISTRY
 from concurrency_guard.scanner.ast_rules import ASTFinding
 
@@ -679,7 +680,7 @@ def render_html_report(
         <div class="logo-badge">cguard</div>
         <div class="title-block">
           <h1>Executive Concurrency Health Report</h1>
-          <div class="timestamp">Generated on {timestamp} • ConcurrencyGuard v3.8.0</div>
+          <div class="timestamp">Generated on {timestamp} • ConcurrencyGuard v{__version__}</div>
         </div>
       </div>
       <div class="score-badge">
