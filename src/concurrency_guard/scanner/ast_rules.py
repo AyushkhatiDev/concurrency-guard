@@ -564,10 +564,9 @@ def _has_repeatable_row_assignment(node: Union[ast.FunctionDef, ast.AsyncFunctio
                     wrote = True
                 elif not isinstance(target, ast.Name):
                     return False
-                elif target.id in entities or target.id in sessions:
+                elif (target.id in entities or target.id in sessions) and not isinstance(n.value, ast.Call):
                     # Rebinding a known receiver to a different expression loses provenance.
-                    if not isinstance(n.value, ast.Call):
-                        return False
+                    return False
     return wrote
 
 
