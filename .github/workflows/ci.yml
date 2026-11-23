@@ -34,7 +34,7 @@ jobs:
 
       - name: Run Mypy Type Checker
         run: |
-          mypy src/
+          mypy --strict .
 
       - name: Run Pytest Suite
         run: |
