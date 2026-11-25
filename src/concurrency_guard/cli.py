@@ -34,6 +34,8 @@ from concurrency_guard.cache.manager import (
     compute_rules_hash,
 )
 from concurrency_guard.config import load_cguard_config
+from concurrency_guard.diff_scope import impacted_python_paths
+from concurrency_guard.engine import parse_modules_parallel
 from concurrency_guard.gh_review import (
     ReviewComment,
     detect_github_environment,
@@ -49,6 +51,7 @@ from concurrency_guard.lsp import run_lsp_server
 from concurrency_guard.patcher.cst_fixer import apply_all_fixes
 from concurrency_guard.patcher.diff_utils import DiffGenerator, colorize_diff
 from concurrency_guard.plugins import PluginError
+from concurrency_guard.project_graph import ProjectSymbolGraph
 from concurrency_guard.report import (
     compute_audit_metrics,
     render_html_report,
@@ -139,6 +142,9 @@ def scan(
         False,
         "--changed-only",
         help="Only scan files modified in git (staged, unstaged, or untracked).",
+    ),
+    diff_base: Optional[str] = typer.Option(
+        None, "--diff-base", help="Scan committed changes against REF and their transitive importers.",
     ),
     base_ref: Optional[str] = typer.Option(
         None,
@@ -249,6 +255,20 @@ def scan(
         if changed_files is not None:
             py_files = [f for f in py_files if f in changed_files or f.resolve() in changed_files]
 
+    diff_modules = None
+    if diff_base is not None:
+        if changed_only or base_ref:
+            raise typer.BadParameter("cannot combine with --changed-only or --base-ref", param_hint="--diff-base")
+        root = path if path.is_dir() else path.parent
+        parsed = parse_modules_parallel(py_files)
+        graph = ProjectSymbolGraph.build(py_files, roots=[root], parsed_modules=parsed)
+        try:
+            impacted = impacted_python_paths(root, diff_base, py_files, graph)
+        except ValueError as error:
+            raise typer.BadParameter(str(error), param_hint="--diff-base") from error
+        py_files = [file for file in py_files if file.resolve() in impacted]
+        diff_modules = {file: module for file, module in parsed.items() if file in impacted}
+
     cache_mgr: Optional[Any] = None
     target_cache_dir = cache_dir or DEFAULT_CACHE_DIR
     rules_hash = compute_rules_hash(rules_path=effective_rules, custom_rules=custom_rules, config=config)
@@ -296,6 +316,7 @@ def scan(
             jobs=effective_jobs,
             config=config,
             cross_file=cross_file,
+            parsed_modules=diff_modules,
         )
     except PluginError as error:
         raise typer.BadParameter(str(error), param_hint="--allow-plugins") from error
@@ -318,7 +339,7 @@ def scan(
         findings = [f for f in findings if Path(f.filename).resolve() in changed_files]
         py_files = [p for p in py_files if p.resolve() in changed_files]
 
-    if cache_mgr is not None and path.is_dir() and hasattr(cache_mgr, "purge_stale_entries"):
+    if cache_mgr is not None and path.is_dir() and diff_base is None and hasattr(cache_mgr, "purge_stale_entries"):
         cache_mgr.purge_stale_entries(set(py_files))
 
     effective_baseline_path: Optional[Path] = baseline
