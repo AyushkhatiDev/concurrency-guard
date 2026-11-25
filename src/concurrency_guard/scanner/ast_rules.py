@@ -2887,11 +2887,14 @@ def discover_python_files(path: Path, config: Optional[Any] = None) -> list[Path
             d for d in dirs
             if not d.startswith(".")
             and d not in EXCLUDED_DIRS
+            and not (Path(root) / d).is_symlink()
             and not (config is not None and hasattr(config, "is_path_excluded") and config.is_path_excluded(Path(root) / d, root_dir=path))
         ]
         for f in sorted(files):
             if f.endswith(".py"):
                 fpath = Path(root) / f
+                if fpath.is_symlink() or not fpath.is_file():
+                    continue
                 if config is not None and hasattr(config, "is_path_excluded") and config.is_path_excluded(fpath, root_dir=path):
                     continue
                 py_files.append(fpath)
@@ -2959,7 +2962,7 @@ def scan_file(
             project_graph=project_graph,
             tree=parsed_tree,
         )
-    except (SyntaxError, ValueError):
+    except (SyntaxError, ValueError, RecursionError):
         findings = []
 
     filter_obj = suppression_filter or SuppressionFilter()

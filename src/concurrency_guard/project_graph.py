@@ -192,13 +192,13 @@ class ProjectSymbolGraph:
                     try:
                         code = resolved_path.read_text(encoding="utf-8-sig")
                         tree = ast.parse(code, filename=str(resolved_path))
-                    except (OSError, UnicodeDecodeError, SyntaxError):
+                    except (OSError, UnicodeDecodeError, RecursionError, SyntaxError):
                         continue
             else:
                 try:
                     code = resolved_path.read_text(encoding="utf-8-sig")
                     tree = ast.parse(code, filename=str(resolved_path))
-                except (OSError, UnicodeDecodeError, SyntaxError):
+                except (OSError, UnicodeDecodeError, RecursionError, SyntaxError):
                     continue
 
             parsed_mods[resolved_path] = (tree, code)
