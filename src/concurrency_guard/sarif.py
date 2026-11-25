@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -591,6 +592,27 @@ def map_confidence_to_level(confidence: str, rule_id: str) -> str:
     return "error"
 
 
+_SARIF_LEVELS = {"none", "note", "warning", "error"}
+_RULE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}")
+_CWE_URI = re.compile(r"https://cwe\.mitre\.org/data/definitions/[1-9][0-9]*\.html")
+
+
+def _validate_rule_metadata(rule_id: str, metadata: dict[str, Any]) -> None:
+    if not _RULE_ID.fullmatch(rule_id) or metadata.get("id") != rule_id:
+        raise ValueError(f"Invalid SARIF rule identifier: {rule_id!r}")
+    if metadata.get("defaultConfiguration", {}).get("level") not in _SARIF_LEVELS:
+        raise ValueError(f"Invalid SARIF level for {rule_id}")
+    uris = [metadata.get("helpUri", "")]
+    for tag in metadata.get("properties", {}).get("tags", []):
+        if tag.lower().startswith("cwe-") and not re.fullmatch(r"cwe-[1-9][0-9]*", tag, re.IGNORECASE):
+            raise ValueError(f"Invalid CWE tag for {rule_id}: {tag!r}")
+        if "cwe.mitre.org" in tag.lower():
+            uris.append(tag)
+    for uri in uris:
+        if "cwe.mitre.org" in uri.lower() and not _CWE_URI.fullmatch(uri):
+            raise ValueError(f"Invalid CWE URI for {rule_id}: {uri!r}")
+
+
 def get_rule_metadata(rule_id: str) -> dict[str, Any]:
     """Return spec-compliant SARIF rule definition or generate a fallback for custom rules."""
     if rule_id in RULE_REGISTRY:
@@ -624,6 +646,9 @@ def findings_to_sarif(
     rules_list: list[dict[str, Any]] = [
         get_rule_metadata(rid) for rid in sorted(seen_rule_ids)
     ]
+
+    for rule_id, metadata in zip(sorted(seen_rule_ids), rules_list):
+        _validate_rule_metadata(rule_id, metadata)
 
     results: list[dict[str, Any]] = []
 
