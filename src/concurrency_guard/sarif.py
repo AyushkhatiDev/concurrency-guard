@@ -526,6 +526,9 @@ for _id, _name, _title, _cwe in (
     ("CG-028", "PartialPathUnlockedMutation", "Partial-path unlocked mutation", "cwe-362"),
     ("CG-029", "CrossFileLockOrderInversion", "Cross-file lock-order inversion", "cwe-833"),
     ("CG-030", "AsyncSharedStateAcrossAwait", "Shared-state mutation across await", "cwe-362"),
+    ("CG-031", "SharedAsyncSession", "Concurrent AsyncSession sharing", "cwe-362"),
+    ("CG-032", "AsyncLockSelfDeadlock", "Non-reentrant async lock self-deadlock", "cwe-833"),
+    ("CG-033", "SwallowedCancellation", "Swallowed asyncio cancellation", "cwe-662"),
 ):
     RULE_REGISTRY[_id] = {
         "id": _id, "name": _name, "helpUri": f"https://concurrencyguard.dev/rules/{_id}", "shortDescription": {"text": _title},

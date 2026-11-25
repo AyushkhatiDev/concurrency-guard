@@ -1123,6 +1123,7 @@ def fix(
         "CG-017": "Replaced in-memory arithmetic with atomic database F() expression",
         "CG-022": "Wrapped premature task dispatch in transaction.on_commit()",
         "CG-025": "Replaced blocking time.sleep() with await asyncio.sleep()",
+        "CG-033": "Preserved asyncio cancellation in broad exception handlers",
     }
 
     for target in target_files:

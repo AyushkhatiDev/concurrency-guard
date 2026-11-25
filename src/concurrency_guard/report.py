@@ -31,6 +31,7 @@ AUTO_FIXABLE_RULES: frozenset[str] = frozenset({
     "CG-017",
     "CG-022",
     "CG-025",
+    "CG-033",
 })
 
 SEVERITY_DEDUCTIONS: dict[str, int] = {
