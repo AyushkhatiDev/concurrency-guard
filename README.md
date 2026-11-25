@@ -95,3 +95,30 @@ mypy --strict .
 ```
 
 Browse the [example projects](./examples), [open an issue](https://github.com/AyushkhatiDev/concurrency-guard/issues), or review the [release history on PyPI](https://pypi.org/project/concurrency-guard/#history).
+
+## Async checks in v4.0.0
+
+| Rule | What to review | CWE |
+| --- | --- | --- |
+| CG-031 | Multiple coroutines in `asyncio.gather` or a `TaskGroup` use one async database session. Give each task its own session. | CWE-362 |
+| CG-032 | An async lock is acquired again inside its own context, directly or by an awaited helper. | CWE-833 |
+| CG-033 | A bare or `BaseException` handler can swallow cancellation. Re-raise `asyncio.CancelledError` before the broad handler. | CWE-662 |
+
+Preview the cancellation fix with `cguard fix . --rule CG-033 --diff`.
+
+### Scan changes and their callers
+
+Run `cguard scan . --diff-base origin/main` to check committed Python changes since the merge base and the files that transitively import them. Fetch the base ref in CI before scanning. The scanner builds the import graph before running rules on the selected files.
+
+### Add a local rule
+
+Declare workspace-relative Python files in `pyproject.toml`.
+
+```toml
+[tool.cguard]
+plugins = ["rules/my_rule.py"]
+```
+
+Export a `PLUGIN` instance implementing `CGuardRulePlugin` from `cguard.plugins`. Provide a unique uppercase `rule_id`, a `severity` of `HIGH`, `MEDIUM`, or `LOW`, a `cwe` such as `CWE-362`, and a `check(module)` method returning `ASTFinding` values with the same rule ID. The `ParsedModule` gives the rule the file path, source text, and parsed AST.
+
+Run `cguard scan . --allow-plugins` for projects whose Python plugins you trust. Plugins run as Python code with the scanner process's permissions.
