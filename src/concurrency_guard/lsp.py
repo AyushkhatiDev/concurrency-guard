@@ -285,21 +285,28 @@ def encode_message(body: dict[str, Any]) -> bytes:
     return header + content
 
 
+_MAX_LSP_BODY = 16 * 1024 * 1024
+
+
 def decode_header(stream: IO[bytes]) -> Optional[int]:
     """Read LSP headers from byte stream, return Content-Length or None on EOF."""
     content_length: Optional[int] = None
     while True:
-        line = stream.readline()
+        line = stream.readline(8193)
         if not line:
             return None  # EOF
+        if len(line) > 8192:
+            raise ValueError("LSP header line too long")
         line_str = line.decode("ascii", errors="replace").strip()
         if not line_str:
             break  # Empty line = end of headers
         if line_str.lower().startswith("content-length:"):
             try:
                 content_length = int(line_str.split(":", 1)[1].strip())
-            except (ValueError, IndexError):
-                pass
+            except ValueError:
+                content_length = None
+    if content_length is None or not 0 <= content_length <= _MAX_LSP_BODY:
+        raise ValueError("Invalid LSP Content-Length")
     return content_length
 
 
@@ -311,7 +318,10 @@ def read_message(stream: IO[bytes]) -> Optional[dict[str, Any]]:
     body_bytes = stream.read(content_length)
     if len(body_bytes) < content_length:
         return None
-    return json.loads(body_bytes.decode("utf-8"))  # type: ignore[no-any-return]
+    message: object = json.loads(body_bytes.decode("utf-8"))
+    if not isinstance(message, dict):
+        raise TypeError("Expected a JSON-RPC object")
+    return message
 
 
 # --- LSP Server Engine ---
@@ -533,7 +543,11 @@ class LanguageServer:
     def run(self) -> int:
         """Run the server main loop, returning exit code."""
         while True:
-            message = read_message(self._reader)
+            try:
+                message = read_message(self._reader)
+            except (ValueError, TypeError, RecursionError):
+                self._send_error(None, -32700, "Parse error")
+                continue
             if message is None:
                 break  # EOF
             should_continue = self._dispatch(message)
