@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import logging
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional, Union
@@ -40,13 +41,32 @@ def expression_nodes(stmt: ast.stmt) -> list[ast.AST]:
     ]
 
 
+MAX_CFG_DEPTH = 64
+MAX_CFG_BLOCKS = 1024
+logger = logging.getLogger(__name__)
+
+
+class CFGLimitError(ValueError):
+    """A function exceeds the analysis budget."""
+
+
 def build_function_cfg(func_node: Function) -> FunctionCFG:
+    try:
+        return _build_function_cfg(func_node)
+    except (CFGLimitError, RecursionError) as exc:
+        logger.warning("Skipping CFG for %s at line %d: %s", func_node.name, func_node.lineno, exc)
+        raise CFGLimitError(str(exc)) from exc
+
+
+def _build_function_cfg(func_node: Function) -> FunctionCFG:
     blocks: list[BasicBlock] = []
     exceptional: set[tuple[int, int]] = set()
     guards: dict[tuple[int, int], tuple[str, bool]] = {}
 
     def block(stmt: Optional[ast.stmt], ctx: tuple[str, ...]) -> int:
         index = len(blocks)
+        if index >= MAX_CFG_BLOCKS:
+            raise CFGLimitError("basic block limit exceeded")
         blocks.append(BasicBlock(index, [stmt] if stmt else [], context=ctx))
         return index
 
@@ -65,12 +85,15 @@ def build_function_cfg(func_node: Function) -> FunctionCFG:
         brk: int,
         cont: int,
         ctx: tuple[str, ...],
+        depth: int = 0,
     ) -> int:
+        if depth >= MAX_CFG_DEPTH:
+            raise CFGLimitError("nesting depth limit exceeded")
         for stmt in reversed(body):
             current = block(stmt, ctx)
 
             def child(items: list[ast.stmt], dest: int) -> int:
-                return suite(items, dest, ret, exc, brk, cont, ctx)
+                return suite(items, dest, ret, exc, brk, cont, ctx, depth + 1)
 
             if isinstance(stmt, ast.If):
                 for items, truth in ((stmt.body, True), (stmt.orelse, False)):
@@ -82,7 +105,7 @@ def build_function_cfg(func_node: Function) -> FunctionCFG:
                     if isinstance(test, ast.Name):
                         guards[current, dest] = (test.id, truth)
             elif isinstance(stmt, (ast.For, ast.AsyncFor, ast.While)):
-                edge(current, suite(stmt.body, current, ret, exc, after, current, ctx))
+                edge(current, suite(stmt.body, current, ret, exc, after, current, ctx, depth + 1))
                 edge(current, child(stmt.orelse, after))
             elif isinstance(stmt, ast.Try):
 
@@ -96,16 +119,16 @@ def build_function_cfg(func_node: Function) -> FunctionCFG:
                 for handler in stmt.handlers:
                     edge(
                         dispatch,
-                        suite(handler.body, normal, returning, raised, breaking, continuing, ctx),
+                        suite(handler.body, normal, returning, raised, breaking, continuing, ctx, depth + 1),
                     )
-                otherwise = suite(stmt.orelse, normal, returning, raised, breaking, continuing, ctx)
+                otherwise = suite(stmt.orelse, normal, returning, raised, breaking, continuing, ctx, depth + 1)
                 edge(
                     current,
-                    suite(stmt.body, otherwise, returning, dispatch, breaking, continuing, ctx),
+                    suite(stmt.body, otherwise, returning, dispatch, breaking, continuing, ctx, depth + 1),
                 )
             elif isinstance(stmt, (ast.With, ast.AsyncWith)):
                 names = tuple(ast.unparse(item.context_expr) for item in stmt.items)
-                edge(current, suite(stmt.body, after, ret, exc, brk, cont, ctx + names))
+                edge(current, suite(stmt.body, after, ret, exc, brk, cont, ctx + names, depth + 1))
             else:
                 target = {ast.Return: ret, ast.Raise: exc, ast.Break: brk, ast.Continue: cont}
                 edge(current, target.get(type(stmt), after))
@@ -269,7 +292,10 @@ def compute_locked_paths(cfg: FunctionCFG) -> dict[ast.stmt, LockFacts]:
 
 def mutation_protection(func: Function) -> tuple[set[int], dict[int, str], set[int], set[int]]:
     """Classify mutations with a reachable commit and a sibling protection witness."""
-    cfg = build_function_cfg(func)
+    try:
+        cfg = build_function_cfg(func)
+    except CFGLimitError:
+        return set(), {}, set(), set()
     states = lock_states(cfg)
     protected: set[int] = set()
     partial: dict[int, str] = {}

@@ -6,7 +6,7 @@ import ast
 from collections import deque
 from collections.abc import Iterator
 
-from concurrency_guard.cfg import build_function_cfg
+from concurrency_guard.cfg import CFGLimitError, build_function_cfg
 
 
 def shared_writes(tree: ast.Module) -> Iterator[tuple[ast.AST, str, str]]:
@@ -116,7 +116,10 @@ def shared_writes(tree: ast.Module) -> Iterator[tuple[ast.AST, str, str]]:
                     if key in names:
                         yield "write" if isinstance(n.ctx, ast.Store) else "read", names[key], n
 
-            cfg = build_function_cfg(fn)
+            try:
+                cfg = build_function_cfg(fn)
+            except CFGLimitError:
+                continue
             # Track one pending read per traversal, including locks held continuously since it.
             State = tuple[int, str, bool, frozenset[str]]
             work: deque[State] = deque([(cfg.entry, "", False, frozenset())])

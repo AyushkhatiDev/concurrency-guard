@@ -44,7 +44,7 @@ class ParsedModule:
             tree = ast.parse(source, filename=str(resolved))
             digest = hashlib.sha256(source.encode("utf-8")).hexdigest()
             return cls(path=resolved, source=source, tree=tree, sha256=digest)
-        except (OSError, UnicodeDecodeError, SyntaxError, ValueError):
+        except (OSError, UnicodeDecodeError, RecursionError, SyntaxError, ValueError):
             return None
 
     @classmethod

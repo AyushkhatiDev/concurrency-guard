@@ -139,7 +139,7 @@ def build_call_graph(files: list[Path], roots: Optional[list[Path]] = None) -> C
     for path in files:
         try:
             parsed.append((path, _module_name(path, roots), ast.parse(path.read_text(encoding="utf-8"), filename=str(path))))
-        except (OSError, UnicodeDecodeError, SyntaxError):
+        except (OSError, UnicodeDecodeError, RecursionError, SyntaxError):
             continue
 
     graph = CallGraph()
@@ -529,7 +529,7 @@ def build_module_function_summaries(
     if isinstance(source_code_or_tree, str):
         try:
             tree = ast.parse(source_code_or_tree)
-        except (SyntaxError, ValueError):
+        except (SyntaxError, ValueError, RecursionError):
             return {}
     else:
         tree = source_code_or_tree

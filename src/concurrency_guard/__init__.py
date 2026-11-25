@@ -2,7 +2,7 @@
 
 import sys
 
-__version__ = "3.9.2"
+__version__ = "3.10.0"
 
 # Register alias 'cguard' pointing to this package
 sys.modules.setdefault("cguard", sys.modules[__name__])

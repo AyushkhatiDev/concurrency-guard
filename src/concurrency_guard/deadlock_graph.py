@@ -7,7 +7,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from concurrency_guard.cfg import build_function_cfg, lock_states, query_info
+from concurrency_guard.cfg import CFGLimitError, build_function_cfg, lock_states, query_info
 from concurrency_guard.project_graph import ProjectSymbolGraph
 from concurrency_guard.scanner.ast_rules import ASTFinding
 
@@ -143,7 +143,10 @@ def project_deadlocks(
                 if isinstance(parent, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
                     qualified = f"{parent.name}.{qualified}"
                 parent = parents.get(parent)
-            cfg = build_function_cfg(fn)
+            try:
+                cfg = build_function_cfg(fn)
+            except CFGLimitError:
+                continue
             for i, states in lock_states(cfg).items():
                 block = cfg.blocks[i]
                 for stmt in block.stmts:

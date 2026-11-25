@@ -10,6 +10,7 @@ from typing import Optional, Union
 import libcst as cst
 from libcst.metadata import MetadataWrapper, ParentNodeProvider
 
+from concurrency_guard.atomic_io import atomic_write_text
 from concurrency_guard.scanner.ast_rules import ASTFinding, scan_source_code
 from concurrency_guard.scanner.suppression import SuppressionFilter
 
@@ -1195,7 +1196,7 @@ def apply_all_fixes_with_report(
         )
 
     if modified and filepath is not None and not dry_run and write_to_disk:
-        Path(filepath).write_text(current_code, encoding="utf-8")
+        atomic_write_text(Path(filepath), current_code)
 
     return PatchResult(
         code=current_code,

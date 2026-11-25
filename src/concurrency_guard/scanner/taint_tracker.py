@@ -183,7 +183,7 @@ def _function_ast_by_key(
     for path in files:
         try:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        except (OSError, UnicodeDecodeError, SyntaxError):
+        except (OSError, UnicodeDecodeError, RecursionError, SyntaxError):
             continue
         sources = _module_sources(tree)
         for node in tree.body:
