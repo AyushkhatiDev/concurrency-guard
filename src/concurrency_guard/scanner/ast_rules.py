@@ -12,7 +12,12 @@ from typing import Any, Optional, Union
 
 import yaml
 
-from concurrency_guard.async_rules import asyncio_names, shared_sessions
+from concurrency_guard.async_rules import (
+    async_lock_contexts,
+    asyncio_names,
+    is_async_lock_name,
+    shared_sessions,
+)
 from concurrency_guard.cfg import mutation_protection
 from concurrency_guard.scanner.call_graph import (
     FunctionSummary,
@@ -2708,12 +2713,64 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         finally:
             self.aliases, self.context_stack = saved_aliases, saved_context
 
+    def _check_cg_032(self, node: ast.AsyncFunctionDef) -> None:
+        def identity(name: str, path: Path) -> tuple[Path, str]:
+            head, _, suffix = name.partition(".")
+            if self.project_graph is not None:
+                imported = self.project_graph.imports_by_file.get(path, {}).get(head)
+                if imported is not None:
+                    target, symbol = imported
+                    return target, ".".join(part for part in (symbol, suffix) if part and part != "*")
+            return path, name
+
+        source = Path(self.filename).resolve()
+        for context, names in async_lock_contexts(node):
+            for name in names:
+                if not is_async_lock_name(name):
+                    continue
+                for statement in context.body:
+                    if isinstance(statement, _SCOPE_BOUNDARY_TYPES):
+                        continue
+                    for nested, locks in async_lock_contexts(ast.Module(body=[statement], type_ignores=[])):
+                        if name in locks:
+                            self._add(
+                                "CG-032", nested, node.name, f"Async lock '{name}' is acquired again while held.",
+                                "Remove the nested acquisition or call a helper that assumes the lock is held.",
+                            )
+                    for awaited in _walk_local_nodes(statement):
+                        if not isinstance(awaited, ast.Await) or not isinstance(awaited.value, ast.Call):
+                            continue
+                        call = awaited.value
+                        local = self._resolve_locked_call(node, call)
+                        target = self.local_functions.get(local) if local else None
+                        target_path = source
+                        if target is None and self.project_graph is not None:
+                            resolved = self.project_graph.resolve_call(source, call)
+                            if resolved is not None and resolved[1] != source:
+                                _, target_path, symbol = resolved
+                                module = self.project_graph.module_trees.get(target_path)
+                                if module is not None:
+                                    target = next((
+                                        item for item in module.body
+                                        if isinstance(item, ast.AsyncFunctionDef)
+                                        and item.name == symbol.split(".")[-1]
+                                    ), None)
+                        if not isinstance(target, ast.AsyncFunctionDef):
+                            continue
+                        if any(identity(lock, target_path) == identity(name, source)
+                               for _, locks in async_lock_contexts(target) for lock in locks):
+                            self._add(
+                                "CG-032", awaited, node.name, f"Awaited helper reacquires async lock '{name}'.",
+                                "Call a helper that assumes the lock is held or move the await outside the lock.",
+                            )
+
     def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> None:
         """Inspect async function definitions for rules CG-001, CG-002, CG-003, CG-004, CG-005, and CG-013."""
         saved_aliases, saved_context = self.aliases, self.context_stack
         self.aliases, self.context_stack = {}, []
         try:
             local_nodes = list(_walk_local_nodes(node, include_self=False))
+            self._check_cg_032(node)
             for site, session in shared_sessions(node, self.asyncio_aliases):
                 self._add(
                     "CG-031", site, node.name,

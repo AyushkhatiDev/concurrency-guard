@@ -150,6 +150,7 @@ class ProjectSymbolGraph:
     """Project-wide symbol table tracking cross-file functions, imports, and taint flow."""
 
     roots: list[Path] = field(default_factory=list)
+    module_trees: dict[Path, ast.Module] = field(default_factory=dict)
     file_summaries: dict[Path, dict[str, FunctionSummary]] = field(default_factory=dict)
     imports_by_file: dict[Path, dict[str, tuple[Path, str]]] = field(default_factory=lambda: defaultdict(dict))
     file_dependency_hashes: dict[Path, str] = field(default_factory=dict)
@@ -219,6 +220,7 @@ class ProjectSymbolGraph:
                                 summaries[cls_qualified] = summaries[method.name]
 
             graph.file_summaries[resolved_path] = summaries
+            graph.module_trees[resolved_path] = tree
 
         # --- PASS 2: Import & Cross-File Call Resolution ---
         for resolved_path, (tree, _) in parsed_mods.items():

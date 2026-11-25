@@ -99,3 +99,19 @@ def shared_sessions(
                     ]
                     for session in sorted(duplicates(tasks)):
                         yield node, session
+
+
+def async_lock_contexts(root: ast.AST) -> Iterator[tuple[ast.AsyncWith, list[str]]]:
+    for statement in local_nodes(root):
+        if isinstance(statement, ast.AsyncWith):
+            locks = [
+                qualified(item.context_expr, {}) for item in statement.items
+                if isinstance(item.context_expr, (ast.Name, ast.Attribute))
+            ]
+            yield statement, locks
+
+
+def is_async_lock_name(name: str) -> bool:
+    return "lock" in name.lower() and not any(
+        marker in name.lower() for marker in ("rlock", "reentrant")
+    )
