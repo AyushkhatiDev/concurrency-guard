@@ -650,6 +650,15 @@ def findings_to_sarif(
         get_rule_metadata(rid) for rid in sorted(seen_rule_ids)
     ]
 
+    plugin_metadata = {finding.rule_id: finding for finding in findings if finding.cwe is not None}
+    for metadata in rules_list:
+        plugin_finding = plugin_metadata.get(metadata["id"])
+        if plugin_finding is not None and metadata["id"] not in RULE_REGISTRY:
+            metadata["properties"]["tags"] = ["concurrency", plugin_finding.cwe]
+            metadata["defaultConfiguration"]["level"] = map_confidence_to_level(
+                plugin_finding.confidence, plugin_finding.rule_id
+            )
+
     for rule_id, metadata in zip(sorted(seen_rule_ids), rules_list):
         _validate_rule_metadata(rule_id, metadata)
 

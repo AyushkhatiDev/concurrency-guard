@@ -79,6 +79,8 @@ def is_auto_fixable(finding: ASTFinding) -> bool:
 
 def get_cwe_for_finding(finding: ASTFinding) -> list[str]:
     """Retrieve CWE tags for a finding from rule registry or default to CWE-362."""
+    if finding.cwe is not None:
+        return [finding.cwe]
     meta = RULE_REGISTRY.get(finding.rule_id, {})
     tags = meta.get("properties", {}).get("tags", [])
     cwes = [t.upper() for t in tags if t.lower().startswith("cwe-")]

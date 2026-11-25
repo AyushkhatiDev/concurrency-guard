@@ -48,6 +48,7 @@ from concurrency_guard.gh_review import (
 from concurrency_guard.lsp import run_lsp_server
 from concurrency_guard.patcher.cst_fixer import apply_all_fixes
 from concurrency_guard.patcher.diff_utils import DiffGenerator, colorize_diff
+from concurrency_guard.plugins import PluginError
 from concurrency_guard.report import (
     compute_audit_metrics,
     render_html_report,
@@ -115,6 +116,9 @@ def scan(
         help="Write scan report directly to an output file (e.g. results.sarif or report.json).",
     ),
     rules: Optional[Path] = typer.Option(None, "--rules", help="YAML file containing custom concurrency rules"),
+    allow_plugins: bool = typer.Option(
+        False, "--allow-plugins", help="Execute trusted Python rule plugins declared in project config.",
+    ),
     cache_path: Optional[Path] = typer.Option(
         None,
         "--cache-path",
@@ -229,6 +233,7 @@ def scan(
         config.jobs = workers
 
     config.cross_file = cross_file
+    config.allow_plugins = allow_plugins
 
     py_files = discover_python_files(path, config=config)
     effective_rules = rules or (path.parent / config.rules_file if config.rules_file and path.is_file() else path / config.rules_file if config.rules_file else None)
@@ -280,17 +285,20 @@ def scan(
         effective_jobs = max(1, chosen_jobs)
 
     suppression_filter = SuppressionFilter(ignore_pragma=ignore_pragma)
-    findings = scan_project(
-        py_files,
-        roots=[path] if path.is_dir() else [path.parent],
-        custom_rules=custom_rules,
-        cache_manager=cache_mgr,
-        suppression_filter=suppression_filter,
-        workers=workers,
-        jobs=effective_jobs,
-        config=config,
-        cross_file=cross_file,
-    )
+    try:
+        findings = scan_project(
+            py_files,
+            roots=[path] if path.is_dir() else [path.parent],
+            custom_rules=custom_rules,
+            cache_manager=cache_mgr,
+            suppression_filter=suppression_filter,
+            workers=workers,
+            jobs=effective_jobs,
+            config=config,
+            cross_file=cross_file,
+        )
+    except PluginError as error:
+        raise typer.BadParameter(str(error), param_hint="--allow-plugins") from error
     if config.select:
         findings = [finding for finding in findings if finding.rule_id in config.select]
     elif config.ignore:

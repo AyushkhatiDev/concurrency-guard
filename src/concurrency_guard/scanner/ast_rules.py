@@ -67,6 +67,7 @@ class ASTFinding:
     confidence: str = "HIGH"
     end_lineno: Optional[int] = None
     col_offset: Optional[int] = None
+    cwe: Optional[str] = None
 
 
 
