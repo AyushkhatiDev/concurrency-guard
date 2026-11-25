@@ -20,6 +20,7 @@ from rich.syntax import Syntax
 from rich.table import Table
 
 from concurrency_guard import __version__
+from concurrency_guard.atomic_io import atomic_write_text
 from concurrency_guard.baseline import (
     Baseline,
     BaselineFilterResult,
@@ -366,7 +367,7 @@ def scan(
         )
         if output is not None:
             output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(sarif_text, encoding="utf-8")
+            atomic_write_text(output, sarif_text)
         else:
             typer.echo(sarif_text)
         raise typer.Exit(code=1 if has_fail else 0)
@@ -405,7 +406,7 @@ def scan(
         json_text = json.dumps(payload, indent=2)
         if output is not None:
             output.parent.mkdir(parents=True, exist_ok=True)
-            output.write_text(json_text, encoding="utf-8")
+            atomic_write_text(output, json_text)
         else:
             typer.echo(json_text)
         raise typer.Exit(code=1 if has_fail else 0)
@@ -1205,7 +1206,7 @@ def fix(
                 "error_message": None,
             })
             if is_modified and should_write:
-                target.write_text(patched_code, encoding="utf-8")
+                atomic_write_text(target, patched_code)
             continue
 
         if show_diff:
@@ -1215,7 +1216,7 @@ def fix(
                 if not colored.endswith("\n"):
                     sys.stdout.write("\n")
             if is_modified and should_write:
-                target.write_text(patched_code, encoding="utf-8")
+                atomic_write_text(target, patched_code)
             continue
 
         if check and not show_diff:
@@ -1283,7 +1284,7 @@ def fix(
         )
 
         if should_write:
-            target.write_text(patched_code, encoding="utf-8")
+            atomic_write_text(target, patched_code)
             console.print(
                 Panel(
                     f"[bold green]✔ Successfully wrote patched code to {target}[/bold green]",
@@ -1446,7 +1447,7 @@ def report(
             original_code=source_code,
         )
 
-        output.write_text(markdown_report, encoding="utf-8")
+        atomic_write_text(output, markdown_report)
         console.print(
             Panel(
                 f"[bold green]✔ Successfully wrote PR report to {output}[/bold green]",
@@ -1492,7 +1493,7 @@ def report(
     if fmt == "html":
         content = render_html_report(metrics, findings, scanned_files=py_files)
         target_out = output if output is not None else Path("cguard-report.html")
-        target_out.write_text(content, encoding="utf-8")
+        atomic_write_text(target_out, content)
         console.print(
             Panel(
                 f"[bold green]✔ Executive Concurrency Health Report saved to {target_out}[/bold green]\n"
@@ -1505,7 +1506,7 @@ def report(
     elif fmt in ("markdown", "md"):
         content = render_markdown_report(metrics, findings)
         if output is not None:
-            output.write_text(content, encoding="utf-8")
+            atomic_write_text(output, content)
             console.print(
                 Panel(
                     f"[bold green]✔ Executive Markdown Report saved to {output}[/bold green]",
@@ -1517,7 +1518,7 @@ def report(
     elif fmt == "json":
         json_data = json.dumps(metrics.to_dict(), indent=2)
         if output is not None:
-            output.write_text(json_data, encoding="utf-8")
+            atomic_write_text(output, json_data)
             console.print(
                 Panel(
                     f"[bold green]✔ Executive JSON Report saved to {output}[/bold green]",
