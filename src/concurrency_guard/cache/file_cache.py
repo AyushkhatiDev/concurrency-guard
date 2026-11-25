@@ -5,14 +5,13 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import os
 import shutil
 import threading
-import time
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
 from concurrency_guard import __version__
+from concurrency_guard.atomic_io import atomic_write_text
 from concurrency_guard.cache.manager import dict_to_finding, finding_to_dict
 
 if TYPE_CHECKING:
@@ -167,11 +166,9 @@ class FileCache:
         try:
             self.cache_dir.mkdir(parents=True, exist_ok=True)
             target_file = self.cache_dir / f"{key}.json"
-            temp_file = self.cache_dir / f".tmp_{key}_{os.getpid()}_{time.time_ns()}.json"
 
             payload = json.dumps([finding_to_dict(f) for f in findings])
-            temp_file.write_text(payload, encoding="utf-8")
-            os.replace(temp_file, target_file)
+            atomic_write_text(target_file, payload)
         except OSError as exc:
             logger.debug("Failed atomic cache write for '%s' (%s).", filepath, exc)
 

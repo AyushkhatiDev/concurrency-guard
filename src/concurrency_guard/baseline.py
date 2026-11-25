@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
+from concurrency_guard.atomic_io import atomic_write_text
+
 if TYPE_CHECKING:
     from concurrency_guard.scanner.ast_rules import ASTFinding
 
@@ -111,7 +113,7 @@ class Baseline:
         """Save Baseline deterministically to a file path."""
         p = Path(path).resolve()
         p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(self.to_json() + "\n", encoding="utf-8")
+        atomic_write_text(p, self.to_json() + "\n")
 
 
 @dataclass
