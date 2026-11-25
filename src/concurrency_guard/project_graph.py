@@ -75,26 +75,26 @@ def resolve_module_path(
                 search_roots.append(p)
             break
 
-    cwd = Path.cwd().resolve()
-    if cwd not in search_roots:
-        search_roots.append(cwd)
+    boundaries = [root.resolve() for root in roots] if roots else search_roots or [current_dir]
 
-    # Known files indexed by canonical resolved path and relative parts
-    canonical_known: set[Path] = {f.resolve() for f in (known_files or set())}
+    def inside(path: Path) -> bool:
+        return any(path.is_relative_to(root) for root in boundaries)
+
+    if not inside(resolved_current):
+        return None
+    if module_name and not all(part.isidentifier() for part in module_name.split(".")):
+        return None
+    canonical_known = {f.resolve() for f in (known_files or set())}
+    canonical_known = {f for f in canonical_known if inside(f)}
 
     def _match_candidate(cand: Path) -> Optional[Path]:
-        """Check if candidate path corresponds to a valid Python file."""
-        # 1. Direct .py file
-        py_cand = cand.with_suffix(".py")
-        if py_cand in canonical_known or py_cand.is_file():
-            return py_cand
-        # 2. Package __init__.py
-        init_cand = cand / "__init__.py"
-        if init_cand in canonical_known or init_cand.is_file():
-            return init_cand
-        # 3. Direct path if already .py
-        if (cand in canonical_known or cand.is_file()) and cand.suffix == ".py":
-            return cand
+        for candidate in (cand.with_suffix(".py"), cand / "__init__.py"):
+            try:
+                resolved = candidate.resolve()
+                if inside(resolved) and (resolved in canonical_known or resolved.is_file()):
+                    return resolved
+            except (OSError, RuntimeError):
+                continue
         return None
 
     # Case 1: Relative import (level > 0)
@@ -104,6 +104,8 @@ def resolve_module_path(
         for _ in range(level - 1):
             base_dir = base_dir.parent
 
+        if not inside(base_dir):
+            return None
         if module_name:
             parts = module_name.split(".")
             candidate = base_dir.joinpath(*parts)
@@ -111,8 +113,7 @@ def resolve_module_path(
             candidate = base_dir
 
         matched = _match_candidate(candidate)
-        if matched is not None:
-            return matched
+        return matched
 
     # Case 2: Absolute import (level == 0)
     if module_name:
@@ -132,12 +133,12 @@ def resolve_module_path(
 
         # Suffix matching fallback against known files
         parts_tuple = tuple(parts[:-1]) + (f"{parts[-1]}.py",)
-        for kf in canonical_known:
+        for kf in sorted(canonical_known):
             if len(kf.parts) >= len(parts_tuple) and kf.parts[-len(parts_tuple):] == parts_tuple:
                 return kf
 
         single_suffix = (f"{parts[-1]}.py",)
-        for kf in canonical_known:
+        for kf in sorted(canonical_known):
             if len(kf.parts) >= 1 and kf.parts[-1:] == single_suffix and len(parts) > 1 and parts[-2] in kf.parts:
                 return kf
 
@@ -179,6 +180,8 @@ class ProjectSymbolGraph:
         # --- PASS 1: Parse and Index Local Function Summaries ---
         for fpath in file_paths:
             resolved_path = fpath.resolve()
+            if not any(resolved_path.is_relative_to(root) for root in effective_roots):
+                continue
             pm = None
             if parsed_modules:
                 pm = parsed_modules.get(resolved_path) or parsed_modules.get(fpath)

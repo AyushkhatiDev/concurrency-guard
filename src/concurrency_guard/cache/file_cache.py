@@ -68,7 +68,8 @@ class FileCache:
         rules_hash: str = "",
         enabled: bool = True,
     ) -> None:
-        self.cache_dir = Path(cache_dir)
+        self.cache_dir = Path(cache_dir).absolute()
+        self._cache_root = self.cache_dir.resolve()
         self.version = version
         self.ignore_pragma = ignore_pragma
         self.rules_hash = rules_hash
@@ -106,6 +107,17 @@ class FileCache:
             dependency_digest=dependency_digest,
         )
 
+    def _entry(self, key: str) -> Optional[Path]:
+        try:
+            if self.cache_dir.resolve() != self._cache_root or self.cache_dir.is_symlink():
+                return None
+            target = self.cache_dir / f"{key}.json"
+            if target.is_symlink() or not target.resolve().is_relative_to(self._cache_root):
+                return None
+            return target
+        except (OSError, RuntimeError):
+            return None
+
     def get(self, filepath: Path, dependency_digest: Optional[str] = None) -> Optional[list[ASTFinding]]:
         """Retrieve cached findings for filepath if SHA-256 digest matches.
 
@@ -120,9 +132,9 @@ class FileCache:
             return None
 
         key = self.get_cache_key(file_bytes, dependency_digest=dependency_digest)
-        cache_file = self.cache_dir / f"{key}.json"
+        cache_file = self._entry(key)
 
-        if not cache_file.is_file():
+        if cache_file is None or not cache_file.is_file():
             with self._lock:
                 self._misses += 1
             return None
@@ -164,8 +176,10 @@ class FileCache:
         key = self.get_cache_key(file_bytes, dependency_digest=dependency_digest)
 
         try:
+            target_file = self._entry(key)
+            if target_file is None:
+                return
             self.cache_dir.mkdir(parents=True, exist_ok=True)
-            target_file = self.cache_dir / f"{key}.json"
 
             payload = json.dumps([finding_to_dict(f) for f in findings])
             atomic_write_text(target_file, payload)
@@ -199,7 +213,7 @@ class FileCache:
         """Cleanly remove all cached files in the cache directory."""
         with self._lock:
             count = 0
-            if not self.cache_dir.exists():
+            if self._entry("clear") is None or not self.cache_dir.exists():
                 return 0
             for item in list(self.cache_dir.iterdir()):
                 try:
