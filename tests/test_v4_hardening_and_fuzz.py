@@ -46,3 +46,70 @@ def test_lsp_recovers_from_malformed_frames() -> None:
     LanguageServer(incoming, outgoing).run()
     assert outgoing.getvalue().count(b'"code":-32700') == 2
     assert b'"id":1' in outgoing.getvalue()
+
+
+def test_project_import_cannot_escape_explicit_root(tmp_path: Path) -> None:
+    from concurrency_guard.project_graph import resolve_module_path
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    outside = tmp_path / "external.py"
+    outside.touch()
+    (workspace / "linked.py").symlink_to(outside)
+
+    assert resolve_module_path(workspace / "app.py", "linked", roots=[workspace]) is None
+    assert resolve_module_path(workspace / "app.py", "external", 2, [workspace], {outside}) is None
+    (workspace / "local.py").touch()
+    assert resolve_module_path(workspace / "app.py", "local", roots=[workspace]) == workspace / "local.py"
+
+
+def test_cache_does_not_overwrite_symlink_target(tmp_path: Path) -> None:
+    from concurrency_guard.cache.file_cache import FileCache
+
+    source = tmp_path / "source.py"
+    source.write_text("pass", encoding="utf-8")
+    outside = tmp_path / "outside.json"
+    outside.write_text("[]", encoding="utf-8")
+    cache = FileCache(tmp_path / "cache")
+    cache.cache_dir.mkdir()
+    key = cache.get_cache_key(source.read_bytes())
+    (cache.cache_dir / f"{key}.json").symlink_to(outside)
+
+    assert cache.get(source) is None
+    cache.set(source, [])
+    assert outside.read_text(encoding="utf-8") == "[]"
+
+
+def test_cfg_limits_emit_warning(caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch) -> None:
+    import ast
+    import sys
+
+    from concurrency_guard.cfg import CFGLimitError, build_function_cfg
+
+    function = ast.parse("def f():\n    if condition:\n        pass\n").body[0]
+    assert isinstance(function, ast.FunctionDef)
+    cfg_module = sys.modules[build_function_cfg.__module__]
+    with monkeypatch.context() as patch:
+        patch.setattr(cfg_module, "MAX_CFG_DEPTH", 1)
+        with pytest.raises(CFGLimitError, match="nesting depth"):
+            build_function_cfg(function)
+    monkeypatch.setattr(cfg_module, "MAX_CFG_BLOCKS", 2)
+    with pytest.raises(CFGLimitError, match="basic block"):
+        build_function_cfg(function)
+    assert "Skipping CFG" in caplog.text
+
+
+def test_sarif_rejects_invalid_rule_metadata(monkeypatch: pytest.MonkeyPatch) -> None:
+    from concurrency_guard.sarif import RULE_REGISTRY, findings_to_sarif
+    from concurrency_guard.scanner.ast_rules import ASTFinding
+
+    finding = ASTFinding("bad/id", "sample.py", 1, "f", "message", "hint")
+    with pytest.raises(ValueError, match="identifier"):
+        findings_to_sarif([finding])
+    with monkeypatch.context() as patch:
+        patch.setitem(RULE_REGISTRY["CG-001"], "defaultConfiguration", {"level": "critical"})
+        with pytest.raises(ValueError, match="level"):
+            findings_to_sarif([])
+    monkeypatch.setitem(RULE_REGISTRY["CG-001"], "helpUri", "http://cwe.mitre.org/data/definitions/362.html")
+    with pytest.raises(ValueError, match="CWE URI"):
+        findings_to_sarif([])
