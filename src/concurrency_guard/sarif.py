@@ -526,6 +526,9 @@ for _id, _name, _title, _cwe in (
     ("CG-028", "PartialPathUnlockedMutation", "Partial-path unlocked mutation", "cwe-362"),
     ("CG-029", "CrossFileLockOrderInversion", "Cross-file lock-order inversion", "cwe-833"),
     ("CG-030", "AsyncSharedStateAcrossAwait", "Shared-state mutation across await", "cwe-362"),
+    ("CG-031", "SharedAsyncSession", "Concurrent AsyncSession sharing", "cwe-362"),
+    ("CG-032", "AsyncLockSelfDeadlock", "Non-reentrant async lock self-deadlock", "cwe-833"),
+    ("CG-033", "SwallowedCancellation", "Swallowed asyncio cancellation", "cwe-662"),
 ):
     RULE_REGISTRY[_id] = {
         "id": _id, "name": _name, "helpUri": f"https://concurrencyguard.dev/rules/{_id}", "shortDescription": {"text": _title},
@@ -646,6 +649,15 @@ def findings_to_sarif(
     rules_list: list[dict[str, Any]] = [
         get_rule_metadata(rid) for rid in sorted(seen_rule_ids)
     ]
+
+    plugin_metadata = {finding.rule_id: finding for finding in findings if finding.cwe is not None}
+    for metadata in rules_list:
+        plugin_finding = plugin_metadata.get(metadata["id"])
+        if plugin_finding is not None and metadata["id"] not in RULE_REGISTRY:
+            metadata["properties"]["tags"] = ["concurrency", plugin_finding.cwe]
+            metadata["defaultConfiguration"]["level"] = map_confidence_to_level(
+                plugin_finding.confidence, plugin_finding.rule_id
+            )
 
     for rule_id, metadata in zip(sorted(seen_rule_ids), rules_list):
         _validate_rule_metadata(rule_id, metadata)

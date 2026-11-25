@@ -11,10 +11,11 @@ import ast
 import concurrent.futures
 import hashlib
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Optional, Union
 
+from concurrency_guard.plugins import PluginError, load_plugins
 from concurrency_guard.scanner.ast_rules import (
     ASTFinding,
     discover_python_files,
@@ -127,6 +128,12 @@ def scan_project_parallel(
         )
     else:
         modules_map = parsed_modules
+
+    plugins = []
+    if config is not None and getattr(config, "allow_plugins", False) and config.plugins:
+        config_path = config.config_source
+        plugin_root = config_path.parent if config_path is not None else (roots or [Path.cwd()])[0]
+        plugins = load_plugins(plugin_root, config.plugins)
 
     # Step 2: Build Cross-File Project Symbol Graph with pre-parsed ASTs
     effective_cross_file = cross_file if cross_file is not None else getattr(config, "cross_file", True)
@@ -255,6 +262,24 @@ def scan_project_parallel(
                 )
             else:
                 active_filter.suppressed_count += 1
+
+    # Run plugins independently of the built-in finding cache.
+    for path in sorted({path.resolve() for path in file_paths}):
+        module = modules_map.get(path)
+        if module is None:
+            continue
+        for plugin in plugins:
+            try:
+                results = plugin.check(module)
+                if any(not isinstance(item, ASTFinding) or item.rule_id != plugin.rule_id for item in results):
+                    raise PluginError("check must return ASTFinding instances with the plugin rule_id")
+                plugin_findings = [
+                    replace(item, filename=str(path), confidence=plugin.severity, cwe=plugin.cwe)
+                    for item in results
+                ]
+                findings.extend(active_filter.filter_findings(plugin_findings, file_path=path))
+            except Exception as exc:
+                raise PluginError(f"Rule plugin {plugin.rule_id} failed on {path}: {exc}") from exc
 
     if config is not None and hasattr(config, "is_rule_enabled"):
         findings = [f for f in findings if config.is_rule_enabled(f.rule_id, file_path=f.filename)]

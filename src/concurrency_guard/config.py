@@ -60,6 +60,8 @@ class CGuardConfig:
     cache: bool = True
     cross_file: bool = True
     baseline: Optional[str] = None
+    plugins: list[str] = field(default_factory=list)
+    allow_plugins: bool = False
     config_source: Optional[Path] = None
 
     def deterministic_hash(self) -> str:
@@ -263,6 +265,10 @@ def parse_toml_config(file_path: Path) -> CGuardConfig:
             elif isinstance(rules, str):
                 per_file_ignores[str(pat)] = [rules.upper()]
 
+    plugins = raw.get("plugins", [])
+    if not isinstance(plugins, list) or not all(isinstance(item, str) and item for item in plugins):
+        raise ValueError("plugins must be a list of nonempty Python file paths")
+
     rules_file = str(raw["rules_file"]) if raw.get("rules_file") else None
     cache = bool(raw.get("cache", True))
     cross_file = bool(raw.get("cross_file", True))
@@ -280,6 +286,7 @@ def parse_toml_config(file_path: Path) -> CGuardConfig:
         cache=cache,
         cross_file=cross_file,
         baseline=baseline,
+        plugins=plugins,
         config_source=file_path,
     )
 

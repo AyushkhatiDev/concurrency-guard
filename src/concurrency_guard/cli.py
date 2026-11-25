@@ -34,6 +34,8 @@ from concurrency_guard.cache.manager import (
     compute_rules_hash,
 )
 from concurrency_guard.config import load_cguard_config
+from concurrency_guard.diff_scope import impacted_python_paths
+from concurrency_guard.engine import parse_modules_parallel
 from concurrency_guard.gh_review import (
     ReviewComment,
     detect_github_environment,
@@ -48,6 +50,8 @@ from concurrency_guard.gh_review import (
 from concurrency_guard.lsp import run_lsp_server
 from concurrency_guard.patcher.cst_fixer import apply_all_fixes
 from concurrency_guard.patcher.diff_utils import DiffGenerator, colorize_diff
+from concurrency_guard.plugins import PluginError
+from concurrency_guard.project_graph import ProjectSymbolGraph
 from concurrency_guard.report import (
     compute_audit_metrics,
     render_html_report,
@@ -115,6 +119,9 @@ def scan(
         help="Write scan report directly to an output file (e.g. results.sarif or report.json).",
     ),
     rules: Optional[Path] = typer.Option(None, "--rules", help="YAML file containing custom concurrency rules"),
+    allow_plugins: bool = typer.Option(
+        False, "--allow-plugins", help="Execute trusted Python rule plugins declared in project config.",
+    ),
     cache_path: Optional[Path] = typer.Option(
         None,
         "--cache-path",
@@ -135,6 +142,9 @@ def scan(
         False,
         "--changed-only",
         help="Only scan files modified in git (staged, unstaged, or untracked).",
+    ),
+    diff_base: Optional[str] = typer.Option(
+        None, "--diff-base", help="Scan committed changes against REF and their transitive importers.",
     ),
     base_ref: Optional[str] = typer.Option(
         None,
@@ -229,6 +239,7 @@ def scan(
         config.jobs = workers
 
     config.cross_file = cross_file
+    config.allow_plugins = allow_plugins
 
     py_files = discover_python_files(path, config=config)
     effective_rules = rules or (path.parent / config.rules_file if config.rules_file and path.is_file() else path / config.rules_file if config.rules_file else None)
@@ -243,6 +254,20 @@ def scan(
         changed_files = get_changed_python_files(repo_dir, base_ref=base_ref)
         if changed_files is not None:
             py_files = [f for f in py_files if f in changed_files or f.resolve() in changed_files]
+
+    diff_modules = None
+    if diff_base is not None:
+        if changed_only or base_ref:
+            raise typer.BadParameter("cannot combine with --changed-only or --base-ref", param_hint="--diff-base")
+        root = path if path.is_dir() else path.parent
+        parsed = parse_modules_parallel(py_files)
+        graph = ProjectSymbolGraph.build(py_files, roots=[root], parsed_modules=parsed)
+        try:
+            impacted = impacted_python_paths(root, diff_base, py_files, graph)
+        except ValueError as error:
+            raise typer.BadParameter(str(error), param_hint="--diff-base") from error
+        py_files = [file for file in py_files if file.resolve() in impacted]
+        diff_modules = {file: module for file, module in parsed.items() if file in impacted}
 
     cache_mgr: Optional[Any] = None
     target_cache_dir = cache_dir or DEFAULT_CACHE_DIR
@@ -280,17 +305,21 @@ def scan(
         effective_jobs = max(1, chosen_jobs)
 
     suppression_filter = SuppressionFilter(ignore_pragma=ignore_pragma)
-    findings = scan_project(
-        py_files,
-        roots=[path] if path.is_dir() else [path.parent],
-        custom_rules=custom_rules,
-        cache_manager=cache_mgr,
-        suppression_filter=suppression_filter,
-        workers=workers,
-        jobs=effective_jobs,
-        config=config,
-        cross_file=cross_file,
-    )
+    try:
+        findings = scan_project(
+            py_files,
+            roots=[path] if path.is_dir() else [path.parent],
+            custom_rules=custom_rules,
+            cache_manager=cache_mgr,
+            suppression_filter=suppression_filter,
+            workers=workers,
+            jobs=effective_jobs,
+            config=config,
+            cross_file=cross_file,
+            parsed_modules=diff_modules,
+        )
+    except PluginError as error:
+        raise typer.BadParameter(str(error), param_hint="--allow-plugins") from error
     if config.select:
         findings = [finding for finding in findings if finding.rule_id in config.select]
     elif config.ignore:
@@ -310,7 +339,7 @@ def scan(
         findings = [f for f in findings if Path(f.filename).resolve() in changed_files]
         py_files = [p for p in py_files if p.resolve() in changed_files]
 
-    if cache_mgr is not None and path.is_dir() and hasattr(cache_mgr, "purge_stale_entries"):
+    if cache_mgr is not None and path.is_dir() and diff_base is None and hasattr(cache_mgr, "purge_stale_entries"):
         cache_mgr.purge_stale_entries(set(py_files))
 
     effective_baseline_path: Optional[Path] = baseline
@@ -1123,6 +1152,7 @@ def fix(
         "CG-017": "Replaced in-memory arithmetic with atomic database F() expression",
         "CG-022": "Wrapped premature task dispatch in transaction.on_commit()",
         "CG-025": "Replaced blocking time.sleep() with await asyncio.sleep()",
+        "CG-033": "Preserved asyncio cancellation in broad exception handlers",
     }
 
     for target in target_files:

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import ast
+import tokenize
 from dataclasses import dataclass
+from io import StringIO
 from pathlib import Path
 from typing import Optional, Union
 
 import libcst as cst
-from libcst.metadata import MetadataWrapper, ParentNodeProvider
+from libcst.codemod import CodemodContext
+from libcst.codemod.visitors import AddImportsVisitor
+from libcst.metadata import MetadataWrapper, ParentNodeProvider, PositionProvider
 
 from concurrency_guard.atomic_io import atomic_write_text
 from concurrency_guard.scanner.ast_rules import ASTFinding, scan_source_code
@@ -992,6 +996,27 @@ class AsyncSleepTransformer(cst.CSTTransformer):
         return updated_node
 
 
+class CancelledErrorReraiseTransformer(cst.CSTTransformer):
+    """Preserve cancellation before reported broad exception handlers."""
+
+    METADATA_DEPENDENCIES = (PositionProvider,)
+
+    def __init__(self, handler_lines: set[int], asyncio_name: str = "asyncio") -> None:
+        self.handler_lines = handler_lines
+        self.asyncio_name = asyncio_name
+
+    def leave_Try(self, original_node: cst.Try, updated_node: cst.Try) -> cst.Try:
+        handlers: list[cst.ExceptHandler] = []
+        for original, handler in zip(original_node.handlers, updated_node.handlers):
+            if self.get_metadata(PositionProvider, original).start.line in self.handler_lines:
+                handlers.append(cst.ExceptHandler(
+                    type=cst.Attribute(cst.Name(self.asyncio_name), cst.Name("CancelledError")),
+                    body=cst.IndentedBlock((cst.SimpleStatementLine((cst.Raise(),)),)),
+                ))
+            handlers.append(handler)
+        return updated_node.with_changes(handlers=handlers)
+
+
 def apply_all_fixes_with_report(
     source_code: str,
     rules: Optional[set[str]] = None,
@@ -1017,6 +1042,7 @@ def apply_all_fixes_with_report(
             "CG-017",
             "CG-022",
             "CG-025",
+            "CG-033",
         }
     current_code = source_code
     suppressions = SuppressionFilter()
@@ -1171,6 +1197,32 @@ def apply_all_fixes_with_report(
             tree = cst.parse_module(current_code).visit(AsyncSleepTransformer(target_functions=targets))
             candidate = _ensure_module_import(tree, "asyncio").code
             current_code = _verify_gate(candidate, current_code, "CG-025", targets)
+
+    if "CG-033" in effective_rules:
+        suppressions.parse_source(current_code, filepath="<memory>")
+        findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
+        cancellation = [finding for finding in findings if finding.rule_id == "CG-033"]
+        if cancellation:
+            identifiers = {
+                token.string for token in tokenize.generate_tokens(StringIO(current_code).readline)
+                if token.type == tokenize.NAME
+            }
+            alias = "asyncio"
+            if alias in identifiers:
+                alias = "_cguard_asyncio"
+                while alias in identifiers:
+                    alias += "_"
+            tree = MetadataWrapper(cst.parse_module(current_code)).visit(
+                CancelledErrorReraiseTransformer({finding.lineno for finding in cancellation}, alias)
+            )
+            context = CodemodContext()
+            AddImportsVisitor.add_needed_import(
+                context, "asyncio", asname=None if alias == "asyncio" else alias,
+            )
+            candidate = AddImportsVisitor(context).transform_module(tree).code
+            current_code = _verify_gate(
+                candidate, current_code, "CG-033", {finding.function_name for finding in cancellation},
+            )
 
     ast.parse(current_code)
     cst.parse_module(current_code)
