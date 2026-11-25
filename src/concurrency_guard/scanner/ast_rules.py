@@ -17,6 +17,7 @@ from concurrency_guard.async_rules import (
     asyncio_names,
     is_async_lock_name,
     shared_sessions,
+    swallowed_cancellation,
 )
 from concurrency_guard.cfg import mutation_protection
 from concurrency_guard.scanner.call_graph import (
@@ -2770,6 +2771,12 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         self.aliases, self.context_stack = {}, []
         try:
             local_nodes = list(_walk_local_nodes(node, include_self=False))
+            for handler in swallowed_cancellation(node, self.asyncio_aliases):
+                self._add(
+                    "CG-033", handler, node.name,
+                    "Broad exception handler can swallow asyncio cancellation.",
+                    "Re-raise asyncio.CancelledError before handling broad exceptions.",
+                )
             self._check_cg_032(node)
             for site, session in shared_sessions(node, self.asyncio_aliases):
                 self._add(

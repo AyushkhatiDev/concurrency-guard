@@ -115,3 +115,38 @@ def is_async_lock_name(name: str) -> bool:
     return "lock" in name.lower() and not any(
         marker in name.lower() for marker in ("rlock", "reentrant")
     )
+
+
+def handler_reraises(body: list[ast.stmt], exception_name: str | None) -> bool:
+    for statement in body:
+        if isinstance(statement, ast.Raise):
+            return statement.exc is None or (
+                isinstance(statement.exc, ast.Name) and statement.exc.id == exception_name
+            )
+        if isinstance(statement, (ast.Return, ast.Break, ast.Continue, ast.Try)):
+            return False
+        if isinstance(statement, ast.If):
+            if handler_reraises(statement.body, exception_name) and handler_reraises(
+                statement.orelse, exception_name
+            ):
+                return True
+            if any(isinstance(item, (ast.Return, ast.Break, ast.Continue))
+                   for item in local_nodes(statement)):
+                return False
+    return False
+
+
+def swallowed_cancellation(
+    function: ast.AsyncFunctionDef, aliases: dict[str, str],
+) -> Iterator[ast.ExceptHandler]:
+    for node in local_nodes(function):
+        if not isinstance(node, ast.Try):
+            continue
+        for handler in node.handlers:
+            catch_types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
+            names = {qualified(item, aliases) for item in catch_types if item is not None}
+            broad = handler.type is None or bool(names & {"BaseException", "builtins.BaseException"})
+            if broad or "asyncio.CancelledError" in names:
+                if broad and not handler_reraises(handler.body, handler.name):
+                    yield handler
+                break
