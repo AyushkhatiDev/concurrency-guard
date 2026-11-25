@@ -12,6 +12,7 @@ from typing import Any, Optional, Union
 
 import yaml
 
+from concurrency_guard.async_rules import asyncio_names, shared_sessions
 from concurrency_guard.cfg import mutation_protection
 from concurrency_guard.scanner.call_graph import (
     FunctionSummary,
@@ -650,6 +651,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             self._qualified_function(n): n for n in ast.walk(tree)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         } if tree is not None else {}
+        self.asyncio_aliases = asyncio_names(tree) if tree is not None else {}
         self.filename = filename
         self.config = config
         self.project_graph = project_graph
@@ -2712,6 +2714,12 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         self.aliases, self.context_stack = {}, []
         try:
             local_nodes = list(_walk_local_nodes(node, include_self=False))
+            for site, session in shared_sessions(node, self.asyncio_aliases):
+                self._add(
+                    "CG-031", site, node.name,
+                    f"Concurrent tasks share AsyncSession '{session}'.",
+                    "Create a separate AsyncSession inside each concurrent task.",
+                )
             self._check_cg_001(node, local_nodes)
             self._check_cg_002(node, local_nodes)
             self._check_cg_003(node)
