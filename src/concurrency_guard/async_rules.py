@@ -185,6 +185,17 @@ def handler_reraises(body: list[ast.stmt], exception_name: str | None) -> bool:
                 paths.add("raise" if same else "stop")
             elif isinstance(stmt, (ast.Return, ast.Break, ast.Continue)):
                 paths.add("stop")
+            elif isinstance(stmt, ast.Try):
+                attempted = outcomes(stmt.body)
+                if "next" in attempted:
+                    attempted.remove("next")
+                    attempted.update(outcomes(stmt.orelse))
+                for handler in stmt.handlers:
+                    attempted.update(outcomes(handler.body))
+                cleanup = outcomes(stmt.finalbody)
+                paths.update(cleanup - {"next"})
+                if "next" in cleanup:
+                    paths.update(attempted)
             elif isinstance(stmt, ast.If):
                 if isinstance(stmt.test, ast.Constant):
                     paths.update(outcomes(stmt.body if stmt.test.value else stmt.orelse))
