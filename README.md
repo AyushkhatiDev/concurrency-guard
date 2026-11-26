@@ -25,7 +25,9 @@ cguard scan .
 
 Scan a single file by passing its path instead of `.`. To see what an available automatic fix would change, run `cguard fix . --diff`. Apply the changes with `cguard fix . --write`.
 
-ConcurrencyGuard supports Python 3.9 and newer. Run `cguard --version` to check which release your terminal is using. Version 4.1.0 improves recovery from malformed editor requests, adds the cancellation fix to editor code actions, and makes cache cleanup safer.
+ConcurrencyGuard supports Python 3.9 and newer. Run `cguard --version` to check which release your terminal is using. Run `cguard explain CG-031` to see why sharing one database session across concurrent tasks can fail and how to use a separate session per task.
+
+In 4.2.0, CG-031 shows where the session came from and which two tasks share it. JSON and HTML reports, editor diagnostics, and SARIF exports carry those locations in order. Use `cguard scan . --diff-base origin/main` in CI to check changed files and their callers with unchanged helpers available for analysis.
 
 ### Example
 
