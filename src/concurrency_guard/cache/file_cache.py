@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
-import shutil
+import re
 import threading
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
@@ -216,12 +216,11 @@ class FileCache:
             if self._entry("clear") is None or not self.cache_dir.exists():
                 return 0
             for item in list(self.cache_dir.iterdir()):
+                if re.fullmatch(r"[0-9a-f]{64}\.json", item.name) is None:
+                    continue
                 try:
                     if item.is_file() or item.is_symlink():
                         item.unlink()
-                        count += 1
-                    elif item.is_dir():
-                        shutil.rmtree(item)
                         count += 1
                 except OSError:
                     pass

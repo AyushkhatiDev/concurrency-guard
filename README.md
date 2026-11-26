@@ -25,6 +25,8 @@ cguard scan .
 
 Scan a single file by passing its path instead of `.`. To see what an available automatic fix would change, run `cguard fix . --diff`. Apply the changes with `cguard fix . --write`.
 
+ConcurrencyGuard supports Python 3.9 and newer. Run `cguard --version` to check which release your terminal is using. Version 4.1.0 improves recovery from malformed editor requests, adds the cancellation fix to editor code actions, and makes cache cleanup safer.
+
 ### Example
 
 Two requests can read the same wallet balance, each subtract an amount, and then overwrite each other’s update:
