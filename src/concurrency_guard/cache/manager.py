@@ -10,6 +10,7 @@ import threading
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager
+from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Optional, Union
 
@@ -82,13 +83,15 @@ def finding_to_dict(finding: Any) -> dict[str, Any]:
         "message": getattr(finding, "message", ""),
         "suggested_fix_hint": getattr(finding, "suggested_fix_hint", ""),
         "confidence": getattr(finding, "confidence", "HIGH"),
+        "evidence": [asdict(step) for step in getattr(finding, "evidence", [])],
+        "cwe": getattr(finding, "cwe", None),
         "end_lineno": getattr(finding, "end_lineno", None),
     }
 
 
 def dict_to_finding(data: dict[str, Any]) -> ASTFinding:
     """Reconstruct an ASTFinding object from a cached dictionary."""
-    from concurrency_guard.scanner.ast_rules import ASTFinding
+    from concurrency_guard.scanner.ast_rules import ASTFinding, EvidenceStep
 
     return ASTFinding(
         rule_id=str(data.get("rule_id", "")),
@@ -99,6 +102,8 @@ def dict_to_finding(data: dict[str, Any]) -> ASTFinding:
         suggested_fix_hint=str(data.get("suggested_fix_hint", "")),
         confidence=str(data.get("confidence", "HIGH")),
         end_lineno=data.get("end_lineno"),
+        evidence=[EvidenceStep(**step) for step in data.get("evidence", [])],
+        cwe=data.get("cwe"),
         col_offset=data.get("col_offset"),
     )
 

@@ -361,6 +361,10 @@ def render_html_report(
                 )
             snippet_html = f"<div class='snippet-wrapper'><div class='snippet-header'>{clean_file}:{clean_line}</div><pre><code>{''.join(snippet_lines)}</code></pre></div>"
 
+        evidence = "".join(
+            f"<li>{html.escape(step.message)} &mdash; {html.escape(step.file)}:{step.line}:{step.column + 1}</li>"
+            for step in f.evidence
+        )
         fix_badge = (
             "<span class='badge badge-fixable' title='Deterministic LibCST auto-fix available'>⚡ AUTO-FIXABLE</span>"
             if fixable
@@ -394,6 +398,7 @@ def render_html_report(
             f"  <div class='card-body'>"
             f"    <div class='card-message'>{clean_msg}</div>"
             f"    {snippet_html}"
+            + (f"<ol>{evidence}</ol>" if evidence else "") +
             f"    {fix_remediation}"
             f"  </div>"
             f"</details>"

@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import urllib.error
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
@@ -36,6 +37,7 @@ from concurrency_guard.cache.manager import (
 from concurrency_guard.config import load_cguard_config
 from concurrency_guard.diff_scope import impacted_python_paths
 from concurrency_guard.engine import parse_modules_parallel
+from concurrency_guard.explain import explain_rule
 from concurrency_guard.gh_review import (
     ReviewComment,
     detect_github_environment,
@@ -107,6 +109,16 @@ def _parse_cli_rules(raw_rules: Optional[list[str]]) -> list[str]:
             if cleaned:
                 result.append(cleaned)
     return result
+
+
+@app.command()
+def explain(rule_id: str) -> None:
+    """Show the impact, examples and fix availability for a built-in rule."""
+    try:
+        reference = explain_rule(rule_id.upper())
+    except KeyError as exc:
+        raise typer.BadParameter(f"Unknown built-in rule {rule_id}") from exc
+    typer.echo(reference)
 
 
 @app.command()
@@ -264,19 +276,20 @@ def scan(
         if changed_files is not None:
             py_files = [f for f in py_files if f in changed_files or f.resolve() in changed_files]
 
+    diff_graph = None
     diff_modules = None
     if diff_base is not None:
         if changed_only or base_ref:
             raise typer.BadParameter("cannot combine with --changed-only or --base-ref", param_hint="--diff-base")
         root = path if path.is_dir() else path.parent
         parsed = parse_modules_parallel(py_files)
-        graph = ProjectSymbolGraph.build(py_files, roots=[root], parsed_modules=parsed)
+        diff_graph = ProjectSymbolGraph.build(py_files, roots=[root], parsed_modules=parsed, custom_lock_names=config.custom_lock_names)
         try:
-            impacted = impacted_python_paths(root, diff_base, py_files, graph)
+            impacted = impacted_python_paths(root, diff_base, py_files, diff_graph)
         except ValueError as error:
             raise typer.BadParameter(str(error), param_hint="--diff-base") from error
         py_files = [file for file in py_files if file.resolve() in impacted]
-        diff_modules = {file: module for file, module in parsed.items() if file in impacted}
+        diff_modules = parsed
 
     cache_mgr: Optional[Any] = None
     target_cache_dir = cache_dir or DEFAULT_CACHE_DIR
@@ -326,6 +339,7 @@ def scan(
             config=config,
             cross_file=cross_file,
             parsed_modules=diff_modules,
+            project_graph=diff_graph,
         )
     except PluginError as error:
         raise typer.BadParameter(str(error), param_hint="--allow-plugins") from error
@@ -437,6 +451,7 @@ def scan(
                     "message": f.message,
                     "suggested_fix_hint": f.suggested_fix_hint,
                     "confidence": f.confidence,
+                    "evidence": [asdict(step) for step in f.evidence],
                 }
                 for f in findings_to_report
             ],

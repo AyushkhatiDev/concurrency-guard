@@ -34,71 +34,127 @@ def qualified(expr: ast.AST, aliases: dict[str, str]) -> str:
     return ""
 
 
+def session_symbols(module: ast.AST | None) -> dict[str, str]:
+    symbols = {"AsyncSession": "session", "async_sessionmaker": "maker"}
+    if isinstance(module, ast.Module):
+        for stmt in module.body:
+            if isinstance(stmt, ast.ImportFrom) and (stmt.module or "").split(".")[0] in {"sqlalchemy", "sqlmodel"}:
+                for alias in stmt.names:
+                    if alias.name in symbols:
+                        symbols[alias.asname or alias.name] = symbols[alias.name]
+            if (isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call)
+                    and symbols.get(qualified(stmt.value.func, {}).split(".")[-1]) == "maker"):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        symbols[target.id] = "factory"
+    return symbols
+
+
 def shared_sessions(
-    function: ast.AsyncFunctionDef, aliases: dict[str, str],
-) -> Iterator[tuple[ast.AST, str]]:
-    session_names = {"db", "session", "async_session"}
+    function: ast.AsyncFunctionDef, aliases: dict[str, str], symbols: dict[str, str],
+) -> Iterator[tuple[ast.AST, str, tuple[ast.AST, ast.AST, ast.AST]]]:
+    # Each binding carries its allocation site, including through local aliases.
+    bindings: dict[str, tuple[str, ast.AST]] = {}
     for arg in (*function.args.posonlyargs, *function.args.args, *function.args.kwonlyargs):
-        if arg.annotation is not None:
-            annotation = ast.unparse(arg.annotation)
-            if "AsyncSession" in annotation:
-                session_names.add(arg.arg)
-            elif annotation not in {"Any", "typing.Any"}:
-                session_names.discard(arg.arg)
+        annotation = ast.unparse(arg.annotation).strip("'\u0022") if arg.annotation else "Any"
+        if (symbols.get(annotation.split(".")[-1]) == "session" or
+                annotation in {"Any", "typing.Any"} and arg.arg in {"db", "session", "async_session"}):
+            bindings[arg.arg] = ("session", arg)
 
-    nodes = list(local_nodes(function))
-    factories = {"async_sessionmaker"}
-    for node in nodes:
-        if isinstance(node, ast.Assign) and isinstance(node.value, ast.Call):
-            constructor = qualified(node.value.func, aliases).split(".")[-1]
-            for target in node.targets:
-                if not isinstance(target, ast.Name):
-                    continue
-                if constructor == "async_sessionmaker":
-                    factories.add(target.id)
-                elif constructor == "AsyncSession" or constructor in factories:
-                    session_names.add(target.id)
-        elif isinstance(node, ast.AsyncWith):
-            for item in node.items:
-                if isinstance(item.context_expr, ast.Call) and isinstance(item.optional_vars, ast.Name):
-                    constructor = qualified(item.context_expr.func, aliases).split(".")[-1]
-                    if constructor == "AsyncSession" or constructor in factories:
-                        session_names.add(item.optional_vars.id)
+    results: list[tuple[ast.AST, str, tuple[ast.AST, ast.AST, ast.AST]]] = []
+    guards: dict[ast.If, bool] = {}
+    groups: dict[str, ast.AsyncWith] = {}
+    history: dict[tuple[ast.AST, ast.AST], list[tuple[ast.AST, dict[ast.If, bool]]]] = {}
+    reported: set[tuple[ast.AST, ast.AST]] = set()
 
-    def duplicates(coroutines: list[ast.expr]) -> set[str]:
-        seen: set[str] = set()
-        repeated: set[str] = set()
-        for coroutine in coroutines:
-            if not isinstance(coroutine, ast.Call):
+    def bind(name: ast.expr, value: ast.expr | None) -> None:
+        if not isinstance(name, ast.Name):
+            return
+        binding = bindings.get(value.id) if isinstance(value, ast.Name) else None
+        if isinstance(value, ast.Call):
+            callee = qualified(value.func, {}).split(".")[-1]
+            kind = bindings[callee][0] if callee in bindings else symbols.get(callee)
+            if kind in {"session", "factory", "maker"}:
+                binding = ("factory" if kind == "maker" else "session", name)
+        if binding:
+            bindings[name.id] = binding
+        else:
+            bindings.pop(name.id, None)
+
+    def record(owner: ast.AST, site: ast.AST, coroutine: ast.expr) -> None:
+        if not isinstance(coroutine, ast.Call):
+            return
+        args = [*coroutine.args, *(kw.value for kw in coroutine.keywords)]
+        if isinstance(coroutine.func, ast.Attribute):
+            args.append(coroutine.func.value)
+        for arg in args:
+            if not isinstance(arg, ast.Name) or arg.id not in bindings:
                 continue
-            arguments = [
-                *coroutine.args,
-                *(keyword.value for keyword in coroutine.keywords),
-            ]
-            current = {arg.id for arg in arguments if isinstance(arg, ast.Name)} & session_names
-            if isinstance(coroutine.func, ast.Attribute) and isinstance(coroutine.func.value, ast.Name):
-                current |= {coroutine.func.value.id} & session_names
-            repeated.update(current & seen)
-            seen.update(current)
-        return repeated
+            kind, origin = bindings[arg.id]
+            key = (owner, origin)
+            if kind != "session" or key in reported:
+                continue
+            prior = history.setdefault(key, [])
+            for other, conditions in prior:
+                if other is not site and all(guards.get(k, v) == v for k, v in conditions.items()):
+                    results.append((owner, arg.id, (origin, other, site)))
+                    reported.add(key)
+                    break
+            if not prior or prior[-1][0] is not site:
+                prior.append((site, guards.copy()))
 
-    for node in nodes:
-        if isinstance(node, ast.Call) and qualified(node.func, aliases) == "asyncio.gather":
-            for session in sorted(duplicates(node.args)):
-                yield node, session
-        elif isinstance(node, ast.AsyncWith):
+    def walk(node: ast.AST) -> None:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)):
+            return
+        if isinstance(node, ast.If):
+            walk(node.test)
+            before = bindings.copy()
+            guards[node] = True
+            for stmt in node.body:
+                walk(stmt)
+            left = bindings.copy()
+            bindings.clear()
+            bindings.update(before)
+            guards[node] = False
+            for stmt in node.orelse:
+                walk(stmt)
+            del guards[node]
+            for name in list(bindings):
+                if bindings[name] != left.get(name):
+                    del bindings[name]
+            return
+        if isinstance(node, ast.AsyncWith):
+            previous = groups.copy()
             for item in node.items:
-                if (isinstance(item.context_expr, ast.Call)
-                        and qualified(item.context_expr.func, aliases) == "asyncio.TaskGroup"
-                        and isinstance(item.optional_vars, ast.Name)):
-                    task_method = f"{item.optional_vars.id}.create_task"
-                    tasks = [
-                        child.args[0] for stmt in node.body for child in (stmt, *local_nodes(stmt))
-                        if isinstance(child, ast.Call) and child.args
-                        and qualified(child.func, {}) == task_method
-                    ]
-                    for session in sorted(duplicates(tasks)):
-                        yield node, session
+                walk(item.context_expr)
+                if item.optional_vars is not None:
+                    bind(item.optional_vars, item.context_expr)
+                if (isinstance(item.optional_vars, ast.Name) and isinstance(item.context_expr, ast.Call)
+                        and qualified(item.context_expr.func, aliases) == "asyncio.TaskGroup"):
+                    groups[item.optional_vars.id] = node
+            for stmt in node.body:
+                walk(stmt)
+            groups.clear()
+            groups.update(previous)
+            return
+        if isinstance(node, ast.Call):
+            if qualified(node.func, aliases) == "asyncio.gather":
+                for coroutine in node.args:
+                    record(node, coroutine, coroutine)
+            elif (isinstance(node.func, ast.Attribute) and node.func.attr == "create_task"
+                  and isinstance(node.func.value, ast.Name) and node.func.value.id in groups and node.args):
+                record(groups[node.func.value.id], node, node.args[0])
+        for child in ast.iter_child_nodes(node):
+            walk(child)
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                bind(target, node.value)
+        elif isinstance(node, ast.AnnAssign) and node.value is not None:
+            bind(node.target, node.value)
+
+    for stmt in function.body:
+        walk(stmt)
+    yield from results
 
 
 def async_lock_contexts(root: ast.AST) -> Iterator[tuple[ast.AsyncWith, list[str]]]:
@@ -118,22 +174,48 @@ def is_async_lock_name(name: str) -> bool:
 
 
 def handler_reraises(body: list[ast.stmt], exception_name: str | None) -> bool:
-    for statement in body:
-        if isinstance(statement, ast.Raise):
-            return statement.exc is None or (
-                isinstance(statement.exc, ast.Name) and statement.exc.id == exception_name
-            )
-        if isinstance(statement, (ast.Return, ast.Break, ast.Continue, ast.Try)):
-            return False
-        if isinstance(statement, ast.If):
-            if handler_reraises(statement.body, exception_name) and handler_reraises(
-                statement.orelse, exception_name
-            ):
-                return True
-            if any(isinstance(item, (ast.Return, ast.Break, ast.Continue))
-                   for item in local_nodes(statement)):
-                return False
-    return False
+    def outcomes(statements: list[ast.stmt]) -> set[str]:
+        paths = {"next"}
+        for stmt in statements:
+            if "next" not in paths:
+                break
+            paths.remove("next")
+            if isinstance(stmt, ast.Raise):
+                same = stmt.exc is None or isinstance(stmt.exc, ast.Name) and stmt.exc.id == exception_name
+                paths.add("raise" if same else "stop")
+            elif isinstance(stmt, (ast.Return, ast.Break, ast.Continue)):
+                paths.add("stop")
+            elif isinstance(stmt, ast.Try):
+                attempted = outcomes(stmt.body)
+                if "next" in attempted:
+                    attempted.remove("next")
+                    attempted.update(outcomes(stmt.orelse))
+                for handler in stmt.handlers:
+                    attempted.update(outcomes(handler.body))
+                cleanup = outcomes(stmt.finalbody)
+                paths.update(cleanup - {"next"})
+                if "next" in cleanup:
+                    paths.update(attempted)
+            elif isinstance(stmt, ast.If):
+                if isinstance(stmt.test, ast.Constant):
+                    paths.update(outcomes(stmt.body if stmt.test.value else stmt.orelse))
+                else:
+                    paths.update(outcomes(stmt.body) | outcomes(stmt.orelse))
+            elif isinstance(stmt, ast.Try):
+                inner = outcomes(stmt.body)
+                if "next" in inner:
+                    inner = (inner - {"next"}) | outcomes(stmt.orelse)
+                for handler in stmt.handlers:
+                    inner.update(outcomes(handler.body))
+                final = outcomes(stmt.finalbody)
+                paths.update((inner if "next" in final else set()) | (final - {"next"}))
+            else:
+                paths.add("next")
+                if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith)):
+                    paths.update(outcomes(stmt.body) - {"next"})
+        return paths
+
+    return outcomes(body) == {"raise"}
 
 
 def swallowed_cancellation(
@@ -146,7 +228,7 @@ def swallowed_cancellation(
             catch_types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
             names = {qualified(item, aliases) for item in catch_types if item is not None}
             broad = handler.type is None or bool(names & {"BaseException", "builtins.BaseException"})
-            if broad or "asyncio.CancelledError" in names:
-                if broad and not handler_reraises(handler.body, handler.name):
+            if broad or names & {"asyncio.CancelledError", "CancelledError"}:
+                if not handler_reraises(handler.body, handler.name):
                     yield handler
                 break

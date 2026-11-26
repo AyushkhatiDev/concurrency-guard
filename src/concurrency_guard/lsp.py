@@ -14,8 +14,9 @@ import json
 import logging
 import sys
 import threading
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from io import BytesIO
+from pathlib import Path
 from typing import IO, Any, Optional, Union
 
 from concurrency_guard import __version__
@@ -52,6 +53,7 @@ class Diagnostic:
     code: str
     source: str
     message: str
+    related: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -96,7 +98,7 @@ def _severity_for_finding(finding: ASTFinding) -> int:
     return 2  # LOW -> Warning
 
 
-def finding_to_diagnostic(finding: ASTFinding) -> Diagnostic:
+def finding_to_diagnostic(finding: ASTFinding, source_lines: Optional[list[str]] = None) -> Diagnostic:
     """Convert an ASTFinding to an LSP Diagnostic."""
     start_line = max(0, finding.lineno - 1)  # 1-based -> 0-based
     end_line = max(start_line, (finding.end_lineno or finding.lineno) - 1)
@@ -106,8 +108,18 @@ def finding_to_diagnostic(finding: ASTFinding) -> Diagnostic:
     if finding.suggested_fix_hint:
         message_parts.append(f"Fix: {finding.suggested_fix_hint}")
 
+    related = []
+    for step in finding.evidence:
+        column = step.column
+        if source_lines and step.file == finding.filename and 0 < step.line <= len(source_lines):
+            prefix = source_lines[step.line - 1].encode()[:column].decode(errors="ignore")
+            column = len(prefix.encode("utf-16-le")) // 2
+        point = {"line": step.line - 1, "character": column}
+        related.append({"location": {"uri": Path(step.file).resolve().as_uri(),
+                                     "range": {"start": point, "end": point}}, "message": step.message})
+
     return Diagnostic(
-        range=Range(
+        related=related,        range=Range(
             start=Position(line=start_line, character=col),
             end=Position(line=end_line, character=0),
         ),
@@ -128,6 +140,7 @@ def diagnostic_to_dict(diag: Diagnostic) -> dict[str, Any]:
         "severity": diag.severity,
         "code": diag.code,
         "source": diag.source,
+        **({"relatedInformation": diag.related} if diag.related else {}),
         "message": diag.message,
     }
 
@@ -388,7 +401,8 @@ class LanguageServer:
         except Exception:  # noqa: BLE001
             findings = []
 
-        diagnostics = [diagnostic_to_dict(finding_to_diagnostic(f)) for f in findings]
+        source_lines = source_code.splitlines()
+        diagnostics = [diagnostic_to_dict(finding_to_diagnostic(f, source_lines)) for f in findings]
 
         # Cache diagnostics for code action requests
         self._cached_diagnostics[uri] = diagnostics

@@ -202,7 +202,7 @@ def _function_ast_by_key(
     return definitions, source_names
 
 
-def find_tainted_shared_state_mutations(files: list[Path], graph: CallGraph) -> list[TaintFinding]:
+def find_tainted_shared_state_mutations(files: list[Path], graph: CallGraph, targets: set[Path] | None = None) -> list[TaintFinding]:
     """Return CG-015 sink locations after fixed-point inter-procedural flow.
 
     Parameter taint is propagated along resolved graph call sites until stable.
@@ -239,6 +239,8 @@ def find_tainted_shared_state_mutations(files: list[Path], graph: CallGraph) -> 
 
     findings: list[TaintFinding] = []
     for key, node in definitions.items():
+        if targets is not None and Path(graph.functions[key].filename).resolve() not in targets:
+            continue
         findings.extend(_FunctionFlow(node, graph.functions[key].filename, sources[key] | parameter_taint[key]).run())
     return list(dict.fromkeys(findings))
 

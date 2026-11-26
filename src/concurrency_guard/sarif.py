@@ -710,6 +710,19 @@ def findings_to_sarif(
             },
         }
 
+        if finding.evidence:
+            locations = [
+                {"location": {
+                    "message": {"text": step.message},
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": normalize_sarif_uri(step.file, workspace_root),
+                                             "uriBaseId": "%SRCROOT%"},
+                        "region": {"startLine": step.line, "startColumn": step.column + 1},
+                    },
+                }} for step in finding.evidence
+            ]
+            result_obj["codeFlows"] = [{"threadFlows": [{"locations": locations}]}]
+
         # A SARIF fix requires concrete artifact edits. Keep textual advice as metadata.
         if finding.suggested_fix_hint:
             result_obj["properties"] = {"remediation": finding.suggested_fix_hint}
