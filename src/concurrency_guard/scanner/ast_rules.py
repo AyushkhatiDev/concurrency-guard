@@ -16,6 +16,7 @@ from concurrency_guard.async_rules import (
     async_lock_contexts,
     asyncio_names,
     is_async_lock_name,
+    session_symbols,
     shared_sessions,
     swallowed_cancellation,
 )
@@ -658,6 +659,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             self._qualified_function(n): n for n in ast.walk(tree)
             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
         } if tree is not None else {}
+        self.session_symbols = session_symbols(tree)
         self.asyncio_aliases = asyncio_names(tree) if tree is not None else {}
         self.filename = filename
         self.config = config
@@ -2779,7 +2781,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                     "Re-raise asyncio.CancelledError before handling broad exceptions.",
                 )
             self._check_cg_032(node)
-            for site, session in shared_sessions(node, self.asyncio_aliases):
+            for site, session, _sites in shared_sessions(node, self.asyncio_aliases, self.session_symbols):
                 self._add(
                     "CG-031", site, node.name,
                     f"Concurrent tasks share AsyncSession '{session}'.",
