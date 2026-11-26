@@ -3131,6 +3131,7 @@ def scan_project(
     config: Optional[Any] = None,
     cross_file: bool = True,
     parsed_modules: Optional[dict[Path, Any]] = None,
+    project_graph: Optional[Any] = None,
 ) -> list[ASTFinding]:
     """Scan files and propagate shared-state hazards to transitive callers."""
     from concurrency_guard.engine import scan_project_parallel
@@ -3146,4 +3147,5 @@ def scan_project(
         config=config,
         cross_file=cross_file,
         parsed_modules=parsed_modules,
+        project_graph=project_graph,
     )

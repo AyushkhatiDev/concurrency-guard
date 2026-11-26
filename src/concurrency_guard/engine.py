@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, Optional, Union
 
 from concurrency_guard.plugins import PluginError, load_plugins
+from concurrency_guard.project_graph import ProjectSymbolGraph
 from concurrency_guard.scanner.ast_rules import (
     ASTFinding,
     discover_python_files,
@@ -101,13 +102,13 @@ def scan_project_parallel(
     config: Optional[Any] = None,
     cross_file: bool = True,
     parsed_modules: Optional[dict[Path, ParsedModule]] = None,
+    project_graph: Optional[ProjectSymbolGraph] = None,
 ) -> list[ASTFinding]:
     """Scan files using parse-once IR and multi-core parallel execution.
 
     Auto-enables parallel processing when scanning > 20 files. Always guarantees
     deterministic output ordering sorted by (file_path, line, rule_id).
     """
-    from concurrency_guard.project_graph import ProjectSymbolGraph
 
     active_filter = suppression_filter or SuppressionFilter()
 
@@ -137,8 +138,9 @@ def scan_project_parallel(
 
     # Step 2: Build Cross-File Project Symbol Graph with pre-parsed ASTs
     effective_cross_file = cross_file if cross_file is not None else getattr(config, "cross_file", True)
-    project_graph: Optional[ProjectSymbolGraph] = None
-    if effective_cross_file and file_paths:
+    if not effective_cross_file:
+        project_graph = None
+    elif project_graph is None and file_paths:
         custom_locks = getattr(config, "custom_lock_names", None)
         project_graph = ProjectSymbolGraph.build(
             file_paths,
@@ -202,15 +204,19 @@ def scan_project_parallel(
             for fp in uncached_files:
                 findings.extend(_scan_one(fp))
 
-    if project_graph is not None:
+    targets = {path.resolve() for path in file_paths}
+    if project_graph is not None and targets:
         from concurrency_guard.deadlock_graph import project_deadlocks
 
         for cycle in project_deadlocks(((p, m.tree) for p, m in modules_map.items()), project_graph):
+            if Path(cycle.filename).resolve() not in targets:
+                continue
             findings.extend(active_filter.filter_findings([cycle], file_path=Path(cycle.filename)))
 
     # Step 5: Taint tracking & inter-procedural shared state hazards
-    graph = build_call_graph(file_paths, roots=roots)
-    taint_findings = find_tainted_shared_state_mutations(file_paths, graph)
+    context_paths = sorted(set(modules_map) | targets) if targets else []
+    graph = build_call_graph(context_paths, roots=roots)
+    taint_findings = find_tainted_shared_state_mutations(context_paths, graph, targets=targets)
     for finding in taint_findings:
         if not active_filter.should_suppress("CG-015", Path(finding.filename), finding.lineno):
             findings.append(
@@ -237,7 +243,7 @@ def scan_project_parallel(
         mutated = graph.functions[mutation]
         for caller_name in graph.callers_of(mutation):
             caller = graph.functions[caller_name]
-            if caller.filename == mutated.filename:
+            if caller.filename == mutated.filename or Path(caller.filename).resolve() not in targets:
                 continue
             key = (caller_name, mutation)
             if key in reported:

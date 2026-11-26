@@ -264,19 +264,20 @@ def scan(
         if changed_files is not None:
             py_files = [f for f in py_files if f in changed_files or f.resolve() in changed_files]
 
+    diff_graph = None
     diff_modules = None
     if diff_base is not None:
         if changed_only or base_ref:
             raise typer.BadParameter("cannot combine with --changed-only or --base-ref", param_hint="--diff-base")
         root = path if path.is_dir() else path.parent
         parsed = parse_modules_parallel(py_files)
-        graph = ProjectSymbolGraph.build(py_files, roots=[root], parsed_modules=parsed)
+        diff_graph = ProjectSymbolGraph.build(py_files, roots=[root], parsed_modules=parsed, custom_lock_names=config.custom_lock_names)
         try:
-            impacted = impacted_python_paths(root, diff_base, py_files, graph)
+            impacted = impacted_python_paths(root, diff_base, py_files, diff_graph)
         except ValueError as error:
             raise typer.BadParameter(str(error), param_hint="--diff-base") from error
         py_files = [file for file in py_files if file.resolve() in impacted]
-        diff_modules = {file: module for file, module in parsed.items() if file in impacted}
+        diff_modules = parsed
 
     cache_mgr: Optional[Any] = None
     target_cache_dir = cache_dir or DEFAULT_CACHE_DIR
@@ -326,6 +327,7 @@ def scan(
             config=config,
             cross_file=cross_file,
             parsed_modules=diff_modules,
+            project_graph=diff_graph,
         )
     except PluginError as error:
         raise typer.BadParameter(str(error), param_hint="--allow-plugins") from error
