@@ -28,6 +28,8 @@ class FunctionCFG:
     exceptional: set[tuple[int, int]]
     guards: dict[tuple[int, int], tuple[str, bool]]
     dominators: dict[int, set[int]]
+    function_name: str = "<unknown>"
+    warnings: list[str] = field(default_factory=list)
 
 
 def expression_nodes(stmt: ast.stmt) -> list[ast.AST]:
@@ -41,6 +43,7 @@ def expression_nodes(stmt: ast.stmt) -> list[ast.AST]:
     ]
 
 
+MAX_LOCK_STATES = 128
 MAX_CFG_DEPTH = 64
 MAX_CFG_BLOCKS = 1024
 logger = logging.getLogger(__name__)
@@ -160,7 +163,7 @@ def _build_function_cfg(func_node: Function) -> FunctionCFG:
             )
             if value != dom[i]:
                 dom[i], changed = value, True
-    return FunctionCFG(blocks, entry, end, exceptional, guards, dom)
+    return FunctionCFG(blocks, entry, end, exceptional, guards, dom, func_node.name)
 
 
 @dataclass(frozen=True)
@@ -199,11 +202,20 @@ def query_info(expr: ast.AST, bindings: dict[str, str]) -> tuple[str, bool, bool
 def lock_states(cfg: FunctionCFG) -> dict[int, list[tuple[frozenset[str], dict[str, str]]]]:
     states: dict[int, list[tuple[frozenset[str], dict[str, str]]]] = {}
     work: deque[tuple[int, frozenset[str], dict[str, str]]] = deque([(cfg.entry, frozenset(), {})])
+    distinct: set[tuple[frozenset[str], frozenset[tuple[str, str]]]] = set()
     while work:
         index, held, bindings = work.popleft()
         seen = states.setdefault(index, [])
         if (held, bindings) in seen:
             continue
+        signature = (held, frozenset(bindings.items()))
+        if signature not in distinct:
+            if len(distinct) >= MAX_LOCK_STATES:
+                warning = f"Partial analysis of {cfg.function_name}: lock-state limit ({MAX_LOCK_STATES}) reached"
+                cfg.warnings.append(warning)
+                logger.warning(warning)
+                return {}
+            distinct.add(signature)
         seen.append((held, bindings))
         block = cfg.blocks[index]
         new, env = set(held), bindings.copy()
