@@ -113,3 +113,31 @@ def test_sarif_rejects_invalid_rule_metadata(monkeypatch: pytest.MonkeyPatch) ->
     monkeypatch.setitem(RULE_REGISTRY["CG-001"], "helpUri", "http://cwe.mitre.org/data/definitions/362.html")
     with pytest.raises(ValueError, match="CWE URI"):
         findings_to_sarif([])
+
+
+def test_malformed_editor_params_do_not_stop_the_server() -> None:
+    incoming = BytesIO(
+        encode_message({"jsonrpc": "2.0", "id": 7, "method": "textDocument/codeAction", "params": []})
+        + encode_message({"jsonrpc": "2.0", "method": "textDocument/didOpen", "params": {"textDocument": None}})
+        + encode_message({"jsonrpc": "2.0", "id": 8, "method": "initialize", "params": {}})
+    )
+    outgoing = BytesIO()
+    LanguageServer(incoming, outgoing).run()
+    assert outgoing.getvalue().count(b'"code":-32602') == 1
+    assert b'"id":8' in outgoing.getvalue()
+
+
+def test_clear_cache_preserves_unrelated_files(tmp_path: Path) -> None:
+    from concurrency_guard.cache.file_cache import FileCache
+
+    source = tmp_path / "source.py"
+    source.write_text("pass", encoding="utf-8")
+    cache = FileCache(tmp_path)
+    cache.set(source, [])
+    directory = tmp_path / "notes"
+    directory.mkdir()
+    nested = directory / "draft.txt"
+    nested.write_text("keep", encoding="utf-8")
+    assert cache.clear() == 1
+    assert source.is_file()
+    assert nested.read_text(encoding="utf-8") == "keep"

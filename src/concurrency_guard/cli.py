@@ -82,7 +82,16 @@ app = typer.Typer(no_args_is_help=True, help="Deterministic Concurrency & Idempo
 console = Console()
 
 
-@app.callback()
+@app.callback(invoke_without_command=True)
+@app.callback(invoke_without_command=True)
+def show_version(
+    version: bool = typer.Option(False, "--version", is_eager=True, help="Show the installed version."),
+) -> None:
+    if version:
+        typer.echo(f"cguard {__version__}")
+        raise typer.Exit()
+
+
 def main() -> None:
     """Deterministic AST + Runtime Concurrency & Idempotency Verifier."""
 
@@ -339,7 +348,7 @@ def scan(
         findings = [f for f in findings if Path(f.filename).resolve() in changed_files]
         py_files = [p for p in py_files if p.resolve() in changed_files]
 
-    if cache_mgr is not None and path.is_dir() and diff_base is None and hasattr(cache_mgr, "purge_stale_entries"):
+    if cache_mgr is not None and path.is_dir() and not (diff_base is not None or changed_only or base_ref) and hasattr(cache_mgr, "purge_stale_entries"):
         cache_mgr.purge_stale_entries(set(py_files))
 
     effective_baseline_path: Optional[Path] = baseline

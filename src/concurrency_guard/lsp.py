@@ -79,7 +79,7 @@ _HIGH_CONFIDENCE_RULES: frozenset[str] = frozenset({"CG-001", "CG-004"})
 
 _FIXABLE_RULES: frozenset[str] = frozenset({
     "CG-001", "CG-002", "CG-004", "CG-006", "CG-007",
-    "CG-009", "CG-016", "CG-017",
+    "CG-009", "CG-016", "CG-017", "CG-033",
 })
 
 
@@ -516,6 +516,40 @@ class LanguageServer:
         request_id = message.get("id")
         params = message.get("params", {})
 
+        has_id = "id" in message
+        if not isinstance(method, str) or (request_id is not None and type(request_id) not in {int, str}):
+            self._send_error(None, -32600, "Invalid request")
+            return True
+
+        valid = isinstance(params, dict)
+        if valid and method in {
+            "textDocument/didOpen", "textDocument/didChange", "textDocument/didSave",
+            "textDocument/didClose", "textDocument/codeAction",
+        }:
+            document = params.get("textDocument")
+            valid = isinstance(document, dict) and isinstance(document.get("uri"), str)
+            if valid and method == "textDocument/didOpen":
+                valid = isinstance(document.get("text"), str)
+            if valid and method == "textDocument/didSave":
+                valid = params.get("text") is None or isinstance(params["text"], str)
+            if valid and method == "textDocument/didChange":
+                changes = params.get("contentChanges")
+                valid = isinstance(changes, list) and all(
+                    isinstance(change, dict) and isinstance(change.get("text"), str)
+                    for change in changes
+                )
+            if valid and method == "textDocument/codeAction":
+                context = params.get("context", {})
+                requested_range = params.get("range", {})
+                valid = isinstance(context, dict) and isinstance(requested_range, dict)
+                if valid:
+                    diagnostics = context.get("diagnostics", [])
+                    valid = isinstance(diagnostics, list) and all(isinstance(item, dict) for item in diagnostics)
+        if not valid:
+            if has_id:
+                self._send_error(request_id, -32602, "Invalid params")
+            return True
+
         if method == "initialize":
             self._handle_initialize(request_id, params)
         elif method == "initialized":
@@ -550,7 +584,13 @@ class LanguageServer:
                 continue
             if message is None:
                 break  # EOF
-            should_continue = self._dispatch(message)
+            try:
+                should_continue = self._dispatch(message)
+            except (AttributeError, TypeError, ValueError, KeyError, IndexError, RecursionError, SyntaxError):
+                message_id = message.get("id")
+                if "id" in message and (message_id is None or type(message_id) in {int, str}):
+                    self._send_error(message_id, -32602, "Invalid params")
+                continue
             if not should_continue:
                 return 0 if self._shutdown_requested else 1
         return 0 if self._shutdown_requested else 1

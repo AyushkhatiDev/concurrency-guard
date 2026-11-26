@@ -1,5 +1,13 @@
 # Changelog
 
+## 4.1.0
+
+- Restore installation and CLI startup on Python 3.9 and 3.10.
+- Keep the language server running after malformed editor requests. Offer the CG-033 cancellation fix in editor code actions.
+- Preserve unrelated files during file-cache cleanup and preserve unrelated SQLite cache entries during filtered scans.
+- Add `cguard --version` and check CLI startup on additional Python versions in CI.
+- Include the examples and changelog in the source distribution.
+
 ## 4.0.0
 
 - Detect shared async sessions, recursive async lock acquisition, and swallowed cancellation.
