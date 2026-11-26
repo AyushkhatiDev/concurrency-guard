@@ -1081,7 +1081,14 @@ def apply_all_fixes_with_report(
             return previous_code
 
         try:
-            scan_source_code(candidate_code)
+            verification_filter = SuppressionFilter()
+            verification_filter.parse_source(candidate_code, filepath="<memory>")
+            remaining = verification_filter.filter_findings(scan_source_code(candidate_code), file_path=None)
+            unresolved = [f for f in remaining if f.rule_id == rule_id and f.function_name in target_funcs]
+            if unresolved:
+                skipped.extend(PatchSkip(rule_id, f.function_name, f.lineno,
+                                         "Targeted finding remains after rewrite.") for f in unresolved)
+                return previous_code
         except Exception as exc:  # noqa: BLE001
             for fn in target_funcs:
                 skipped.append(
