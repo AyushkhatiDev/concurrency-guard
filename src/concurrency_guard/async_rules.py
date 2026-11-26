@@ -174,22 +174,37 @@ def is_async_lock_name(name: str) -> bool:
 
 
 def handler_reraises(body: list[ast.stmt], exception_name: str | None) -> bool:
-    for statement in body:
-        if isinstance(statement, ast.Raise):
-            return statement.exc is None or (
-                isinstance(statement.exc, ast.Name) and statement.exc.id == exception_name
-            )
-        if isinstance(statement, (ast.Return, ast.Break, ast.Continue, ast.Try)):
-            return False
-        if isinstance(statement, ast.If):
-            if handler_reraises(statement.body, exception_name) and handler_reraises(
-                statement.orelse, exception_name
-            ):
-                return True
-            if any(isinstance(item, (ast.Return, ast.Break, ast.Continue))
-                   for item in local_nodes(statement)):
-                return False
-    return False
+    def outcomes(statements: list[ast.stmt]) -> set[str]:
+        paths = {"next"}
+        for stmt in statements:
+            if "next" not in paths:
+                break
+            paths.remove("next")
+            if isinstance(stmt, ast.Raise):
+                same = stmt.exc is None or isinstance(stmt.exc, ast.Name) and stmt.exc.id == exception_name
+                paths.add("raise" if same else "stop")
+            elif isinstance(stmt, (ast.Return, ast.Break, ast.Continue)):
+                paths.add("stop")
+            elif isinstance(stmt, ast.If):
+                if isinstance(stmt.test, ast.Constant):
+                    paths.update(outcomes(stmt.body if stmt.test.value else stmt.orelse))
+                else:
+                    paths.update(outcomes(stmt.body) | outcomes(stmt.orelse))
+            elif isinstance(stmt, ast.Try):
+                inner = outcomes(stmt.body)
+                if "next" in inner:
+                    inner = (inner - {"next"}) | outcomes(stmt.orelse)
+                for handler in stmt.handlers:
+                    inner.update(outcomes(handler.body))
+                final = outcomes(stmt.finalbody)
+                paths.update((inner if "next" in final else set()) | (final - {"next"}))
+            else:
+                paths.add("next")
+                if isinstance(stmt, (ast.For, ast.AsyncFor, ast.While, ast.With, ast.AsyncWith)):
+                    paths.update(outcomes(stmt.body) - {"next"})
+        return paths
+
+    return outcomes(body) == {"raise"}
 
 
 def swallowed_cancellation(
@@ -202,7 +217,7 @@ def swallowed_cancellation(
             catch_types = handler.type.elts if isinstance(handler.type, ast.Tuple) else [handler.type]
             names = {qualified(item, aliases) for item in catch_types if item is not None}
             broad = handler.type is None or bool(names & {"BaseException", "builtins.BaseException"})
-            if broad or "asyncio.CancelledError" in names:
-                if broad and not handler_reraises(handler.body, handler.name):
+            if broad or names & {"asyncio.CancelledError", "CancelledError"}:
+                if not handler_reraises(handler.body, handler.name):
                     yield handler
                 break

@@ -1209,6 +1209,17 @@ def apply_all_fixes_with_report(
         suppressions.parse_source(current_code, filepath="<memory>")
         findings = suppressions.filter_findings(scan_source_code(current_code), file_path=None)
         cancellation = [finding for finding in findings if finding.rule_id == "CG-033"]
+        safe_lines = {
+            h.lineno for h in ast.walk(ast.parse(current_code)) if isinstance(h, ast.ExceptHandler)
+            and (h.type is None or ast.unparse(h.type) in {"BaseException", "builtins.BaseException"})
+            and all(isinstance(stmt, ast.Pass) or isinstance(stmt, ast.Return)
+                    and (stmt.value is None or isinstance(stmt.value, ast.Constant)) for stmt in h.body)
+        }
+        for finding in cancellation:
+            if finding.lineno not in safe_lines:
+                skipped.append(PatchSkip("CG-033", finding.function_name, finding.lineno,
+                                         "Review manually to preserve cancellation cleanup."))
+        cancellation = [f for f in cancellation if f.lineno in safe_lines]
         if cancellation:
             identifiers = {
                 token.string for token in tokenize.generate_tokens(StringIO(current_code).readline)

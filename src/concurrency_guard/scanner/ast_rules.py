@@ -2777,7 +2777,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
             for handler in swallowed_cancellation(node, self.asyncio_aliases):
                 self._add(
                     "CG-033", handler, node.name,
-                    "Broad exception handler can swallow asyncio cancellation.",
+                    "Exception handler can swallow asyncio cancellation.",
                     "Re-raise asyncio.CancelledError before handling broad exceptions.",
                 )
             self._check_cg_032(node)
