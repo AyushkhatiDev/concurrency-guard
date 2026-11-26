@@ -37,6 +37,7 @@ from concurrency_guard.cache.manager import (
 from concurrency_guard.config import load_cguard_config
 from concurrency_guard.diff_scope import impacted_python_paths
 from concurrency_guard.engine import parse_modules_parallel
+from concurrency_guard.explain import explain_rule
 from concurrency_guard.gh_review import (
     ReviewComment,
     detect_github_environment,
@@ -108,6 +109,16 @@ def _parse_cli_rules(raw_rules: Optional[list[str]]) -> list[str]:
             if cleaned:
                 result.append(cleaned)
     return result
+
+
+@app.command()
+def explain(rule_id: str) -> None:
+    """Show the impact, examples and fix availability for a built-in rule."""
+    try:
+        reference = explain_rule(rule_id.upper())
+    except KeyError as exc:
+        raise typer.BadParameter(f"Unknown built-in rule {rule_id}") from exc
+    typer.echo(reference)
 
 
 @app.command()
