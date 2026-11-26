@@ -10,6 +10,7 @@ import os
 import sys
 import time
 import urllib.error
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Optional
 
@@ -439,6 +440,7 @@ def scan(
                     "message": f.message,
                     "suggested_fix_hint": f.suggested_fix_hint,
                     "confidence": f.confidence,
+                    "evidence": [asdict(step) for step in f.evidence],
                 }
                 for f in findings_to_report
             ],

@@ -6,7 +6,7 @@ import ast
 import os
 from collections import defaultdict
 from collections.abc import Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Union
 
@@ -56,6 +56,16 @@ EXCLUDED_DIRS: frozenset[str] = frozenset({
 
 
 @dataclass(frozen=True)
+class EvidenceStep:
+    """One source location in analysis order (1-based line, 0-based UTF-8 byte column)."""
+
+    file: str
+    line: int
+    column: int
+    message: str
+
+
+@dataclass(frozen=True)
 class ASTFinding:
     """Represents a vulnerability finding discovered by AST analysis."""
 
@@ -69,6 +79,7 @@ class ASTFinding:
     end_lineno: Optional[int] = None
     col_offset: Optional[int] = None
     cwe: Optional[str] = None
+    evidence: list[EvidenceStep] = field(default_factory=list, hash=False)
 
 
 
@@ -858,6 +869,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
         message: str,
         hint: str,
         confidence: str = "HIGH",
+        evidence: Optional[list[EvidenceStep]] = None,
     ) -> None:
         self.findings.append(
             ASTFinding(
@@ -870,6 +882,7 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                 confidence,
                 end_lineno=getattr(node, "end_lineno", getattr(node, "lineno", 0)),
                 col_offset=getattr(node, "col_offset", 0),
+                evidence=evidence or [],
             )
         )
 
@@ -2781,11 +2794,13 @@ class ConcurrencyASTVisitor(ast.NodeVisitor):
                     "Re-raise asyncio.CancelledError before handling broad exceptions.",
                 )
             self._check_cg_032(node)
-            for site, session, _sites in shared_sessions(node, self.asyncio_aliases, self.session_symbols):
+            for site, session, sites in shared_sessions(node, self.asyncio_aliases, self.session_symbols):
                 self._add(
                     "CG-031", site, node.name,
                     f"Concurrent tasks share AsyncSession '{session}'.",
                     "Create a separate AsyncSession inside each concurrent task.",
+                    evidence=[EvidenceStep(self.filename, getattr(n, "lineno", 1), getattr(n, "col_offset", 0), label)
+                              for n, label in zip(sites, ("Session origin", "First concurrent task", "Second concurrent task"))],
                 )
             self._check_cg_001(node, local_nodes)
             self._check_cg_002(node, local_nodes)

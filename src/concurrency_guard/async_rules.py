@@ -42,11 +42,11 @@ def session_symbols(module: ast.AST | None) -> dict[str, str]:
                 for alias in stmt.names:
                     if alias.name in symbols:
                         symbols[alias.asname or alias.name] = symbols[alias.name]
-            if isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call):
-                if symbols.get(qualified(stmt.value.func, {}).split(".")[-1]) == "maker":
-                    for target in stmt.targets:
-                        if isinstance(target, ast.Name):
-                            symbols[target.id] = "factory"
+            if (isinstance(stmt, ast.Assign) and isinstance(stmt.value, ast.Call)
+                    and symbols.get(qualified(stmt.value.func, {}).split(".")[-1]) == "maker"):
+                for target in stmt.targets:
+                    if isinstance(target, ast.Name):
+                        symbols[target.id] = "factory"
     return symbols
 
 
